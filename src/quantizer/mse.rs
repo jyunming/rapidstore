@@ -3,11 +3,13 @@ use ndarray::{Array1, Array2, Axis};
 use nalgebra::DMatrix;
 use rand::{SeedableRng};
 use rand::rngs::StdRng;
+use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 
 use super::codebook::{beta_pdf, lloyd_max, expected_mse};
 
 /// TurboQuant_mse Quantizer structure
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MseQuantizer {
     pub d: usize,
     pub b: usize,

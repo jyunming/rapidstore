@@ -19,6 +19,7 @@ pub struct Manifest {
     pub seed: u64,
     pub vector_count: u64,
     pub storage_uri: String,
+    pub quantizer: Option<ProdQuantizer>, // Serialized quantization state for reproducibility
 }
 
 impl Manifest {
@@ -34,7 +35,7 @@ impl Manifest {
     }
 }
 
-/// The core V2 disk-native TurboQuant engine.
+/// The core disk-native TurboQuant engine.
 /// Insert path:    Python → WAL (fsync) → memory buffer → SegmentManager → disk
 /// Search path:    SegmentManager (scan/graph) → quantizer.dequantize → dot product
 pub struct TurboQuantEngine {
@@ -65,19 +66,28 @@ impl TurboQuantEngine {
         let metadata_path = format!("{}/metadata.redb", db_dir);
 
         // Load or create manifest
-        let manifest = if std::path::Path::new(&manifest_path).exists() {
+        let (manifest, quantizer) = if std::path::Path::new(&manifest_path).exists() {
             let m = Manifest::load(&manifest_path)?;
             if m.d != d || m.b != b {
                 return Err(format!("Schema mismatch: DB has d={}, b={} but got d={}, b={}", m.d, m.b, d, b).into());
             }
-            m
+            let q = m.quantizer.clone().ok_or("Manifest missing quantizer state")?;
+            (m, q)
         } else {
-            let m = Manifest { version: 2, d, b, seed, vector_count: 0, storage_uri: db_dir.to_string() };
+            let q = ProdQuantizer::new(d, b, seed);
+            let m = Manifest { 
+                version: 1, 
+                d, 
+                b, 
+                seed, 
+                vector_count: 0, 
+                storage_uri: db_dir.to_string(),
+                quantizer: Some(q.clone()),
+            };
             m.save(&manifest_path)?;
-            m
+            (m, q)
         };
 
-        let quantizer = ProdQuantizer::new(d, b, manifest.seed);
         let segments = SegmentManager::open(&segments_dir)?;
         let metadata = MetadataStore::open(&metadata_path)?;
 
@@ -244,6 +254,7 @@ impl TurboQuantEngine {
             buffered_vectors: self.wal_buffer.len(),
             d: self.d,
             b: self.b,
+            total_disk_bytes: self.segments.total_disk_size(),
         }
     }
 }
@@ -264,4 +275,5 @@ pub struct DbStats {
     pub buffered_vectors: usize,
     pub d: usize,
     pub b: usize,
+    pub total_disk_bytes: u64,
 }

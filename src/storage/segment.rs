@@ -140,6 +140,15 @@ impl SegmentManager {
     pub fn total_vectors(&self) -> usize {
         self.segments.iter().map(|s| s.record_count).sum()
     }
+
+    /// Calculate total bytes occupied by all segment files.
+    pub fn total_disk_size(&self) -> u64 {
+        self.segments.iter()
+            .map(|s| {
+                std::fs::metadata(&s.path).map(|m| m.len()).unwrap_or(0)
+            })
+            .sum()
+    }
 }
 
 use std::io::BufWriter;

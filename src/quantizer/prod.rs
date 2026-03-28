@@ -1,9 +1,11 @@
 use ndarray::Array1;
+use serde::{Serialize, Deserialize};
 
 use super::mse::MseQuantizer;
 use super::qjl::QjlQuantizer;
 
 /// TurboQuant_prod Quantizer structure
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ProdQuantizer {
     pub d: usize,
     pub b: usize,

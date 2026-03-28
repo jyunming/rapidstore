@@ -2,9 +2,11 @@ use ndarray::{Array1, Array2, Axis};
 use nalgebra::DMatrix;
 use rand::{SeedableRng};
 use rand::rngs::StdRng;
+use serde::{Serialize, Deserialize};
 use std::f64::consts::PI;
 
 /// QJL Quantizer structure (1-bit inner product quantization on residual)
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct QjlQuantizer {
     pub d: usize,
     pub projection: DMatrix<f64>,
