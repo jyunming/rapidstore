@@ -372,6 +372,21 @@ struct JobStatusResponse { job: JobRecord }
 #[derive(Serialize, Deserialize)]
 struct ListJobsResponse { jobs: Vec<JobRecord> }
 
+#[derive(Serialize, Deserialize)]
+struct QuotaUsageResponse {
+    tenant: String,
+    database: String,
+    max_collections: Option<usize>,
+    max_vectors: Option<u64>,
+    max_disk_bytes: Option<u64>,
+    max_concurrent_jobs: Option<usize>,
+    current_collections: usize,
+    current_vectors: u64,
+    current_disk_bytes: u64,
+    queued_jobs: usize,
+    running_jobs: usize,
+}
+
 fn build_app(state: AppState) -> Router {
     let protected = Router::new()
         .route("/v1/tenants/:tenant/databases/:database/collections", get(list_collections).post(create_collection))
@@ -385,6 +400,7 @@ fn build_app(state: AppState) -> Router {
         .route("/v1/tenants/:tenant/databases/:database/collections/:collection/index", post(start_index_job))
         .route("/v1/tenants/:tenant/databases/:database/collections/:collection/snapshot", post(start_snapshot_job))
         .route("/v1/tenants/:tenant/databases/:database/collections/:collection/jobs", get(list_collection_jobs))
+        .route("/v1/tenants/:tenant/databases/:database/quota_usage", get(get_quota_usage))
         .route("/v1/jobs/:job_id", get(get_job_status))
         .route("/v1/jobs/:job_id/cancel", post(cancel_job))
         .route("/v1/jobs/:job_id/retry", post(retry_job))
@@ -861,6 +877,7 @@ async fn query_vectors(State(state): State<AppState>, Path((tenant, database, co
 }
 async fn start_compact_job(State(state): State<AppState>, Path((tenant, database, collection)): Path<(String, String, String)>, Extension(ctx): Extension<RequestContext>, Json(body): Json<CompactRequest>) -> Result<(StatusCode, Json<JobEnqueueResponse>), ApiError> {
     authorize(&ctx, &state.auth, "write", &tenant, &database, Some(&collection))?;
+    enforce_job_enqueue_quota(&state, &tenant, &database, Some(&collection), ctx.request_id.clone())?;
     let _ = body.r#async.unwrap_or(true);
     let (job_id, status) = enqueue_job(&state, JobType::Compact, tenant, database, collection, None, ctx.request_id.clone())?;
     Ok((StatusCode::ACCEPTED, Json(JobEnqueueResponse { job_id, status })))
@@ -868,6 +885,7 @@ async fn start_compact_job(State(state): State<AppState>, Path((tenant, database
 
 async fn start_index_job(State(state): State<AppState>, Path((tenant, database, collection)): Path<(String, String, String)>, Extension(ctx): Extension<RequestContext>, Json(body): Json<IndexRequest>) -> Result<(StatusCode, Json<JobEnqueueResponse>), ApiError> {
     authorize(&ctx, &state.auth, "write", &tenant, &database, Some(&collection))?;
+    enforce_job_enqueue_quota(&state, &tenant, &database, Some(&collection), ctx.request_id.clone())?;
     let _ = body.r#async.unwrap_or(true);
     let (job_id, status) = enqueue_job(&state, JobType::IndexBuild, tenant, database, collection, None, ctx.request_id.clone())?;
     Ok((StatusCode::ACCEPTED, Json(JobEnqueueResponse { job_id, status })))
@@ -875,6 +893,7 @@ async fn start_index_job(State(state): State<AppState>, Path((tenant, database, 
 
 async fn start_snapshot_job(State(state): State<AppState>, Path((tenant, database, collection)): Path<(String, String, String)>, Extension(ctx): Extension<RequestContext>, Json(body): Json<SnapshotRequest>) -> Result<(StatusCode, Json<JobEnqueueResponse>), ApiError> {
     authorize(&ctx, &state.auth, "write", &tenant, &database, Some(&collection))?;
+    enforce_job_enqueue_quota(&state, &tenant, &database, Some(&collection), ctx.request_id.clone())?;
     let _ = body.r#async.unwrap_or(true);
     let (job_id, status) = enqueue_job(&state, JobType::Snapshot, tenant, database, collection, body.snapshot_name, ctx.request_id.clone())?;
     Ok((StatusCode::ACCEPTED, Json(JobEnqueueResponse { job_id, status })))
@@ -1217,6 +1236,130 @@ fn enforce_vector_quota_for_ids(
     Ok(())
 }
 
+async fn get_quota_usage(
+    State(state): State<AppState>,
+    Path((tenant, database)): Path<(String, String)>,
+    Extension(ctx): Extension<RequestContext>,
+) -> Result<Json<QuotaUsageResponse>, ApiError> {
+    authorize(&ctx, &state.auth, "read", &tenant, &database, None)?;
+
+    let collection_names = TurboQuantEngine::list_collections_scoped(&state.storage.local_root, &tenant, &database)
+        .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
+    let mut current_vectors = 0u64;
+    let mut current_disk_bytes = 0u64;
+
+    for collection in &collection_names {
+        let mut engine = open_scoped_engine_from_manifest(&state, &tenant, &database, collection)
+            .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
+        current_vectors = current_vectors.saturating_add(engine.vector_count());
+        current_disk_bytes = current_disk_bytes.saturating_add(engine.stats().total_disk_bytes);
+        engine.close().map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
+    }
+
+    let (queued_jobs, running_jobs) =
+        count_jobs_for_scope(&state, &tenant, &database, None, ctx.request_id.clone())?;
+    let limits = effective_quota_limits(&state.quotas, &tenant, &database);
+
+    Ok(Json(QuotaUsageResponse {
+        tenant,
+        database,
+        max_collections: limits.max_collections,
+        max_vectors: limits.max_vectors,
+        max_disk_bytes: limits.max_disk_bytes,
+        max_concurrent_jobs: limits.max_concurrent_jobs,
+        current_collections: collection_names.len(),
+        current_vectors,
+        current_disk_bytes,
+        queued_jobs,
+        running_jobs,
+    }))
+}
+
+#[derive(Clone, Copy)]
+struct QuotaLimits {
+    max_collections: Option<usize>,
+    max_vectors: Option<u64>,
+    max_disk_bytes: Option<u64>,
+    max_concurrent_jobs: Option<usize>,
+}
+
+fn effective_quota_limits(quotas: &QuotaStore, tenant: &str, database: &str) -> QuotaLimits {
+    let key = format!("{tenant}/{database}");
+    let db_quota = quotas.database_quotas.get(&key);
+    let tenant_quota = quotas.tenant_quotas.get(tenant);
+    QuotaLimits {
+        max_collections: db_quota
+            .and_then(|q| q.max_collections)
+            .or_else(|| tenant_quota.and_then(|q| q.max_collections)),
+        max_vectors: db_quota
+            .and_then(|q| q.max_vectors)
+            .or_else(|| tenant_quota.and_then(|q| q.max_vectors)),
+        max_disk_bytes: db_quota
+            .and_then(|q| q.max_disk_bytes)
+            .or_else(|| tenant_quota.and_then(|q| q.max_disk_bytes)),
+        max_concurrent_jobs: db_quota
+            .and_then(|q| q.max_concurrent_jobs)
+            .or_else(|| tenant_quota.and_then(|q| q.max_concurrent_jobs)),
+    }
+}
+
+fn count_jobs_for_scope(
+    state: &AppState,
+    tenant: &str,
+    database: &str,
+    collection: Option<&str>,
+    request_id: Option<String>,
+) -> Result<(usize, usize), ApiError> {
+    let guard = state
+        .jobs
+        .lock()
+        .map_err(|_| ApiError::internal("job store lock poisoned", request_id))?;
+
+    let mut queued = 0usize;
+    let mut running = 0usize;
+    for job in guard.jobs.values() {
+        if job.tenant != tenant || job.database != database {
+            continue;
+        }
+        if let Some(c) = collection {
+            if job.collection != c {
+                continue;
+            }
+        }
+        if matches!(job.status, JobStatus::Queued) {
+            queued = queued.saturating_add(1);
+        } else if matches!(job.status, JobStatus::Running) {
+            running = running.saturating_add(1);
+        }
+    }
+    Ok((queued, running))
+}
+
+fn enforce_job_enqueue_quota(
+    state: &AppState,
+    tenant: &str,
+    database: &str,
+    collection: Option<&str>,
+    request_id: Option<String>,
+) -> Result<(), ApiError> {
+    let Some(limit) = effective_max_concurrent_jobs(&state.quotas, tenant, database) else {
+        return Ok(());
+    };
+
+    let (queued, running) =
+        count_jobs_for_scope(state, tenant, database, collection, request_id.clone())?;
+    let active = queued.saturating_add(running);
+    if active >= limit {
+        return Err(ApiError::quota_exceeded(
+            format!(
+                "job quota exceeded for tenant='{}' database='{}' (active={}, limit={})",
+                tenant, database, active, limit
+            ),
+            request_id,
+        ));
+    }
+    Ok(())
+}
 fn parse_metric(metric: Option<&str>, request_id: Option<String>) -> Result<DistanceMetric, ApiError> {
     match metric.unwrap_or("ip").to_ascii_lowercase().as_str() {
         "ip" => Ok(DistanceMetric::Ip),
@@ -1300,4 +1443,146 @@ fn scoped_collection_dir(local_root: &str, tenant: &str, database: &str, collect
 
 
 
+
+
+
+
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_state_with_jobs(max_concurrent_jobs: Option<usize>, jobs: Vec<JobRecord>) -> AppState {
+        let mut tenant_quotas = HashMap::new();
+        tenant_quotas.insert(
+            "dev".to_string(),
+            TenantQuota {
+                tenant: "dev".to_string(),
+                max_collections: None,
+                max_vectors: None,
+                max_disk_bytes: None,
+                max_concurrent_jobs,
+            },
+        );
+
+        let mut job_map = HashMap::new();
+        for j in jobs {
+            job_map.insert(j.job_id.clone(), j);
+        }
+
+        AppState {
+            auth: Arc::new(AuthStore {
+                api_key_subjects: HashMap::new(),
+                principals: HashMap::new(),
+                role_bindings: vec![],
+            }),
+            quotas: Arc::new(QuotaStore {
+                tenant_quotas,
+                database_quotas: HashMap::new(),
+            }),
+            jobs: Arc::new(Mutex::new(JobStore { jobs: job_map, next_id: 1 })),
+            storage: StorageConfig {
+                uri: "".to_string(),
+                local_root: "".to_string(),
+                auth_store_path: "".to_string(),
+                quota_store_path: "".to_string(),
+                job_store_path: "".to_string(),
+            },
+            job_worker_concurrency: 1,
+        }
+    }
+
+    fn mk_job(id: &str, status: JobStatus) -> JobRecord {
+        JobRecord {
+            job_id: id.to_string(),
+            job_type: JobType::Compact,
+            status,
+            tenant: "dev".to_string(),
+            database: "db".to_string(),
+            collection: "c1".to_string(),
+            snapshot_name: None,
+            created_at: "0".to_string(),
+            started_at: None,
+            completed_at: None,
+            error: None,
+            attempts: 0,
+            max_attempts: default_job_max_attempts(),
+        }
+    }
+
+    #[test]
+    fn effective_quota_limits_database_overrides_tenant() {
+        let mut tenant_quotas = HashMap::new();
+        tenant_quotas.insert(
+            "dev".to_string(),
+            TenantQuota {
+                tenant: "dev".to_string(),
+                max_collections: Some(10),
+                max_vectors: Some(1_000),
+                max_disk_bytes: Some(10_000),
+                max_concurrent_jobs: Some(4),
+            },
+        );
+
+        let mut database_quotas = HashMap::new();
+        database_quotas.insert(
+            "dev/db".to_string(),
+            DatabaseQuota {
+                tenant: "dev".to_string(),
+                database: "db".to_string(),
+                max_collections: Some(3),
+                max_vectors: None,
+                max_disk_bytes: Some(7_000),
+                max_concurrent_jobs: Some(2),
+            },
+        );
+
+        let limits = effective_quota_limits(
+            &QuotaStore {
+                tenant_quotas,
+                database_quotas,
+            },
+            "dev",
+            "db",
+        );
+
+        assert_eq!(limits.max_collections, Some(3));
+        assert_eq!(limits.max_vectors, Some(1_000));
+        assert_eq!(limits.max_disk_bytes, Some(7_000));
+        assert_eq!(limits.max_concurrent_jobs, Some(2));
+    }
+
+    #[test]
+    fn count_jobs_for_scope_tracks_queued_and_running() {
+        let state = mk_state_with_jobs(
+            Some(10),
+            vec![
+                mk_job("job_1", JobStatus::Queued),
+                mk_job("job_2", JobStatus::Running),
+                mk_job("job_3", JobStatus::Succeeded),
+            ],
+        );
+
+        let (queued, running) = match count_jobs_for_scope(&state, "dev", "db", Some("c1"), None) { Ok(v) => v, Err(_) => panic!("count_jobs_for_scope should succeed"), };
+        assert_eq!(queued, 1);
+        assert_eq!(running, 1);
+    }
+
+    #[test]
+    fn enforce_job_enqueue_quota_blocks_when_limit_reached() {
+        let state = mk_state_with_jobs(
+            Some(2),
+            vec![
+                mk_job("job_1", JobStatus::Queued),
+                mk_job("job_2", JobStatus::Running),
+            ],
+        );
+
+        let err = enforce_job_enqueue_quota(&state, "dev", "db", Some("c1"), None).unwrap_err();
+        assert_eq!(err.code, "quota_exceeded");
+        assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+    }
+}
 
