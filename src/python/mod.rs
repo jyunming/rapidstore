@@ -108,6 +108,7 @@ impl Database {
         dict.set_item("buffered_vectors", stats.buffered_vectors)?;
         dict.set_item("dimension", stats.d)?;
         dict.set_item("bits", stats.b)?;
+        dict.set_item("total_disk_bytes", stats.total_disk_bytes)?;
         Ok(dict.into())
     }
 
