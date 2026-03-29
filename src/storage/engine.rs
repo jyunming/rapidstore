@@ -565,7 +565,6 @@ impl TurboQuantEngine {
         }
 
         self.segments.flush_batch(records)?;
-        self.wal.sync()?;
         self.wal.truncate()?;
 
         if self.compactor.should_compact(self.segments.segments.len()) {
@@ -574,7 +573,6 @@ impl TurboQuantEngine {
 
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_records.len() as u64;
-        self.save_manifest()?;
         Ok(())
     }
 
