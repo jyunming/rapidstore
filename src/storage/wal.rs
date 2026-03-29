@@ -3,7 +3,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-/// A single WAL entry representing a vector insertion
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WalEntry {
     pub id: String,
@@ -15,9 +14,6 @@ pub struct WalEntry {
     pub is_deleted: bool,
 }
 
-/// Segmented Write-Ahead Log for crash-safe insertions.
-/// Entries are appended as length-prefixed bincode records.
-/// On restart, the WAL is replayed before any segment data is trusted.
 pub struct Wal {
     path: PathBuf,
     writer: BufWriter<File>,
@@ -25,7 +21,6 @@ pub struct Wal {
 }
 
 impl Wal {
-    /// Open (or create) a WAL file at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -36,24 +31,32 @@ impl Wal {
         })
     }
 
-    /// Append an entry to the WAL — guaranteed persistent before returning.
     pub fn append(
         &mut self,
         entry: &WalEntry,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let encoded = bincode::serialize(entry)?;
-        let len = encoded.len() as u64;
-        // Write length prefix then payload
-        self.writer.write_all(&len.to_le_bytes())?;
-        self.writer.write_all(&encoded)?;
-        // fsync ensures data survives a crash
+        self.append_batch(std::slice::from_ref(entry))
+    }
+
+    pub fn append_batch(
+        &mut self,
+        entries: &[WalEntry],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        for entry in entries {
+            let encoded = bincode::serialize(entry)?;
+            let len = encoded.len() as u64;
+            self.writer.write_all(&len.to_le_bytes())?;
+            self.writer.write_all(&encoded)?;
+            self.entry_count += 1;
+        }
         self.writer.flush()?;
         self.writer.get_ref().sync_data()?;
-        self.entry_count += 1;
         Ok(())
     }
 
-    /// Replay all entries from the WAL file (used on startup for crash recovery).
     pub fn replay<P: AsRef<Path>>(
         path: P,
     ) -> Result<Vec<WalEntry>, Box<dyn std::error::Error + Send + Sync>> {
@@ -75,7 +78,7 @@ impl Wal {
             let mut payload = vec![0u8; len];
             match file.read_exact(&mut payload) {
                 Ok(_) => {}
-                Err(_) => break, // Partial write at tail — safe to truncate
+                Err(_) => break,
             }
             if let Ok(entry) = bincode::deserialize::<WalEntry>(&payload) {
                 entries.push(entry);
@@ -84,9 +87,8 @@ impl Wal {
         Ok(entries)
     }
 
-    /// Truncate the WAL after all pending entries have been flushed to a segment.
     pub fn truncate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        File::create(&self.path)?; // Overwrite with empty file
+        File::create(&self.path)?;
         Ok(())
     }
 
