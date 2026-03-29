@@ -33,11 +33,22 @@ class TurboQuantRetriever:
         if metadatas is None:
             metadatas = [{} for _ in texts]
 
-        for i, (text, emb, meta) in enumerate(zip(texts, embeddings, metadatas)):
-            doc_id = f"doc_{len(self.doc_store) + i}"
-            self.doc_store[doc_id] = {"text": text, "metadata": meta}
-            vec = np.array(emb, dtype=np.float64)
-            self.db.insert(doc_id, vec, meta, text)
+        start = len(self.doc_store)
+        ids = [f"doc_{start + i}" for i in range(len(texts))]
+        for i, doc_id in enumerate(ids):
+            self.doc_store[doc_id] = {"text": texts[i], "metadata": metadatas[i]}
+
+        vectors = np.ascontiguousarray(np.asarray(embeddings, dtype=np.float64))
+        if hasattr(self.db, "insert_batch"):
+            self.db.insert_batch(ids, vectors, metadatas, texts, "insert")
+            return
+
+        if hasattr(self.db, "insert_many"):
+            self.db.insert_many(ids, [row for row in vectors], metadatas, texts, "insert")
+            return
+
+        for i, doc_id in enumerate(ids):
+            self.db.insert(doc_id, vectors[i], metadatas[i], texts[i])
 
     def similarity_search(self, query_embedding: List[float], k: int = 4) -> List[Dict[str, Any]]:
         vec = np.array(query_embedding, dtype=np.float64)
@@ -55,3 +66,4 @@ class TurboQuantRetriever:
                     "score": score,
                 })
         return output
+
