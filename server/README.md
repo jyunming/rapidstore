@@ -1,4 +1,4 @@
-# turboquantdb-server
+# rapidstore-server (crate: turboquantdb-server)
 
 Service mode currently includes:
 
@@ -14,6 +14,7 @@ Service mode currently includes:
 - `DELETE /v1/tenants/:tenant/databases/:database/collections/:collection`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/add`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/upsert`
+- `POST /v1/tenants/:tenant/databases/:database/collections/:collection/update`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/delete`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/get`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/query`
@@ -40,8 +41,10 @@ Service mode currently includes:
 ### Data-Plane Request Notes
 
 - `POST .../add` and `POST .../upsert` support optional `report` (when `true`, returns partial-failure report with `applied` and `failed[]` instead of fail-fast).
-- `POST .../get` supports optional `include` (`ids`,`metadatas`,`documents`), `offset`, `limit`.
-- `POST .../query` supports optional `include` (`ids`,`scores`,`metadatas`,`documents`) and `offset`.
+- `POST .../get` supports optional selectors (`ids`, `filter`, `where_filter`) plus `include`, `offset`, `limit`.
+- `POST .../query` supports `top_k` (or alias `n_results`), `filter` (or alias `where_filter`), optional `include`, and `offset`.
 - `include` defaults to all allowed fields for each endpoint.
+
+
 
 
