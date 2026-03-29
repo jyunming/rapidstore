@@ -1,4 +1,5 @@
 use memmap2::Mmap;
+use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -33,9 +34,7 @@ impl NodeRecord {
         let mut neighbors = Vec::with_capacity(count);
         for i in 0..count.min(MAX_DEGREE) {
             let start = 4 + (i * 4);
-            neighbors.push(u32::from_le_bytes(
-                buf[start..start + 4].try_into().unwrap(),
-            ));
+            neighbors.push(u32::from_le_bytes(buf[start..start + 4].try_into().unwrap()));
         }
         Self { neighbors }
     }
@@ -149,8 +148,7 @@ impl GraphManager {
         visited.insert(entry_node);
 
         while let Some(current) = candidates.pop() {
-            if results.len() >= search_list_size && current.score < results.peek().unwrap().0.score
-            {
+            if results.len() >= search_list_size && current.score < results.peek().unwrap().0.score {
                 break;
             }
             for nb in self.get_neighbors(current.id).unwrap_or_default() {
@@ -162,8 +160,7 @@ impl GraphManager {
                     id: nb,
                     score: scorer(nb),
                 };
-                if results.len() < search_list_size || cand.score >= results.peek().unwrap().0.score
-                {
+                if results.len() < search_list_size || cand.score >= results.peek().unwrap().0.score {
                     candidates.push(cand);
                     results.push(OrderingWrapper(cand));
                     if results.len() > search_list_size {
@@ -187,9 +184,8 @@ impl GraphManager {
         n: usize,
         max_degree: usize,
         _alpha: f64,
-        build_scorer: impl Fn(u32, u32) -> f64,
+        build_scorer: impl Fn(u32, u32) -> f64 + Sync,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Drop mapping before rebuilding; mandatory on Windows.
         self.mmap = None;
 
         let mut file = OpenOptions::new()
@@ -200,62 +196,67 @@ impl GraphManager {
             .open(&self.local_cache_path)?;
         file.set_len((n * BLOCK_SIZE) as u64)?;
 
-        let mut mmap_mut = unsafe { memmap2::MmapMut::map_mut(&file)? };
         let degree_cap = max_degree.min(MAX_DEGREE).max(1);
-        let candidate_cap = (degree_cap * CANDIDATE_MULTIPLIER).min(n.saturating_sub(1)).max(degree_cap);
+        let candidate_cap = (degree_cap * CANDIDATE_MULTIPLIER)
+            .min(n.saturating_sub(1))
+            .max(degree_cap);
 
-        for i in 0..n {
-            let mut candidate_ids: Vec<u32> = Vec::with_capacity(candidate_cap + 4);
-            let mut seen = HashSet::with_capacity(candidate_cap + 4);
+        let adjacency: Vec<Vec<u32>> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mut candidate_ids: Vec<u32> = Vec::with_capacity(candidate_cap + 4);
+                let mut seen = HashSet::with_capacity(candidate_cap + 4);
 
-            // Always keep ring neighbors for baseline connectivity.
-            if n > 1 {
-                let prev = if i == 0 { n - 1 } else { i - 1 };
-                let next = (i + 1) % n;
-                if prev != i && seen.insert(prev as u32) {
-                    candidate_ids.push(prev as u32);
+                if n > 1 {
+                    let prev = if i == 0 { n - 1 } else { i - 1 };
+                    let next = (i + 1) % n;
+                    if prev != i && seen.insert(prev as u32) {
+                        candidate_ids.push(prev as u32);
+                    }
+                    if next != i && seen.insert(next as u32) {
+                        candidate_ids.push(next as u32);
+                    }
                 }
-                if next != i && seen.insert(next as u32) {
-                    candidate_ids.push(next as u32);
-                }
-            }
 
-            // Deterministic pseudo-random candidate sampling; avoids O(N^2) build cost.
-            let mut x = (i as u64)
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407)
-                % (n.max(1) as u64);
-            while candidate_ids.len() < candidate_cap {
-                x = x
-                    .wrapping_mul(2862933555777941757)
-                    .wrapping_add(3037000493)
+                let mut x = (i as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407)
                     % (n.max(1) as u64);
-                let cand = x as usize;
-                if cand == i {
-                    continue;
+                while candidate_ids.len() < candidate_cap {
+                    x = x
+                        .wrapping_mul(2862933555777941757)
+                        .wrapping_add(3037000493)
+                        % (n.max(1) as u64);
+                    let cand = x as usize;
+                    if cand == i {
+                        continue;
+                    }
+                    let cand_u32 = cand as u32;
+                    if seen.insert(cand_u32) {
+                        candidate_ids.push(cand_u32);
+                    }
                 }
-                let cand_u32 = cand as u32;
-                if seen.insert(cand_u32) {
-                    candidate_ids.push(cand_u32);
-                }
-            }
 
-            let mut scored: Vec<(u32, f64)> = candidate_ids
-                .iter()
-                .map(|&j| (j, build_scorer(i as u32, j)))
-                .collect();
-            scored.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
+                let mut scored: Vec<(u32, f64)> = candidate_ids
+                    .iter()
+                    .map(|&j| (j, build_scorer(i as u32, j)))
+                    .collect();
+                scored.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
 
-            let neighbors: Vec<u32> = scored
-                .into_iter()
-                .take(degree_cap.min(n.saturating_sub(1)))
-                .map(|(id, _)| id)
-                .collect();
+                scored
+                    .into_iter()
+                    .take(degree_cap.min(n.saturating_sub(1)))
+                    .map(|(id, _)| id)
+                    .collect::<Vec<u32>>()
+            })
+            .collect();
 
+        let mut mmap_mut = unsafe { memmap2::MmapMut::map_mut(&file)? };
+        for (i, neighbors) in adjacency.into_iter().enumerate() {
             let record = NodeRecord { neighbors };
             mmap_mut[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE].copy_from_slice(&record.encode());
         }
@@ -272,5 +273,3 @@ impl GraphManager {
         Ok(())
     }
 }
-
-
