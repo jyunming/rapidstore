@@ -11,9 +11,9 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
-use turboquantdb::storage::engine::{BatchWriteItem, DistanceMetric, TurboQuantEngine};
+use turboquantdb::storage::engine::{BatchWriteItem, DistanceMetric, GetResult, TurboQuantEngine};
 
 #[derive(Clone)]
 struct AppState {
@@ -380,7 +380,9 @@ struct DeleteVectorsRequest {
 
 #[derive(Deserialize)]
 struct GetVectorsRequest {
-    ids: Vec<String>,
+    ids: Option<Vec<String>>,
+    filter: Option<HashMap<String, JsonValue>>,
+    where_filter: Option<HashMap<String, JsonValue>>,
     include: Option<Vec<String>>,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -389,8 +391,10 @@ struct GetVectorsRequest {
 #[derive(Deserialize)]
 struct QueryVectorsRequest {
     query_embeddings: Vec<Vec<f64>>,
-    top_k: usize,
+    top_k: Option<usize>,
+    n_results: Option<usize>,
     filter: Option<HashMap<String, JsonValue>>,
+    where_filter: Option<HashMap<String, JsonValue>>,
     include: Option<Vec<String>>,
     offset: Option<usize>,
 }
@@ -1342,11 +1346,55 @@ async fn get_vectors(
     )?;
     let offset = body.offset.unwrap_or(0);
 
+    let selector_ids = body.ids.unwrap_or_default();
+    let where_filter = body.filter.as_ref().or(body.where_filter.as_ref());
+    if selector_ids.is_empty() && where_filter.is_none() {
+        return Err(ApiError::invalid_argument(
+            "get request requires non-empty ids and/or filter",
+            ctx.request_id.clone(),
+        ));
+    }
+
     let mut engine = open_scoped_engine_from_manifest(&state, &tenant, &database, &collection)
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
-    let mut rows = engine
-        .get_many(&body.ids)
-        .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
+
+    let mut rows = if selector_ids.is_empty() {
+        Vec::new()
+    } else {
+        engine
+            .get_many(&selector_ids)
+            .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?
+    };
+
+    if let Some(filter_expr) = where_filter {
+        let probe = Array1::zeros(engine.d);
+        let top_k = engine.vector_count().min(usize::MAX as u64) as usize;
+        let filtered_rows = if top_k == 0 {
+            Vec::new()
+        } else {
+            engine
+                .search_with_filter(&probe, top_k, Some(filter_expr))
+                .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?
+                .into_iter()
+                .map(|hit| GetResult {
+                    id: hit.id,
+                    metadata: hit.metadata,
+                    document: hit.document,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if selector_ids.is_empty() {
+            rows = filtered_rows;
+        } else {
+            let filtered_ids = filtered_rows
+                .into_iter()
+                .map(|r| r.id)
+                .collect::<HashSet<_>>();
+            rows.retain(|r| filtered_ids.contains(&r.id));
+        }
+    }
+
     if offset > 0 {
         rows = rows.into_iter().skip(offset).collect();
     }
@@ -1384,7 +1432,8 @@ async fn query_vectors(
         &database,
         Some(&collection),
     )?;
-    if body.top_k == 0 {
+    let top_k = body.top_k.or(body.n_results).unwrap_or(10);
+    if top_k == 0 {
         return Err(ApiError::invalid_argument(
             "top_k must be greater than 0",
             ctx.request_id.clone(),
@@ -1404,7 +1453,8 @@ async fn query_vectors(
         ctx.request_id.clone(),
     )?;
     let offset = body.offset.unwrap_or(0);
-    let candidate_n = body.top_k.saturating_add(offset);
+    let candidate_n = top_k.saturating_add(offset);
+    let where_filter = body.filter.as_ref().or(body.where_filter.as_ref());
 
     let mut engine = open_scoped_engine_from_manifest(&state, &tenant, &database, &collection)
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
@@ -1425,12 +1475,12 @@ async fn query_vectors(
         }
         let query = Array1::from(q.clone());
         let mut hits = engine
-            .search_with_filter(&query, candidate_n, body.filter.as_ref())
+            .search_with_filter(&query, candidate_n, where_filter)
             .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?
             .into_iter()
             .skip(offset)
             .collect::<Vec<_>>();
-        hits.truncate(body.top_k);
+        hits.truncate(top_k);
 
         rows.push(QueryRow {
             ids: include_set
@@ -2708,18 +2758,40 @@ mod tests {
         )
         .expect("create scoped collection");
 
-        let mut engine = TurboQuantEngine::open_collection_scoped(
-            ".",
-            local_root,
-            "dev",
-            "db",
-            collection,
-            2,
-            8,
-            42,
-            DistanceMetric::Ip,
-        )
-        .expect("open scoped engine");
+        let mut open_err = None;
+        let mut engine_opt = None;
+        for _ in 0..10 {
+            match TurboQuantEngine::open_collection_scoped(
+                ".",
+                local_root,
+                "dev",
+                "db",
+                collection,
+                2,
+                8,
+                42,
+                DistanceMetric::Ip,
+            ) {
+                Ok(engine) => {
+                    engine_opt = Some(engine);
+                    break;
+                }
+                Err(err) => {
+                    if err.to_string().contains("EOF while parsing a value") {
+                        std::thread::sleep(Duration::from_millis(10));
+                        open_err = Some(err.to_string());
+                        continue;
+                    }
+                    panic!("open scoped engine: {err}");
+                }
+            }
+        }
+        let mut engine = engine_opt.unwrap_or_else(|| {
+            panic!(
+                "open scoped engine: {}",
+                open_err.unwrap_or_else(|| "unknown open error".to_string())
+            )
+        });
 
         let mut meta_faq = HashMap::new();
         meta_faq.insert("source".to_string(), serde_json::json!("faq"));
@@ -2800,6 +2872,88 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("/v1/tenants/dev/databases/db/collections/c1/delete")
+            .header("Authorization", "ApiKey dev-key")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("request should execute");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(payload["error"]["code"], "invalid_argument");
+    }
+
+    #[tokio::test]
+    async fn query_endpoint_accepts_n_results_and_where_filter() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_string_lossy().to_string();
+        seed_collection_for_http(&root, "c1");
+
+        let state = mk_state_for_http_with_storage(None, None, vec![], &root);
+        let app = build_app(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/dev/databases/db/collections/c1/query")
+            .header("Authorization", "ApiKey dev-key")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                r#"{"query_embeddings":[[1.0,0.0]],"n_results":1,"where_filter":{"source":{"$eq":"faq"}},"include":["ids"]}"#,
+            ))
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("request should execute");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(payload["results"][0]["ids"][0], "id-faq");
+    }
+
+    #[tokio::test]
+    async fn get_endpoint_supports_where_filter_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_string_lossy().to_string();
+        seed_collection_for_http(&root, "c1");
+
+        let state = mk_state_for_http_with_storage(None, None, vec![], &root);
+        let app = build_app(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/dev/databases/db/collections/c1/get")
+            .header("Authorization", "ApiKey dev-key")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                r#"{"where_filter":{"source":{"$eq":"blog"}},"include":["ids"]}"#,
+            ))
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("request should execute");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(payload["ids"][0], "id-blog");
+    }
+
+    #[tokio::test]
+    async fn get_endpoint_rejects_empty_selector() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_string_lossy().to_string();
+        seed_collection_for_http(&root, "c1");
+
+        let state = mk_state_for_http_with_storage(None, None, vec![], &root);
+        let app = build_app(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/dev/databases/db/collections/c1/get")
             .header("Authorization", "ApiKey dev-key")
             .header("Content-Type", "application/json")
             .body(Body::from(r#"{}"#))
