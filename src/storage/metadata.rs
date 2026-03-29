@@ -1,6 +1,6 @@
-use serde::{Serialize, Deserialize};
+use redb::{Database as RedbDatabase, ReadableTable, TableDefinition};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use redb::{Database as RedbDatabase, TableDefinition, ReadableTable};
 
 const METADATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
@@ -8,6 +8,8 @@ const METADATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("metada
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct VectorMetadata {
     pub properties: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub document: Option<String>,
 }
 
 /// Embedded B-Tree metadata store backed by redb.
@@ -22,13 +24,19 @@ impl MetadataStore {
         let db = RedbDatabase::create(path)?;
         // Ensure table exists
         let write_txn = db.begin_write()?;
-        { let _table = write_txn.open_table(METADATA_TABLE)?; }
+        {
+            let _table = write_txn.open_table(METADATA_TABLE)?;
+        }
         write_txn.commit()?;
         Ok(Self { db })
     }
 
     /// Insert or update metadata for a vector ID.
-    pub fn put(&self, id: &str, meta: &VectorMetadata) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn put(
+        &self,
+        id: &str,
+        meta: &VectorMetadata,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let json = serde_json::to_string(meta)?;
         let write_txn = self.db.begin_write()?;
         {
@@ -40,7 +48,10 @@ impl MetadataStore {
     }
 
     /// Retrieve metadata for a vector ID.
-    pub fn get(&self, id: &str) -> Result<Option<VectorMetadata>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn get(
+        &self,
+        id: &str,
+    ) -> Result<Option<VectorMetadata>, Box<dyn std::error::Error + Send + Sync>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(METADATA_TABLE)?;
         if let Some(value) = table.get(id)? {
