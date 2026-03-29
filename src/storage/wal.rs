@@ -1,7 +1,7 @@
-use std::io::{BufWriter, Write};
+use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use serde::{Serialize, Deserialize};
 
 /// A single WAL entry representing a vector insertion
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -11,6 +11,8 @@ pub struct WalEntry {
     pub qjl_bits: Vec<i8>,
     pub gamma: f32,
     pub metadata_json: String,
+    #[serde(default)]
+    pub is_deleted: bool,
 }
 
 /// Segmented Write-Ahead Log for crash-safe insertions.
@@ -26,10 +28,7 @@ impl Wal {
     /// Open (or create) a WAL file at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             path,
             writer: BufWriter::new(file),
@@ -38,7 +37,10 @@ impl Wal {
     }
 
     /// Append an entry to the WAL — guaranteed persistent before returning.
-    pub fn append(&mut self, entry: &WalEntry) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn append(
+        &mut self,
+        entry: &WalEntry,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let encoded = bincode::serialize(entry)?;
         let len = encoded.len() as u64;
         // Write length prefix then payload
@@ -52,7 +54,9 @@ impl Wal {
     }
 
     /// Replay all entries from the WAL file (used on startup for crash recovery).
-    pub fn replay<P: AsRef<Path>>(path: P) -> Result<Vec<WalEntry>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn replay<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Vec<WalEntry>, Box<dyn std::error::Error + Send + Sync>> {
         use std::io::Read;
         let path = path.as_ref();
         if !path.exists() {
@@ -63,14 +67,14 @@ impl Wal {
         loop {
             let mut len_buf = [0u8; 8];
             match file.read_exact(&mut len_buf) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e.into()),
             }
             let len = u64::from_le_bytes(len_buf) as usize;
             let mut payload = vec![0u8; len];
             match file.read_exact(&mut payload) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(_) => break, // Partial write at tail — safe to truncate
             }
             if let Ok(entry) = bincode::deserialize::<WalEntry>(&payload) {

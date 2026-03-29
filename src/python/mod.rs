@@ -1,15 +1,14 @@
+use numpy::PyReadonlyArray1;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use numpy::PyReadonlyArray1;
+use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use serde_json::Value as JsonValue;
 
-use crate::storage::engine::TurboQuantEngine;
+use crate::storage::engine::{
+    BatchWriteItem, DistanceMetric, GetResult, SearchResult, TurboQuantEngine,
+};
 
-/// Thread-safe Python-accessible database handle.
-/// RwLock allows concurrent reads (search) with exclusive writes (insert).
-/// GIL is released during heavy Rust computation via py.allow_threads().
 #[pyclass]
 pub struct Database {
     engine: Arc<RwLock<TurboQuantEngine>>,
@@ -17,86 +16,205 @@ pub struct Database {
 
 #[pymethods]
 impl Database {
-    /// Open or create a TurboQuantDB at the given path.
-    /// `uri` can be a local directory path: "/data/my_db"
-    /// Cloud URIs (s3://, gs://) are planned for Phase 5.
     #[staticmethod]
-    #[pyo3(signature = (uri, dimension, bits, seed=42))]
-    fn open(uri: &str, dimension: usize, bits: usize, seed: u64) -> PyResult<Self> {
-        let engine = TurboQuantEngine::open(uri, dimension, bits, seed)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    #[pyo3(signature = (uri, dimension, bits, seed=42, local_dir=None, metric="ip"))]
+    fn open(
+        uri: &str,
+        dimension: usize,
+        bits: usize,
+        seed: u64,
+        local_dir: Option<String>,
+        metric: &str,
+    ) -> PyResult<Self> {
+        let metric = parse_metric(metric)?;
+        let local = local_dir.unwrap_or_else(|| uri.to_string());
+        let engine = TurboQuantEngine::open_with_metric(uri, &local, dimension, bits, seed, metric)
+            .map_err(to_py_runtime)?;
         Ok(Self {
             engine: Arc::new(RwLock::new(engine)),
         })
     }
 
-    /// Insert a single vector with optional metadata dictionary.
     fn insert(
         &self,
         py: Python<'_>,
         id: String,
         vector: PyReadonlyArray1<f64>,
         metadata: Option<&Bound<'_, PyDict>>,
+        document: Option<String>,
     ) -> PyResult<()> {
         let vec = vector.as_array().to_owned();
         let props = parse_pydict(py, metadata)?;
-
         py.allow_threads(|| {
             let mut engine = self.engine.write().unwrap();
-            engine.insert(id, &vec, props)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            engine
+                .insert_with_document(id, &vec, props, document)
+                .map_err(to_py_runtime)
         })
     }
 
-    /// Search for the top_k most similar vectors. Returns a list of dicts.
+    #[pyo3(signature = (ids, vectors, metadatas=None, documents=None, mode="insert"))]
+    fn insert_many(
+        &self,
+        py: Python<'_>,
+        ids: Vec<String>,
+        vectors: Vec<PyReadonlyArray1<f64>>,
+        metadatas: Option<&Bound<'_, PyAny>>,
+        documents: Option<&Bound<'_, PyAny>>,
+        mode: &str,
+    ) -> PyResult<()> {
+        if ids.len() != vectors.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "ids and vectors length mismatch",
+            ));
+        }
+
+        let metas = parse_metadata_rows(py, metadatas, ids.len())?;
+        let docs = parse_document_rows(documents, ids.len())?;
+
+        let mut items = Vec::with_capacity(ids.len());
+        for i in 0..ids.len() {
+            items.push(BatchWriteItem {
+                id: ids[i].clone(),
+                vector: vectors[i].as_array().to_owned(),
+                metadata: metas[i].clone(),
+                document: docs[i].clone(),
+            });
+        }
+
+        py.allow_threads(|| {
+            let mut engine = self.engine.write().unwrap();
+            match mode.to_ascii_lowercase().as_str() {
+                "insert" => engine.insert_many(items).map_err(to_py_runtime),
+                "upsert" => engine.upsert_many(items).map_err(to_py_runtime),
+                "update" => engine.update_many(items).map_err(to_py_runtime),
+                other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unsupported mode '{}' (expected insert/upsert/update)",
+                    other
+                ))),
+            }
+        })
+    }
+
+    fn upsert(
+        &self,
+        py: Python<'_>,
+        id: String,
+        vector: PyReadonlyArray1<f64>,
+        metadata: Option<&Bound<'_, PyDict>>,
+        document: Option<String>,
+    ) -> PyResult<()> {
+        let vec = vector.as_array().to_owned();
+        let props = parse_pydict(py, metadata)?;
+        py.allow_threads(|| {
+            let mut engine = self.engine.write().unwrap();
+            engine
+                .upsert_with_document(id, &vec, props, document)
+                .map_err(to_py_runtime)
+        })
+    }
+
+    fn update(
+        &self,
+        py: Python<'_>,
+        id: String,
+        vector: PyReadonlyArray1<f64>,
+        metadata: Option<&Bound<'_, PyDict>>,
+        document: Option<String>,
+    ) -> PyResult<()> {
+        let vec = vector.as_array().to_owned();
+        let props = parse_pydict(py, metadata)?;
+        py.allow_threads(|| {
+            let mut engine = self.engine.write().unwrap();
+            engine
+                .update_with_document(id, &vec, props, document)
+                .map_err(to_py_runtime)
+        })
+    }
+
+    fn delete(&self, py: Python<'_>, id: String) -> PyResult<bool> {
+        py.allow_threads(|| {
+            let mut engine = self.engine.write().unwrap();
+            engine.delete(id).map_err(to_py_runtime)
+        })
+    }
+
+    fn get(&self, py: Python<'_>, id: String) -> PyResult<Option<PyObject>> {
+        let got = py.allow_threads(|| {
+            let engine = self.engine.read().unwrap();
+            engine.get(&id).map_err(to_py_runtime)
+        })?;
+        Ok(match got {
+            Some(g) => Some(get_result_to_py(py, &g)?),
+            None => None,
+        })
+    }
+
+    #[pyo3(signature = (query, top_k, filter=None, use_ann=true, ann_search_list_size=None))]
     fn search(
         &self,
         py: Python<'_>,
         query: PyReadonlyArray1<f64>,
         top_k: usize,
+        filter: Option<&Bound<'_, PyDict>>,
+        use_ann: bool,
+        ann_search_list_size: Option<usize>,
     ) -> PyResult<PyObject> {
         let q = query.as_array().to_owned();
+        let parsed_filter = parse_pydict(py, filter)?;
+        let filter_ref = if parsed_filter.is_empty() {
+            None
+        } else {
+            Some(&parsed_filter)
+        };
 
         let results = py.allow_threads(|| {
             let engine = self.engine.read().unwrap();
-            engine.search(&q, top_k)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            if use_ann {
+                engine.search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size)
+            } else {
+                engine.search_with_filter(&q, top_k, filter_ref)
+            }
+            .map_err(to_py_runtime)
         })?;
 
         let py_list = PyList::empty(py);
         for r in results {
-            let dict = PyDict::new(py);
-            dict.set_item("id", &r.id)?;
-            dict.set_item("score", r.score)?;
-            let meta_dict = PyDict::new(py);
-            for (k, v) in &r.metadata {
-                meta_dict.set_item(k, json_to_py(py, v)?)?;
-            }
-            dict.set_item("metadata", meta_dict)?;
-            py_list.append(dict)?;
+            py_list.append(search_result_to_py(py, &r)?)?;
         }
         Ok(py_list.into())
     }
 
-    /// Flush all buffered WAL entries to disk segments.
+    #[pyo3(signature = (max_degree=32, search_list_size=128, alpha=1.2))]
+    fn create_index(
+        &self,
+        py: Python<'_>,
+        max_degree: usize,
+        search_list_size: usize,
+        alpha: f64,
+    ) -> PyResult<()> {
+        py.allow_threads(|| {
+            let mut engine = self.engine.write().unwrap();
+            engine
+                .create_index_with_params(max_degree, search_list_size, alpha)
+                .map_err(to_py_runtime)
+        })
+    }
+
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| {
             let mut engine = self.engine.write().unwrap();
-            engine.flush_wal_to_segment()
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            engine.flush_wal_to_segment().map_err(to_py_runtime)
         })
     }
 
-    /// Close the database, flushing remaining buffers.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| {
             let mut engine = self.engine.write().unwrap();
-            engine.close()
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            engine.close().map_err(to_py_runtime)
         })
     }
 
-    /// Return database statistics as a dict.
     fn stats(&self, py: Python<'_>) -> PyResult<PyObject> {
         let stats = {
             let engine = self.engine.read().unwrap();
@@ -109,6 +227,8 @@ impl Database {
         dict.set_item("dimension", stats.d)?;
         dict.set_item("bits", stats.b)?;
         dict.set_item("total_disk_bytes", stats.total_disk_bytes)?;
+        dict.set_item("has_index", stats.has_index)?;
+        dict.set_item("index_nodes", stats.index_nodes)?;
         Ok(dict.into())
     }
 
@@ -119,11 +239,108 @@ impl Database {
 
     fn __repr__(&self) -> PyResult<String> {
         let engine = self.engine.read().unwrap();
-        Ok(format!("TurboQuantDB(d={}, b={}, vectors={})", engine.d, engine.b, engine.vector_count()))
+        Ok(format!(
+            "TurboQuantDB(d={}, b={}, vectors={})",
+            engine.d,
+            engine.b,
+            engine.vector_count()
+        ))
     }
 }
 
-/// Parse an optional Python dict into HashMap<String, JsonValue>
+fn parse_metric(metric: &str) -> PyResult<DistanceMetric> {
+    match metric.to_ascii_lowercase().as_str() {
+        "ip" | "inner_product" | "inner-product" => Ok(DistanceMetric::Ip),
+        "cosine" => Ok(DistanceMetric::Cosine),
+        "l2" | "euclidean" => Ok(DistanceMetric::L2),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unsupported metric '{}' (expected ip/cosine/l2)",
+            other
+        ))),
+    }
+}
+
+fn parse_metadata_rows(
+    py: Python<'_>,
+    rows: Option<&Bound<'_, PyAny>>,
+    expected: usize,
+) -> PyResult<Vec<HashMap<String, JsonValue>>> {
+    let mut out = Vec::with_capacity(expected);
+    let Some(rows_any) = rows else {
+        return Ok(vec![HashMap::new(); expected]);
+    };
+    let list = rows_any.downcast::<PyList>()?;
+    if list.len() != expected {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "metadatas length mismatch",
+        ));
+    }
+    for item in list.iter() {
+        if item.is_none() {
+            out.push(HashMap::new());
+            continue;
+        }
+        let d = item.downcast::<PyDict>()?;
+        out.push(parse_pydict(py, Some(d))?);
+    }
+    Ok(out)
+}
+
+fn parse_document_rows(
+    rows: Option<&Bound<'_, PyAny>>,
+    expected: usize,
+) -> PyResult<Vec<Option<String>>> {
+    let mut out = Vec::with_capacity(expected);
+    let Some(rows_any) = rows else {
+        return Ok(vec![None; expected]);
+    };
+    let list = rows_any.downcast::<PyList>()?;
+    if list.len() != expected {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "documents length mismatch",
+        ));
+    }
+    for item in list.iter() {
+        if item.is_none() {
+            out.push(None);
+        } else {
+            out.push(Some(item.extract::<String>()?));
+        }
+    }
+    Ok(out)
+}
+
+fn search_result_to_py(py: Python<'_>, r: &SearchResult) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("id", &r.id)?;
+    dict.set_item("score", r.score)?;
+    let meta_dict = PyDict::new(py);
+    for (k, v) in &r.metadata {
+        meta_dict.set_item(k, json_to_py(py, v)?)?;
+    }
+    dict.set_item("metadata", meta_dict)?;
+    match &r.document {
+        Some(doc) => dict.set_item("document", doc)?,
+        None => dict.set_item("document", py.None())?,
+    }
+    Ok(dict.into())
+}
+
+fn get_result_to_py(py: Python<'_>, r: &GetResult) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("id", &r.id)?;
+    let meta_dict = PyDict::new(py);
+    for (k, v) in &r.metadata {
+        meta_dict.set_item(k, json_to_py(py, v)?)?;
+    }
+    dict.set_item("metadata", meta_dict)?;
+    match &r.document {
+        Some(doc) => dict.set_item("document", doc)?,
+        None => dict.set_item("document", py.None())?,
+    }
+    Ok(dict.into())
+}
+
 fn parse_pydict(
     py: Python<'_>,
     dict: Option<&Bound<'_, PyDict>>,
@@ -139,9 +356,7 @@ fn parse_pydict(
     Ok(props)
 }
 
-/// Convert a Python object to a serde_json Value (best-effort)
 fn py_to_json(_py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
-    // Order matters: bool before i64 since Python bool is a subtype of int
     if let Ok(v) = obj.extract::<bool>() {
         return Ok(JsonValue::Bool(v));
     }
@@ -156,36 +371,46 @@ fn py_to_json(_py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
     if let Ok(v) = obj.extract::<String>() {
         return Ok(JsonValue::String(v));
     }
-    // Fallback: store string representation
     Ok(JsonValue::String(obj.str()?.to_string()))
 }
 
-/// Convert a serde_json Value to a Python object (pyo3 0.21 compatible)
 fn json_to_py(py: Python<'_>, val: &JsonValue) -> PyResult<PyObject> {
     Ok(match val {
         JsonValue::Null => py.None(),
         JsonValue::Bool(b) => (*b).to_object(py),
         JsonValue::Number(n) => {
-            if let Some(i) = n.as_i64() { i.to_object(py) }
-            else if let Some(f) = n.as_f64() { f.to_object(py) }
-            else { n.to_string().to_object(py) }
-        },
+            if let Some(i) = n.as_i64() {
+                i.to_object(py)
+            } else if let Some(f) = n.as_f64() {
+                f.to_object(py)
+            } else {
+                n.to_string().to_object(py)
+            }
+        }
         JsonValue::String(s) => s.to_object(py),
         JsonValue::Array(arr) => {
             let list = PyList::empty(py);
-            for v in arr { list.append(json_to_py(py, v)?)?; }
+            for v in arr {
+                list.append(json_to_py(py, v)?)?;
+            }
             list.into()
-        },
+        }
         JsonValue::Object(map) => {
             let dict = PyDict::new(py);
-            for (k, v) in map { dict.set_item(k, json_to_py(py, v)?)?; }
+            for (k, v) in map {
+                dict.set_item(k, json_to_py(py, v)?)?;
+            }
             dict.into()
-        },
+        }
     })
 }
 
-/// Register the Database class with the PyO3 module.
+fn to_py_runtime(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+}
+
 pub fn register(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Database>()?;
     Ok(())
 }
+

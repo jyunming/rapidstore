@@ -1,6 +1,6 @@
 use nalgebra::{DMatrix, QR};
 use rand::{CryptoRng, Rng};
-use rand_distr::{StandardNormal, Distribution};
+use rand_distr::{Distribution, StandardNormal};
 
 /// Generates a random rotation matrix Π (d x d)
 /// This is done by:
@@ -10,20 +10,20 @@ use rand_distr::{StandardNormal, Distribution};
 pub fn generate_random_rotation<R: Rng + CryptoRng>(d: usize, rng: &mut R) -> DMatrix<f64> {
     let mut mat = DMatrix::zeros(d, d);
     let dist = StandardNormal;
-    
+
     // Fill with N(0,1)
     for i in 0..d {
         for j in 0..d {
             mat[(i, j)] = dist.sample(rng);
         }
     }
-    
+
     // Compute QR decomposition
     let qr = QR::new(mat);
-    
+
     // Extract Q matrix
     let q = qr.q();
-    
+
     // Q is an orthogonal matrix, so it's a valid rotation matrix (or reflection)
     q
 }
@@ -32,14 +32,14 @@ pub fn generate_random_rotation<R: Rng + CryptoRng>(d: usize, rng: &mut R) -> DM
 pub fn generate_projection_matrix<R: Rng + CryptoRng>(d: usize, rng: &mut R) -> DMatrix<f64> {
     let mut mat = DMatrix::zeros(d, d);
     let dist = StandardNormal;
-    
+
     // Fill with N(0,1)
     for i in 0..d {
         for j in 0..d {
             mat[(i, j)] = dist.sample(rng);
         }
     }
-    
+
     mat
 }
 
@@ -54,11 +54,11 @@ mod tests {
         let d = 10;
         let mut rng = StdRng::seed_from_u64(42);
         let q = generate_random_rotation(d, &mut rng);
-        
+
         // Orthogonality: Q^T * Q should be Identity
         let qt_q = q.transpose() * &q;
         let identity: DMatrix<f64> = DMatrix::identity(d, d);
-        
+
         for i in 0..d {
             for j in 0..d {
                 let val: f64 = qt_q[(i, j)] - identity[(i, j)];

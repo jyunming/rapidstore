@@ -1,1 +1,14 @@
 /target
+/target_*
+/.venv
+/.hf_home
+/.pydeps
+/.tmp*
+/rq_fix_*
+/benchmarks/__pycache__/
+/benchmarks/artifacts*/
+/benchmarks/store_compare_work*/
+/benchmarks/tmp*/
+/server/tenants/
+/build_error.txt
+/t

@@ -1,7 +1,11 @@
 use std::f64::consts::PI;
 
-/// Calculates the gamma function using the Lanczos approximation
-fn gamma(z: f64) -> f64 {
+/// Numerically stable log-gamma using Lanczos approximation.
+fn log_gamma(z: f64) -> f64 {
+    // Reflection for small z keeps the implementation robust.
+    if z < 0.5 {
+        return (PI / (PI * z).sin()).ln() - log_gamma(1.0 - z);
+    }
     let p = [
         676.5203681218851,
         -1259.1392167224028,
@@ -14,10 +18,10 @@ fn gamma(z: f64) -> f64 {
     ];
     let mut y = 0.99999999999980993;
     for (i, &val) in p.iter().enumerate() {
-        y += val / (z + i as f64 + 1.0);
+        y += val / (z + i as f64);
     }
-    let t = z + 7.5;
-    (2.0 * PI).sqrt() * t.powf(z + 0.5) * (-t).exp() * y / z
+    let t = z + 6.5;
+    0.5 * (2.0 * PI).ln() + (z - 0.5) * t.ln() - t + y.ln()
 }
 
 /// Evaluates the Beta distribution PDF f_X(x) for the paper's coordinate distribution.
@@ -28,16 +32,20 @@ pub fn beta_pdf(x: f64, d: usize) -> f64 {
         return 0.0;
     }
     let df = d as f64;
-    let coeff = gamma(df / 2.0) / (PI.sqrt() * gamma((df - 1.0) / 2.0));
-    let term = (1.0 - x * x).powf((df - 3.0) / 2.0);
-    coeff * term
+    let log_coeff = log_gamma(df / 2.0) - 0.5 * PI.ln() - log_gamma((df - 1.0) / 2.0);
+    let base = (1.0 - x * x).max(0.0);
+    if base == 0.0 {
+        return 0.0;
+    }
+    let log_term = ((df - 3.0) / 2.0) * base.ln();
+    (log_coeff + log_term).exp()
 }
 
 /// Computes the optimal Lloyd-Max quantizer centroids for a given distribution and bit-width.
 /// Approximates the continuous k-means using a fine grid.
 pub fn lloyd_max(b: usize, d: usize, num_points: usize) -> Vec<f64> {
     let num_centroids = 1 << b; // 2^b
-    
+
     // Create a fine grid points in [-1, 1]
     let step = 2.0 / (num_points as f64 - 1.0);
     let grid: Vec<(f64, f64)> = (0..num_points)
@@ -58,7 +66,7 @@ pub fn lloyd_max(b: usize, d: usize, num_points: usize) -> Vec<f64> {
         .collect();
 
     let mut boundaries = vec![0.0; num_centroids - 1];
-    
+
     // Lloyd-Max iterations
     let max_iter = 1000;
     let tol = 1e-7;
@@ -80,7 +88,7 @@ pub fn lloyd_max(b: usize, d: usize, num_points: usize) -> Vec<f64> {
                     cluster_idx = i + 1;
                 }
             }
-            
+
             next_centroids[cluster_idx] += x * p;
             masses[cluster_idx] += p;
         }
@@ -110,14 +118,15 @@ pub fn expected_mse(centroids: &[f64], d: usize, num_points: usize) -> f64 {
     for i in 0..num_points {
         let x = -1.0 + i as f64 * step;
         let p = beta_pdf(x, d) * step;
-        
-        let nearest = centroids.iter().min_by(|a, b| {
-            (x - **a).abs().partial_cmp(&(x - **b).abs()).unwrap()
-        }).unwrap();
-        
+
+        let nearest = centroids
+            .iter()
+            .min_by(|a, b| (x - **a).abs().partial_cmp(&(x - **b).abs()).unwrap())
+            .unwrap();
+
         var_1d += (x - *nearest).powi(2) * p;
     }
-    
+
     var_1d * d as f64
 }
 
@@ -145,22 +154,27 @@ mod tests {
         let centroids = lloyd_max(1, d, 20_000);
         // For b=1, large d, should be around +/- sqrt(2 / (pi * d))
         let expected = (2.0 / (PI * d as f64)).sqrt();
-        assert!((centroids[1] - expected).abs() < 1e-3, "Expected ~{}, got {}", expected, centroids[1]);
+        assert!(
+            (centroids[1] - expected).abs() < 1e-3,
+            "Expected ~{}, got {}",
+            expected,
+            centroids[1]
+        );
         assert!((centroids[0] - (-expected)).abs() < 1e-3);
     }
-    
+
     #[test]
     fn test_expected_mse_bounds() {
         // Test paper's MSE bounds for low bit-widths
         let d = 1536;
         let n_pts = 100_000;
-        
+
         let cents_b1 = lloyd_max(1, d, n_pts);
         let mse_b1 = expected_mse(&cents_b1, d, n_pts);
-        
+
         // Let's print out what we found
         println!("b=1 MSE: {}", mse_b1);
-        
+
         // Assert within ~5% of paper's 0.36
         assert!((mse_b1 - 0.36).abs() < 0.05);
     }
