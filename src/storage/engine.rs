@@ -4,6 +4,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use rayon::prelude::*;
 
 use super::backend::StorageBackend;
 use super::compaction::Compactor;
@@ -127,6 +128,13 @@ pub struct TurboQuantEngine {
     index_ids: Vec<String>,
     index_vectors: Vec<Array1<f64>>, // cached once per index build/open
     live_records: HashMap<String, SegmentRecord>,
+}
+
+
+enum BatchWriteMode {
+    Insert,
+    Upsert,
+    Update,
 }
 
 impl TurboQuantEngine {
@@ -306,30 +314,21 @@ impl TurboQuantEngine {
         &mut self,
         items: Vec<BatchWriteItem>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        for item in items {
-            self.insert_with_document(item.id, &item.vector, item.metadata, item.document)?;
-        }
-        Ok(())
+        self.write_many(items, BatchWriteMode::Insert)
     }
 
     pub fn upsert_many(
         &mut self,
         items: Vec<BatchWriteItem>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        for item in items {
-            self.upsert_with_document(item.id, &item.vector, item.metadata, item.document)?;
-        }
-        Ok(())
+        self.write_many(items, BatchWriteMode::Upsert)
     }
 
     pub fn update_many(
         &mut self,
         items: Vec<BatchWriteItem>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        for item in items {
-            self.update_with_document(item.id, &item.vector, item.metadata, item.document)?;
-        }
-        Ok(())
+        self.write_many(items, BatchWriteMode::Update)
     }
 
     pub fn delete(
@@ -390,10 +389,11 @@ impl TurboQuantEngine {
         records.sort_by(|a, b| a.id.cmp(&b.id));
 
         let all_vectors: Vec<Array1<f64>> = records
-            .iter()
+            .par_iter()
             .map(|r| self.quantizer.dequantize(&r.quantized_indices, &r.qjl_bits, r.gamma as f64))
             .collect();
-        let indexed_ids: Vec<String> = records.iter().map(|r| r.id.clone()).collect();
+        let indexed_ids: Vec<String> = records
+            .par_iter().map(|r| r.id.clone()).collect();
 
         let metric = self.metric.clone();
         let build_scorer = |from: u32, to: u32| {
@@ -461,10 +461,19 @@ impl TurboQuantEngine {
                     self.score_vectors(query, &self.index_vectors[node as usize])
                 })?;
 
+            let ann_ids: Vec<String> = ann
+                .iter()
+                .map(|(node, _)| self.index_ids[*node as usize].clone())
+                .collect();
+            let meta_map = self.metadata.get_many(&ann_ids)?;
+
             let mut out = Vec::with_capacity(ann.len());
-            for (node, score) in ann {
+            for (idx, (node, score)) in ann.into_iter().enumerate() {
                 let id = self.index_ids[node as usize].clone();
-                let meta = self.metadata.get(&id)?.unwrap_or_default();
+                let meta = meta_map
+                    .get(&ann_ids[idx])
+                    .cloned()
+                    .unwrap_or_default();
                 out.push(SearchResult {
                     id,
                     score,
@@ -482,9 +491,12 @@ impl TurboQuantEngine {
             return Ok(out);
         }
 
+        let live_ids: Vec<String> = self.live_records.keys().cloned().collect();
+        let meta_map = self.metadata.get_many(&live_ids)?;
+
         let mut candidates = Vec::new();
         for (id, record) in &self.live_records {
-            let meta = self.metadata.get(id)?.unwrap_or_default();
+            let meta = meta_map.get(id).cloned().unwrap_or_default();
             if let Some(f) = filter {
                 if !metadata_matches_filter(&meta.properties, f) {
                     continue;
@@ -566,6 +578,84 @@ impl TurboQuantEngine {
             has_index: self.can_use_ann_index(),
             index_nodes: self.index_ids.len(),
         }
+    }
+
+    fn write_many(
+        &mut self,
+        items: Vec<BatchWriteItem>,
+        mode: BatchWriteMode,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        for item in &items {
+            if item.vector.len() != self.d {
+                return Err(format!(
+                    "Vector dimension mismatch for '{}': got {}, expected {}",
+                    item.id,
+                    item.vector.len(),
+                    self.d
+                )
+                .into());
+            }
+            match mode {
+                BatchWriteMode::Insert if self.live_records.contains_key(&item.id) => {
+                    return Err(format!("ID '{}' already exists; use upsert/update", item.id).into())
+                }
+                BatchWriteMode::Update if !self.live_records.contains_key(&item.id) => {
+                    return Err(format!("ID '{}' does not exist; use insert/upsert", item.id).into())
+                }
+                _ => {}
+            }
+        }
+
+        let mut wal_entries = Vec::with_capacity(items.len());
+        let mut metadata_entries = Vec::with_capacity(items.len());
+        let mut live_updates = Vec::with_capacity(items.len());
+
+        for item in items {
+            let meta = VectorMetadata {
+                properties: item.metadata,
+                document: item.document,
+            };
+            let (indices, qjl, gamma) = self.quantizer.quantize(&item.vector);
+            let metadata_json = serde_json::to_string(&meta)?;
+            wal_entries.push(WalEntry {
+                id: item.id.clone(),
+                quantized_indices: indices.clone(),
+                qjl_bits: qjl.clone(),
+                gamma: gamma as f32,
+                metadata_json,
+                is_deleted: false,
+            });
+            metadata_entries.push((item.id.clone(), meta));
+            live_updates.push((
+                item.id,
+                SegmentRecord {
+                    id: wal_entries.last().unwrap().id.clone(),
+                    quantized_indices: indices,
+                    qjl_bits: qjl,
+                    gamma: gamma as f32,
+                    is_deleted: false,
+                },
+            ));
+        }
+
+        self.wal.append_batch(&wal_entries)?;
+        self.wal_buffer.extend(wal_entries.clone());
+        self.metadata.put_many(&metadata_entries)?;
+        for (id, record) in live_updates {
+            self.live_records.insert(id, record);
+        }
+
+        self.invalidate_index_state()?;
+        self.manifest.vector_count = self.live_records.len() as u64;
+
+        if self.wal_buffer.len() >= self.wal_flush_threshold {
+            self.flush_wal_to_segment()?;
+        }
+        Ok(())
     }
 
     fn write_vector_entry(
@@ -838,3 +928,11 @@ fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array
         }
     }
 }
+
+
+
+
+
+
+
+

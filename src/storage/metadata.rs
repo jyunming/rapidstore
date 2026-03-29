@@ -4,7 +4,6 @@ use std::collections::HashMap;
 
 const METADATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
-/// Arbitrary metadata stored alongside a vector.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct VectorMetadata {
     pub properties: HashMap<String, serde_json::Value>,
@@ -12,17 +11,13 @@ pub struct VectorMetadata {
     pub document: Option<String>,
 }
 
-/// Embedded B-Tree metadata store backed by redb.
-/// Stores JSON-serialized VectorMetadata keyed by vector ID string.
 pub struct MetadataStore {
     db: RedbDatabase,
 }
 
 impl MetadataStore {
-    /// Open or create the metadata store at the given path.
     pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let db = RedbDatabase::create(path)?;
-        // Ensure table exists
         let write_txn = db.begin_write()?;
         {
             let _table = write_txn.open_table(METADATA_TABLE)?;
@@ -31,7 +26,6 @@ impl MetadataStore {
         Ok(Self { db })
     }
 
-    /// Insert or update metadata for a vector ID.
     pub fn put(
         &self,
         id: &str,
@@ -47,7 +41,25 @@ impl MetadataStore {
         Ok(())
     }
 
-    /// Retrieve metadata for a vector ID.
+    pub fn put_many(
+        &self,
+        entries: &[(String, VectorMetadata)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(METADATA_TABLE)?;
+            for (id, meta) in entries {
+                let json = serde_json::to_string(meta)?;
+                table.insert(id.as_str(), json.as_str())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     pub fn get(
         &self,
         id: &str,
@@ -62,7 +74,25 @@ impl MetadataStore {
         }
     }
 
-    /// Delete metadata for a vector ID.
+    pub fn get_many(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, VectorMetadata>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut out = HashMap::with_capacity(ids.len());
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(METADATA_TABLE)?;
+        for id in ids {
+            if let Some(value) = table.get(id.as_str())? {
+                let meta: VectorMetadata = serde_json::from_str(value.value())?;
+                out.insert(id.clone(), meta);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn delete(&self, id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let write_txn = self.db.begin_write()?;
         {
