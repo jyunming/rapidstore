@@ -411,9 +411,7 @@ impl TurboQuantEngine {
 
         self.index_ids = indexed_ids;
         self.index_vectors = all_vectors;
-        save_index_ids(&self.local_dir, &self.index_ids)?;
-        self.backend
-            .write(INDEX_IDS_FILE, serde_json::to_vec_pretty(&self.index_ids)?)?;
+        // Persisted index ids are only written on create_index; avoid per-write churn here.
 
         self.manifest.index_state = Some(IndexState {
             max_degree,
