@@ -373,7 +373,9 @@ struct UpsertVectorsRequest {
 
 #[derive(Deserialize)]
 struct DeleteVectorsRequest {
-    ids: Vec<String>,
+    ids: Option<Vec<String>>,
+    filter: Option<HashMap<String, JsonValue>>,
+    where_filter: Option<HashMap<String, JsonValue>>,
 }
 
 #[derive(Deserialize)]
@@ -1278,10 +1280,39 @@ async fn delete_vectors(
         &database,
         Some(&collection),
     )?;
+
     let mut engine = open_scoped_engine_from_manifest(&state, &tenant, &database, &collection)
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
+
+    let filter = body.filter.as_ref().or(body.where_filter.as_ref());
+    let mut ids_to_delete = body.ids.unwrap_or_default();
+
+    if let Some(where_filter) = filter {
+        let probe = Array1::zeros(engine.d);
+        let top_k = engine.vector_count().min(usize::MAX as u64) as usize;
+        if top_k > 0 {
+            let filtered = engine
+                .search_with_filter(&probe, top_k, Some(where_filter))
+                .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
+            ids_to_delete.extend(filtered.into_iter().map(|h| h.id));
+        }
+    }
+
+    if ids_to_delete.is_empty() {
+        engine
+            .close()
+            .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
+        return Err(ApiError::invalid_argument(
+            "delete request requires non-empty ids and/or filter",
+            ctx.request_id.clone(),
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    ids_to_delete.retain(|id| seen.insert(id.clone()));
+
     let deleted = engine
-        .delete_many(&body.ids)
+        .delete_many(&ids_to_delete)
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
     engine
         .close()
@@ -2537,7 +2568,12 @@ mod tests {
         assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
     }
 
-    fn mk_state_for_http(max_concurrent_jobs: Option<usize>, jobs: Vec<JobRecord>) -> AppState {
+    fn mk_state_for_http_with_storage(
+        max_concurrent_jobs: Option<usize>,
+        max_disk_bytes: Option<u64>,
+        jobs: Vec<JobRecord>,
+        local_root: &str,
+    ) -> AppState {
         let mut api_key_subjects = HashMap::new();
         api_key_subjects.insert("dev-key".to_string(), "dev-user".to_string());
         let mut principals = HashMap::new();
@@ -2562,7 +2598,7 @@ mod tests {
                 tenant: "dev".to_string(),
                 max_collections: None,
                 max_vectors: None,
-                max_disk_bytes: None,
+                max_disk_bytes,
                 max_concurrent_jobs,
             },
         );
@@ -2598,13 +2634,26 @@ mod tests {
             })),
             storage: StorageConfig {
                 uri: ".".to_string(),
-                local_root: ".".to_string(),
-                auth_store_path: "auth_store.json".to_string(),
-                quota_store_path: "quota_store.json".to_string(),
-                job_store_path: "job_store.json".to_string(),
+                local_root: local_root.to_string(),
+                auth_store_path: PathBuf::from(local_root)
+                    .join("auth_store.json")
+                    .to_string_lossy()
+                    .to_string(),
+                quota_store_path: PathBuf::from(local_root)
+                    .join("quota_store.json")
+                    .to_string_lossy()
+                    .to_string(),
+                job_store_path: PathBuf::from(local_root)
+                    .join("job_store.json")
+                    .to_string_lossy()
+                    .to_string(),
             },
             job_worker_concurrency: 1,
         }
+    }
+
+    fn mk_state_for_http(max_concurrent_jobs: Option<usize>, jobs: Vec<JobRecord>) -> AppState {
+        mk_state_for_http_with_storage(max_concurrent_jobs, None, jobs, ".")
     }
 
     #[tokio::test]
@@ -2651,5 +2700,117 @@ mod tests {
             .expect("body bytes");
         let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
         assert_eq!(payload["error"]["code"], "quota_exceeded");
+    }
+
+    fn seed_collection_for_http(local_root: &str, collection: &str) {
+        TurboQuantEngine::create_collection_scoped_with_uri(
+            ".", local_root, "dev", "db", collection,
+        )
+        .expect("create scoped collection");
+
+        let mut engine = TurboQuantEngine::open_collection_scoped(
+            ".",
+            local_root,
+            "dev",
+            "db",
+            collection,
+            2,
+            8,
+            42,
+            DistanceMetric::Ip,
+        )
+        .expect("open scoped engine");
+
+        let mut meta_faq = HashMap::new();
+        meta_faq.insert("source".to_string(), serde_json::json!("faq"));
+        engine
+            .upsert_with_document(
+                "id-faq".to_string(),
+                &Array1::from(vec![1.0, 0.0]),
+                meta_faq,
+                Some("doc faq".to_string()),
+            )
+            .expect("insert faq");
+
+        let mut meta_blog = HashMap::new();
+        meta_blog.insert("source".to_string(), serde_json::json!("blog"));
+        engine
+            .upsert_with_document(
+                "id-blog".to_string(),
+                &Array1::from(vec![0.0, 1.0]),
+                meta_blog,
+                Some("doc blog".to_string()),
+            )
+            .expect("insert blog");
+
+        engine.close().expect("close seeded engine");
+    }
+
+    #[tokio::test]
+    async fn delete_endpoint_supports_filter_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_string_lossy().to_string();
+        seed_collection_for_http(&root, "c1");
+
+        let state = mk_state_for_http_with_storage(None, None, vec![], &root);
+        let app = build_app(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/dev/databases/db/collections/c1/delete")
+            .header("Authorization", "ApiKey dev-key")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"filter":{"source":{"$eq":"faq"}}}"#))
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("request should execute");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(payload["deleted"], 1);
+
+        let mut engine = TurboQuantEngine::open_collection_scoped(
+            ".",
+            &root,
+            "dev",
+            "db",
+            "c1",
+            2,
+            8,
+            42,
+            DistanceMetric::Ip,
+        )
+        .expect("open engine after delete");
+        assert!(engine.get("id-faq").expect("get faq").is_none());
+        assert!(engine.get("id-blog").expect("get blog").is_some());
+        engine.close().expect("close engine");
+    }
+
+    #[tokio::test]
+    async fn delete_endpoint_rejects_empty_selector() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_string_lossy().to_string();
+        seed_collection_for_http(&root, "c1");
+
+        let state = mk_state_for_http_with_storage(None, None, vec![], &root);
+        let app = build_app(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/dev/databases/db/collections/c1/delete")
+            .header("Authorization", "ApiKey dev-key")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("request should execute");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(payload["error"]["code"], "invalid_argument");
     }
 }
