@@ -223,12 +223,19 @@ def bench_turboquant(db_dir: Path, ids: List[str], vectors: np.ndarray, texts: L
     t0 = time.perf_counter()
     for s in range(0, len(ids), batch_size):
         e = min(len(ids), s + batch_size)
-        if hasattr(db, "insert_many"):
+        batch_ids = ids[s:e]
+        batch_vecs = np.ascontiguousarray(vectors64[s:e], dtype=np.float64)
+        batch_metas = metas[s:e]
+        batch_docs = texts[s:e]
+        if hasattr(db, "insert_batch"):
+            db.insert_batch(batch_ids, batch_vecs, batch_metas, batch_docs, "insert")
+        elif hasattr(db, "insert_many"):
             db.insert_many(
-                ids[s:e],
-                [vectors64[i] for i in range(s, e)],
-                metas[s:e],
-                texts[s:e],
+                batch_ids,
+                [row for row in batch_vecs],
+                batch_metas,
+                batch_docs,
+                "insert",
             )
         else:
             for i in range(s, e):
@@ -539,3 +546,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

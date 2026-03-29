@@ -1,4 +1,4 @@
-use numpy::PyReadonlyArray1;
+use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use serde_json::Value as JsonValue;
@@ -84,15 +84,43 @@ impl Database {
 
         py.allow_threads(|| {
             let mut engine = self.engine.write().unwrap();
-            match mode.to_ascii_lowercase().as_str() {
-                "insert" => engine.insert_many(items).map_err(to_py_runtime),
-                "upsert" => engine.upsert_many(items).map_err(to_py_runtime),
-                "update" => engine.update_many(items).map_err(to_py_runtime),
-                other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "unsupported mode '{}' (expected insert/upsert/update)",
-                    other
-                ))),
-            }
+            run_batch_write(&mut engine, items, mode)
+        })
+    }
+
+    #[pyo3(signature = (ids, vectors, metadatas=None, documents=None, mode="insert"))]
+    fn insert_batch(
+        &self,
+        py: Python<'_>,
+        ids: Vec<String>,
+        vectors: PyReadonlyArray2<f64>,
+        metadatas: Option<&Bound<'_, PyAny>>,
+        documents: Option<&Bound<'_, PyAny>>,
+        mode: &str,
+    ) -> PyResult<()> {
+        let matrix = vectors.as_array();
+        if ids.len() != matrix.nrows() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "ids and vectors row count mismatch",
+            ));
+        }
+
+        let metas = parse_metadata_rows(py, metadatas, ids.len())?;
+        let docs = parse_document_rows(documents, ids.len())?;
+
+        let mut items = Vec::with_capacity(ids.len());
+        for i in 0..ids.len() {
+            items.push(BatchWriteItem {
+                id: ids[i].clone(),
+                vector: matrix.row(i).to_owned(),
+                metadata: metas[i].clone(),
+                document: docs[i].clone(),
+            });
+        }
+
+        py.allow_threads(|| {
+            let mut engine = self.engine.write().unwrap();
+            run_batch_write(&mut engine, items, mode)
         })
     }
 
@@ -245,6 +273,22 @@ impl Database {
             engine.b,
             engine.vector_count()
         ))
+    }
+}
+
+fn run_batch_write(
+    engine: &mut TurboQuantEngine,
+    items: Vec<BatchWriteItem>,
+    mode: &str,
+) -> PyResult<()> {
+    match mode.to_ascii_lowercase().as_str() {
+        "insert" => engine.insert_many(items).map_err(to_py_runtime),
+        "upsert" => engine.upsert_many(items).map_err(to_py_runtime),
+        "update" => engine.update_many(items).map_err(to_py_runtime),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unsupported mode '{}' (expected insert/upsert/update)",
+            other
+        ))),
     }
 }
 
@@ -413,4 +457,7 @@ pub fn register(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Database>()?;
     Ok(())
 }
+
+
+
 
