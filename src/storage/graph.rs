@@ -219,22 +219,40 @@ impl GraphManager {
                     }
                 }
 
+                // Keep RNG state in full u64 space. Reducing state by `% n` collapses
+                // the period and can stall candidate discovery for many n values.
                 let mut x = (i as u64)
                     .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407)
-                    % (n.max(1) as u64);
-                while candidate_ids.len() < candidate_cap {
+                    .wrapping_add(1442695040888963407);
+                // LCG can have short periods for some n; stop when we cannot discover
+                // more unique neighbors via this generator.
+                while candidate_ids.len() < candidate_cap && (seen.len() + 1) < n {
                     x = x
                         .wrapping_mul(2862933555777941757)
-                        .wrapping_add(3037000493)
-                        % (n.max(1) as u64);
-                    let cand = x as usize;
+                        .wrapping_add(3037000493);
+                    let cand = (x % (n.max(1) as u64)) as usize;
                     if cand == i {
                         continue;
                     }
                     let cand_u32 = cand as u32;
                     if seen.insert(cand_u32) {
                         candidate_ids.push(cand_u32);
+                    }
+                }
+
+                // If LCG coverage is incomplete, deterministically fill the remainder.
+                if candidate_ids.len() < candidate_cap {
+                    for cand in 0..n {
+                        if cand == i {
+                            continue;
+                        }
+                        let cand_u32 = cand as u32;
+                        if seen.insert(cand_u32) {
+                            candidate_ids.push(cand_u32);
+                            if candidate_ids.len() >= candidate_cap {
+                                break;
+                            }
+                        }
                     }
                 }
                 candidate_ids
