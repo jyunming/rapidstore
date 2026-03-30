@@ -553,19 +553,23 @@ impl TurboQuantEngine {
     }
 
     fn write_many(&mut self, items: Vec<BatchWriteItem>, _mode: BatchWriteMode) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        for chunk in items.chunks(1000) {
+        for chunk in items.chunks(5000) {
             let vectors: Vec<_> = chunk.iter().map(|i| i.vector.clone()).collect();
             let quantized = self.quantizer.quantize_batch(&vectors);
-            let mut wal_entries = Vec::new();
+            let mut wal_entries = Vec::with_capacity(chunk.len());
+            let mut metadata_entries: Vec<(u32, VectorMetadata)> = Vec::with_capacity(chunk.len());
+
             for (item, (indices, qjl, gamma)) in chunk.iter().zip(quantized) {
                 let meta = VectorMetadata { properties: item.metadata.clone(), document: item.document.clone() };
                 wal_entries.push(WalEntry { id: item.id.clone(), quantized_indices: indices, qjl_bits: qjl, gamma: gamma as f32, metadata_json: serde_json::to_string(&meta)?, is_deleted: false });
             }
+
             self.wal.append_batch(&wal_entries, false)?;
             for (item, entry) in chunk.iter().zip(&wal_entries) {
                 let slot = self.live_alloc_or_update(&item.id, &entry.quantized_indices, &entry.qjl_bits, entry.gamma);
-                self.metadata.put(slot, &VectorMetadata { properties: item.metadata.clone(), document: item.document.clone() })?;
+                metadata_entries.push((slot, VectorMetadata { properties: item.metadata.clone(), document: item.document.clone() }));
             }
+            self.metadata.put_many(&metadata_entries)?;
             self.wal_buffer.extend(wal_entries);
         }
         self.invalidate_index_state()?;
