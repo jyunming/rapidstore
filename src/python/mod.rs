@@ -110,20 +110,29 @@ impl Database {
         let metas = parse_metadata_rows(py, metadatas, ids.len())?;
         let docs = parse_document_rows(documents, ids.len())?;
 
-        let mut items = Vec::with_capacity(ids.len());
-        for i in 0..ids.len() {
-            items.push(BatchWriteItem {
-                id: ids[i].clone(),
-                vector: matrix.row(i).to_owned(),
-                metadata: metas[i].clone(),
-                document: docs[i].clone(),
-            });
+        // We process in smaller chunks even here to avoid a giant BatchWriteItem vector
+        let chunk_size = 5000;
+        let mut start = 0;
+        while start < ids.len() {
+            let end = (start + chunk_size).min(ids.len());
+            let mut items = Vec::with_capacity(end - start);
+            for i in start..end {
+                items.push(BatchWriteItem {
+                    id: ids[i].clone(),
+                    vector: matrix.row(i).to_owned(),
+                    metadata: metas[i].clone(),
+                    document: docs[i].clone(),
+                });
+            }
+
+            py.allow_threads(|| {
+                let mut engine = self.engine.write().unwrap();
+                run_batch_write(&mut engine, items, mode)
+            })?;
+            start = end;
         }
 
-        py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
-            run_batch_write(&mut engine, items, mode)
-        })
+        Ok(())
     }
 
     fn upsert(

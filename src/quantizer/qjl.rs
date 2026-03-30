@@ -5,6 +5,7 @@ use rand::SeedableRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
+
 use crate::linalg::matmul::gemm;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -20,7 +21,7 @@ impl QjlQuantizer {
         Self { d, projection }
     }
 
-    pub fn quantize(&self, r: &Array1<f64>) -> Vec<i8> {
+    pub fn quantize(&self, r: &Array1<f64>) -> Vec<u8> {
         assert_eq!(r.len(), self.d);
 
         let mut r_mat = DMatrix::zeros(self.d, 1);
@@ -34,7 +35,7 @@ impl QjlQuantizer {
             .unwrap_or_default()
     }
 
-    pub fn quantize_batch(&self, rs: &DMatrix<f64>) -> Vec<Vec<i8>> {
+    pub fn quantize_batch(&self, rs: &DMatrix<f64>) -> Vec<Vec<u8>> {
         assert_eq!(rs.nrows(), self.d);
 
         let n = rs.ncols();
@@ -43,36 +44,45 @@ impl QjlQuantizer {
         }
 
         let s_r_batch = gemm(&self.projection, false, rs, false);
-        let mut all_qjl = vec![vec![0i8; self.d]; n];
+        let packed_len = self.d.div_ceil(8);
+        let mut all_qjl = vec![vec![0u8; packed_len]; n];
         all_qjl
             .par_iter_mut()
             .enumerate()
-            .for_each(|(col, qjl)| {
+            .for_each(|(col, packed)| {
                 for row in 0..self.d {
-                    qjl[row] = if s_r_batch[(row, col)] >= 0.0 { 1 } else { -1 };
+                    if s_r_batch[(row, col)] >= 0.0 {
+                        let byte_idx = row / 8;
+                        let bit_idx = row % 8;
+                        packed[byte_idx] |= 1u8 << bit_idx;
+                    }
                 }
             });
 
         all_qjl
     }
 
-    pub fn dequantize(&self, qjl: &[i8], gamma: f64) -> Array1<f64> {
-        assert_eq!(qjl.len(), self.d);
+    pub fn dequantize(&self, qjl: &[u8], gamma: f64) -> Array1<f64> {
+        assert_eq!(qjl.len(), self.d.div_ceil(8));
         let mut out = self.dequantize_batch(&[(qjl.to_vec(), gamma)]);
         out.pop().unwrap_or_else(|| Array1::zeros(self.d))
     }
 
-    pub fn dequantize_batch(&self, encoded: &[(Vec<i8>, f64)]) -> Vec<Array1<f64>> {
+    pub fn dequantize_batch(&self, encoded: &[(Vec<u8>, f64)]) -> Vec<Array1<f64>> {
         if encoded.is_empty() {
             return Vec::new();
         }
 
         let n = encoded.len();
+        let packed_len = self.d.div_ceil(8);
         let mut qjl_mat = DMatrix::zeros(self.d, n);
         for (col, (qjl, _)) in encoded.iter().enumerate() {
-            assert_eq!(qjl.len(), self.d);
+            assert_eq!(qjl.len(), packed_len);
             for row in 0..self.d {
-                qjl_mat[(row, col)] = qjl[row] as f64;
+                let byte_idx = row / 8;
+                let bit_idx = row % 8;
+                let bit_set = ((qjl[byte_idx] >> bit_idx) & 1u8) == 1u8;
+                qjl_mat[(row, col)] = if bit_set { 1.0 } else { -1.0 };
             }
         }
 
@@ -90,5 +100,3 @@ impl QjlQuantizer {
         out
     }
 }
-
-

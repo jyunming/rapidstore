@@ -2,43 +2,14 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
-use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::fs::File;
 use std::sync::Arc;
 
 use super::backend::StorageBackend;
 
 const MAX_DEGREE: usize = 127;
-const BLOCK_SIZE: usize = 512;
-const CANDIDATE_MULTIPLIER: usize = 8;
-
-#[derive(Clone, Debug, PartialEq)]
-struct NodeRecord {
-    pub neighbors: Vec<u32>,
-}
-
-impl NodeRecord {
-    fn encode(&self) -> [u8; BLOCK_SIZE] {
-        let mut buf = [0u8; BLOCK_SIZE];
-        let count = (self.neighbors.len() as u32).min(MAX_DEGREE as u32);
-        buf[0..4].copy_from_slice(&count.to_le_bytes());
-        for i in 0..count as usize {
-            let start = 4 + (i * 4);
-            buf[start..start + 4].copy_from_slice(&self.neighbors[i].to_le_bytes());
-        }
-        buf
-    }
-
-    fn decode(buf: &[u8]) -> Self {
-        let count = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
-        let mut neighbors = Vec::with_capacity(count);
-        for i in 0..count.min(MAX_DEGREE) {
-            let start = 4 + (i * 4);
-            neighbors.push(u32::from_le_bytes(buf[start..start + 4].try_into().unwrap()));
-        }
-        Self { neighbors }
-    }
-}
+const CANDIDATE_MULTIPLIER: usize = 2;
+const GRAPH_V2_MAGIC: &[u8; 4] = b"TQG2";
 
 #[derive(Copy, Clone, PartialEq)]
 struct SearchCandidate {
@@ -82,6 +53,8 @@ pub struct GraphManager {
     local_cache_path: String,
     mmap: Option<Mmap>,
     node_count: usize,
+    offsets: Vec<u64>,
+    data_start: usize,
 }
 
 impl GraphManager {
@@ -95,14 +68,15 @@ impl GraphManager {
             local_cache_path,
             mmap: None,
             node_count: 0,
+            offsets: Vec::new(),
+            data_start: 0,
         };
         if let Ok(data) = backend.read("graph.bin") {
             std::fs::create_dir_all(cache_dir)?;
             std::fs::write(&manager.local_cache_path, data)?;
             let file = File::open(&manager.local_cache_path)?;
-            let len = file.metadata()?.len();
             manager.mmap = Some(unsafe { Mmap::map(&file)? });
-            manager.node_count = (len as usize) / BLOCK_SIZE;
+            manager.parse_layout();
         }
         Ok(manager)
     }
@@ -115,14 +89,67 @@ impl GraphManager {
         self.node_count > 0 && self.mmap.is_some()
     }
 
-    pub fn get_neighbors(&self, node_id: u32) -> Result<Vec<u32>, String> {
+    fn parse_layout(&mut self) {
+        self.offsets.clear();
+        self.data_start = 0;
+
+        let Some(mmap) = self.mmap.as_ref() else {
+            self.node_count = 0;
+            return;
+        };
+
+        if mmap.len() >= 8 && &mmap[0..4] == GRAPH_V2_MAGIC {
+            let n = u32::from_le_bytes(mmap[4..8].try_into().unwrap()) as usize;
+            let table_bytes = (n + 1) * 8;
+            let data_start = 8 + table_bytes;
+            if mmap.len() >= data_start {
+                let mut offsets = Vec::with_capacity(n + 1);
+                let mut ok = true;
+                for i in 0..=n {
+                    let start = 8 + (i * 8);
+                    let end = start + 8;
+                    let off = u64::from_le_bytes(mmap[start..end].try_into().unwrap());
+                    offsets.push(off);
+                }
+                if offsets[0] != 0 {
+                    ok = false;
+                }
+                if let Some(last) = offsets.last().copied() {
+                    if (data_start as u64).saturating_add(last) > mmap.len() as u64 {
+                        ok = false;
+                    }
+                }
+                for w in offsets.windows(2) {
+                    if w[0] > w[1] {
+                        ok = false;
+                        break;
+                    }
+                }
+
+                if ok {
+                    self.node_count = n;
+                                self.offsets = offsets;
+                    self.data_start = data_start;
+                    return;
+                }
+            }
+        }
+        self.node_count = 0;
+    }
+
+    pub fn get_neighbors_raw(&self, node_id: u32) -> Result<&[u8], String> {
         let mmap = self.mmap.as_ref().ok_or("Graph not loaded")?;
-        let offset = (node_id as usize) * BLOCK_SIZE;
-        if offset + BLOCK_SIZE > mmap.len() {
+
+        let i = node_id as usize;
+        if i >= self.node_count {
             return Err(format!("Node ID {} out of range", node_id));
         }
-        let record = NodeRecord::decode(&mmap[offset..offset + BLOCK_SIZE]);
-        Ok(record.neighbors)
+        let start = self.data_start + self.offsets[i] as usize;
+        let end = self.data_start + self.offsets[i + 1] as usize;
+        if end > mmap.len() || start > end || end.saturating_sub(start) < 4 {
+            return Err(format!("Corrupt graph record for node {}", node_id));
+        }
+        Ok(&mmap[start..end])
     }
 
     pub fn search(
@@ -151,20 +178,29 @@ impl GraphManager {
             if results.len() >= search_list_size && current.score < results.peek().unwrap().0.score {
                 break;
             }
-            for nb in self.get_neighbors(current.id).unwrap_or_default() {
-                if visited.contains(&nb) {
-                    continue;
-                }
-                visited.insert(nb);
-                let cand = SearchCandidate {
-                    id: nb,
-                    score: scorer(nb),
-                };
-                if results.len() < search_list_size || cand.score >= results.peek().unwrap().0.score {
-                    candidates.push(cand);
-                    results.push(OrderingWrapper(cand));
-                    if results.len() > search_list_size {
-                        results.pop();
+
+            if let Ok(rec) = self.get_neighbors_raw(current.id) {
+                let count = u32::from_le_bytes(rec[0..4].try_into().unwrap()) as usize;
+                let cap_count = count.min(MAX_DEGREE);
+                for i in 0..cap_count {
+                    let p = 4 + i * 4;
+                    let nb = u32::from_le_bytes(rec[p..p + 4].try_into().unwrap());
+                    if visited.contains(&nb) {
+                        continue;
+                    }
+                    visited.insert(nb);
+                    let cand = SearchCandidate {
+                        id: nb,
+                        score: scorer(nb),
+                    };
+                    if results.len() < search_list_size
+                        || cand.score >= results.peek().unwrap().0.score
+                    {
+                        candidates.push(cand);
+                        results.push(OrderingWrapper(cand));
+                        if results.len() > search_list_size {
+                            results.pop();
+                        }
                     }
                 }
             }
@@ -187,14 +223,6 @@ impl GraphManager {
         build_scorer: impl Fn(u32, &[u32]) -> Vec<(u32, f64)> + Sync,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.mmap = None;
-
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&self.local_cache_path)?;
-        file.set_len((n * BLOCK_SIZE) as u64)?;
 
         let degree_cap = max_degree.min(MAX_DEGREE).max(1);
         let max_neighbors = n.saturating_sub(1);
@@ -260,7 +288,7 @@ impl GraphManager {
             .collect();
 
         let adjacency: Vec<Vec<u32>> = candidate_lists
-            .into_iter()
+            .into_par_iter()
             .enumerate()
             .map(|(i, candidate_ids)| {
                 let mut scored: Vec<(u32, f64)> = build_scorer(i as u32, &candidate_ids);
@@ -278,23 +306,36 @@ impl GraphManager {
             })
             .collect();
 
-        let mut mmap_mut = unsafe { memmap2::MmapMut::map_mut(&file)? };
-        for (i, neighbors) in adjacency.into_iter().enumerate() {
-            let record = NodeRecord { neighbors };
-            mmap_mut[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE].copy_from_slice(&record.encode());
+        // V2 variable-length format:
+        // [magic:4][node_count:u32][offsets:(n+1)*u64][payload]
+        // payload node i: [deg:u32][deg * u32 neighbors]
+        let mut payload = Vec::<u8>::new();
+        let mut offsets = Vec::<u64>::with_capacity(n + 1);
+        offsets.push(0);
+        for neighbors in adjacency {
+            let deg = neighbors.len().min(MAX_DEGREE) as u32;
+            payload.extend_from_slice(&deg.to_le_bytes());
+            for nb in neighbors.into_iter().take(deg as usize) {
+                payload.extend_from_slice(&nb.to_le_bytes());
+            }
+            offsets.push(payload.len() as u64);
         }
 
-        mmap_mut.flush()?;
-        drop(mmap_mut);
-        file.flush()?;
+        let mut out = Vec::<u8>::with_capacity(8 + (n + 1) * 8 + payload.len());
+        out.extend_from_slice(GRAPH_V2_MAGIC);
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+        for off in &offsets {
+            out.extend_from_slice(&off.to_le_bytes());
+        }
+        out.extend_from_slice(&payload);
+
+        std::fs::write(&self.local_cache_path, &out)?;
 
         self.node_count = n;
-        let data = std::fs::read(&self.local_cache_path)?;
-        self.backend.write("graph.bin", data)?;
+        self.backend.write("graph.bin", out)?;
         let file_ro = File::open(&self.local_cache_path)?;
         self.mmap = Some(unsafe { Mmap::map(&file_ro)? });
+        self.parse_layout();
         Ok(())
     }
 }
-
-

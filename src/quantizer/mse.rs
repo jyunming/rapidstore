@@ -23,6 +23,7 @@ impl MseQuantizer {
         let rotation = crate::linalg::rotation::generate_random_rotation(d, &mut rng);
         let num_points = 20_000;
         let centroids = lloyd_max(b, d, num_points);
+        assert!(centroids.len() <= 256, "codebook too large for u8 indices; reduce bits");
 
         Self {
             d,
@@ -120,3 +121,5 @@ impl MseQuantizer {
         gemm(&self.rotation, true, &y_tilde_batch, false)
     }
 }
+
+

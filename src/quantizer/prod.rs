@@ -18,10 +18,16 @@ pub struct ProdQuantizer {
 
 pub struct PreparedIpQuery {
     // Lookup table flattened as [dim0 c0..cK, dim1 c0..cK, ...]
-    mse_lut: Vec<f64>,
+    mse_lut: Vec<f32>,
     mse_lut_width: usize,
-    sq: Vec<f64>,
-    qjl_scale: f64,
+    sq: Vec<f32>,
+    qjl_scale: f32,
+}
+
+pub struct PreparedIpQueryLite {
+    y: Vec<f32>,
+    sq: Vec<f32>,
+    qjl_scale: f32,
 }
 
 impl ProdQuantizer {
@@ -42,8 +48,8 @@ impl ProdQuantizer {
     pub fn prepare_ip_query(&self, query: &Array1<f64>) -> PreparedIpQuery {
         assert_eq!(query.len(), self.d);
 
-        let mut y = vec![0.0f64; self.d];
-        let mut sq = vec![0.0f64; self.d];
+        let mut y = vec![0.0f32; self.d];
+        let mut sq = vec![0.0f32; self.d];
 
         // y = R * q
         for row in 0..self.d {
@@ -51,18 +57,18 @@ impl ProdQuantizer {
             for col in 0..self.d {
                 acc += self.mse_quantizer.rotation[(row, col)] * query[col];
             }
-            y[row] = acc;
+            y[row] = acc as f32;
         }
 
         // Precompute MSE lookup scores for each dimension/code.
         let centroids = &self.mse_quantizer.centroids;
         let lut_w = centroids.len();
-        let mut mse_lut = vec![0.0f64; self.d * lut_w];
+        let mut mse_lut = vec![0.0f32; self.d * lut_w];
         for i in 0..self.d {
             let yi = y[i];
             let row_off = i * lut_w;
             for (k, &c) in centroids.iter().enumerate() {
-                mse_lut[row_off + k] = c * yi;
+                mse_lut[row_off + k] = (c * yi as f64) as f32;
             }
         }
 
@@ -72,15 +78,82 @@ impl ProdQuantizer {
             for col in 0..self.d {
                 acc += self.qjl_quantizer.projection[(row, col)] * query[col];
             }
-            sq[row] = acc;
+            sq[row] = acc as f32;
         }
 
         PreparedIpQuery {
             mse_lut,
             mse_lut_width: lut_w,
             sq,
-            qjl_scale: (PI / (2.0 * self.d as f64)).sqrt(),
+            qjl_scale: (PI / (2.0 * self.d as f64)).sqrt() as f32,
         }
+    }
+
+    pub fn prepare_ip_query_lite(&self, query: &Array1<f64>) -> PreparedIpQueryLite {
+        assert_eq!(query.len(), self.d);
+
+        let mut y = vec![0.0f32; self.d];
+        let mut sq = vec![0.0f32; self.d];
+
+        for row in 0..self.d {
+            let mut acc = 0.0;
+            for col in 0..self.d {
+                acc += self.mse_quantizer.rotation[(row, col)] * query[col];
+            }
+            y[row] = acc as f32;
+        }
+
+        for row in 0..self.d {
+            let mut acc = 0.0;
+            for col in 0..self.d {
+                acc += self.qjl_quantizer.projection[(row, col)] * query[col];
+            }
+            sq[row] = acc as f32;
+        }
+
+        PreparedIpQueryLite {
+            y,
+            sq,
+            qjl_scale: (PI / (2.0 * self.d as f64)).sqrt() as f32,
+        }
+    }
+
+    pub fn score_ip_encoded_lite(
+        &self,
+        prep: &PreparedIpQueryLite,
+        idx: &[CodeIndex],
+        qjl: &[u8],
+        gamma: f64,
+    ) -> f64 {
+        let mut mse_score = 0.0f32;
+        let centroids = &self.mse_quantizer.centroids;
+        let prep_y = &prep.y;
+
+        for i in 0..self.d {
+            let c = unsafe { *centroids.get_unchecked(idx[i] as usize) };
+            mse_score += (c as f32) * unsafe { *prep_y.get_unchecked(i) };
+        }
+
+        let mut qjl_score = 0.0f32;
+        let sq = &prep.sq;
+        let qjl_len = qjl.len();
+
+        for byte_idx in 0..qjl_len {
+            let byte = unsafe { *qjl.get_unchecked(byte_idx) };
+            let base_i = byte_idx << 3;
+
+            for bit_idx in 0..8 {
+                let i = base_i + bit_idx;
+                if i >= self.d {
+                    break;
+                }
+                let bit_set = ((byte >> bit_idx) & 1u8) == 1u8;
+                let s = unsafe { *sq.get_unchecked(i) };
+                qjl_score += if bit_set { s } else { -s };
+            }
+        }
+
+        (mse_score + (gamma as f32) * prep.qjl_scale * qjl_score) as f64
     }
 
     pub fn score_ip_encoded(
@@ -90,21 +163,37 @@ impl ProdQuantizer {
         qjl: &[u8],
         gamma: f64,
     ) -> f64 {
-        let mut mse_score = 0.0f64;
+        let mut mse_score = 0.0f32;
+        let lut_width = prep.mse_lut_width;
+        let lut = &prep.mse_lut;
+
+        let mut row_off = 0;
         for i in 0..self.d {
-            let row_off = i * prep.mse_lut_width;
-            mse_score += prep.mse_lut[row_off + idx[i] as usize];
+            let val = unsafe { *lut.get_unchecked(row_off + idx[i] as usize) };
+            mse_score += val;
+            row_off += lut_width;
         }
 
-        let mut qjl_score = 0.0f64;
-        for i in 0..self.d {
-            let byte_idx = i / 8;
-            let bit_idx = i % 8;
-            let bit_set = ((qjl[byte_idx] >> bit_idx) & 1u8) == 1u8;
-            qjl_score += if bit_set { prep.sq[i] } else { -prep.sq[i] };
+        let mut qjl_score = 0.0f32;
+        let sq = &prep.sq;
+
+        let qjl_len = qjl.len();
+        for byte_idx in 0..qjl_len {
+            let byte = unsafe { *qjl.get_unchecked(byte_idx) };
+            let base_i = byte_idx << 3;
+
+            for bit_idx in 0..8 {
+                let i = base_i + bit_idx;
+                if i >= self.d {
+                    break;
+                }
+                let bit_set = ((byte >> bit_idx) & 1u8) == 1u8;
+                let s = unsafe { *sq.get_unchecked(i) };
+                qjl_score += if bit_set { s } else { -s };
+            }
         }
 
-        mse_score + gamma * prep.qjl_scale * qjl_score
+        (mse_score + (gamma as f32) * prep.qjl_scale * qjl_score) as f64
     }
 
     pub fn quantize(&self, x: &Array1<f64>) -> (Vec<CodeIndex>, Vec<u8>, f64) {
@@ -168,6 +257,52 @@ impl ProdQuantizer {
     pub fn dequantize(&self, idx: &[CodeIndex], qjl: &[u8], gamma: f64) -> Array1<f64> {
         let mut out = self.dequantize_batch(&[(idx.to_vec(), qjl.to_vec(), gamma)]);
         out.pop().unwrap_or_else(|| Array1::zeros(self.d))
+    }
+
+    pub fn dequantize_single_no_parallel(
+        &self,
+        idx: &[CodeIndex],
+        qjl: &[u8],
+        gamma: f64,
+    ) -> Array1<f64> {
+        assert_eq!(idx.len(), self.d);
+        assert_eq!(qjl.len(), self.d.div_ceil(8));
+
+        let mut y_tilde = vec![0.0f64; self.d];
+        for i in 0..self.d {
+            y_tilde[i] = self.mse_quantizer.centroids[idx[i] as usize];
+        }
+
+        // x_mse = R^T * y_tilde
+        let mut x_mse = vec![0.0f64; self.d];
+        for row in 0..self.d {
+            let mut acc = 0.0;
+            for col in 0..self.d {
+                acc += self.mse_quantizer.rotation[(col, row)] * y_tilde[col];
+            }
+            x_mse[row] = acc;
+        }
+
+        // x_qjl = sqrt(pi/(2d)) * gamma * S^T * sign(qjl)
+        let mut x_qjl = vec![0.0f64; self.d];
+        let scale = (PI / (2.0 * self.d as f64)).sqrt() * gamma;
+        for row in 0..self.d {
+            let mut acc = 0.0;
+            for col in 0..self.d {
+                let byte_idx = col / 8;
+                let bit_idx = col % 8;
+                let bit_set = ((qjl[byte_idx] >> bit_idx) & 1u8) == 1u8;
+                let sign = if bit_set { 1.0 } else { -1.0 };
+                acc += self.qjl_quantizer.projection[(col, row)] * sign;
+            }
+            x_qjl[row] = scale * acc;
+        }
+
+        let mut out = Array1::zeros(self.d);
+        for i in 0..self.d {
+            out[i] = x_mse[i] + x_qjl[i];
+        }
+        out
     }
 
     pub fn dequantize_batch(&self, encoded: &[(Vec<CodeIndex>, Vec<u8>, f64)]) -> Vec<Array1<f64>> {

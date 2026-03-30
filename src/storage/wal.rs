@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WalEntry {
     pub id: String,
-    pub quantized_indices: Vec<u16>,
-    pub qjl_bits: Vec<i8>,
+    pub quantized_indices: Vec<u8>,
+    pub qjl_bits: Vec<u8>,
     pub gamma: f32,
     pub metadata_json: String,
     #[serde(default)]
@@ -110,4 +110,5 @@ impl Wal {
         self.entry_count
     }
 }
+
 

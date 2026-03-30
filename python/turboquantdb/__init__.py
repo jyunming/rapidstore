@@ -1,3 +1,3 @@
-from .turboquantdb import Database
+from .turboquantdb import Database, TurboQuantDB
 
-__all__ = ["Database"]
+__all__ = ["Database", "TurboQuantDB"]
