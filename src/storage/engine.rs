@@ -16,6 +16,7 @@ use crate::quantizer::prod::ProdQuantizer;
 
 const QUANTIZER_STATE_FILE: &str = "quantizer.bin";
 const INDEX_IDS_FILE: &str = "graph_ids.json";
+const MANIFEST_SAVE_INTERVAL_OPS: usize = 64;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -129,6 +130,8 @@ pub struct TurboQuantEngine {
     index_vectors: Vec<Array1<f64>>, // cached once per index build/open
     live_records: HashMap<String, SegmentRecord>,
     live_vectors: HashMap<String, Array1<f64>>,
+    index_ids_dirty: bool,
+    pending_manifest_updates: usize,
 }
 
 
@@ -245,6 +248,8 @@ impl TurboQuantEngine {
             index_vectors: Vec::new(),
             live_records: HashMap::new(),
             live_vectors: HashMap::new(),
+            index_ids_dirty: false,
+            pending_manifest_updates: 0,
         };
 
         let pending = Wal::replay(&wal_path)?;
@@ -348,13 +353,15 @@ impl TurboQuantEngine {
             metadata_json: "{}".to_string(),
             is_deleted: true,
         };
-        self.wal.append(&entry)?;
+        self.wal.append(&entry, false)?;
         self.wal_buffer.push(entry);
         self.metadata.delete(&id)?;
         self.live_records.remove(&id);
         self.live_vectors.remove(&id);
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_records.len() as u64;
+        self.pending_manifest_updates += 1;
+        self.maybe_persist_state(false)?;
         if self.wal_buffer.len() >= self.wal_flush_threshold {
             self.flush_wal_to_segment()?;
         }
@@ -386,7 +393,7 @@ impl TurboQuantEngine {
         let mut records: Vec<SegmentRecord> = self.live_records.values().cloned().collect();
         if records.is_empty() {
             self.invalidate_index_state()?;
-            self.save_manifest()?;
+            self.maybe_persist_state(true)?;
             return Ok(());
         }
         records.sort_by(|a, b| a.id.cmp(&b.id));
@@ -411,7 +418,7 @@ impl TurboQuantEngine {
 
         self.index_ids = indexed_ids;
         self.index_vectors = all_vectors;
-        // Persisted index ids are only written on create_index; avoid per-write churn here.
+        self.index_ids_dirty = true;
 
         self.manifest.index_state = Some(IndexState {
             max_degree,
@@ -419,7 +426,8 @@ impl TurboQuantEngine {
             alpha,
             indexed_nodes: self.index_ids.len(),
         });
-        self.save_manifest()?;
+        self.pending_manifest_updates += 1;
+        self.maybe_persist_state(true)?;
         Ok(())
     }
 
@@ -573,13 +581,16 @@ impl TurboQuantEngine {
 
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_records.len() as u64;
+        self.pending_manifest_updates += 1;
+        self.maybe_persist_state(false)?;
         Ok(())
     }
 
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.flush_wal_to_segment()?;
         save_quantizer_state(&self.local_dir, &self.backend, &self.quantizer)?;
-        self.save_manifest()?;
+        self.pending_manifest_updates += 1;
+        self.maybe_persist_state(true)?;
         Ok(())
     }
 
@@ -634,9 +645,18 @@ impl TurboQuantEngine {
         let mut metadata_entries = Vec::with_capacity(items.len());
         let mut live_updates = Vec::with_capacity(items.len());
 
-        let vectors: Vec<Array1<f64>> = items.iter().map(|item| item.vector.clone()).collect();
+        // Parallel chunking keeps quantization CPU-bound and avoids one giant batch bottleneck.
+        let quantize_chunk_size = 128usize;
+        let quantized_chunks: Vec<Vec<(Vec<usize>, Vec<i8>, f64)>> = items
+            .par_chunks(quantize_chunk_size)
+            .map(|chunk| {
+                let vectors: Vec<Array1<f64>> =
+                    chunk.iter().map(|item| item.vector.clone()).collect();
+                self.quantizer.quantize_batch(&vectors)
+            })
+            .collect();
         let quantized: Vec<(Vec<usize>, Vec<i8>, f64)> =
-            self.quantizer.quantize_batch(&vectors);
+            quantized_chunks.into_iter().flatten().collect();
 
         for (item, (indices, qjl, gamma)) in items.into_iter().zip(quantized.into_iter()) {
             let meta = VectorMetadata {
@@ -666,8 +686,8 @@ impl TurboQuantEngine {
             ));
         }
 
-        self.wal.append_batch(&wal_entries)?;
-        self.wal_buffer.extend(wal_entries.clone());
+        self.wal.append_batch(&wal_entries, false)?;
+        self.wal_buffer.extend(wal_entries);
         self.metadata.put_many(&metadata_entries)?;
         for (id, vec, record) in live_updates {
             self.live_vectors.insert(id.clone(), vec);
@@ -677,7 +697,8 @@ impl TurboQuantEngine {
 
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_records.len() as u64;
-
+        self.pending_manifest_updates += 1;
+        self.maybe_persist_state(false)?;
         if self.wal_buffer.len() >= self.wal_flush_threshold {
             self.flush_wal_to_segment()?;
         }
@@ -711,10 +732,9 @@ impl TurboQuantEngine {
             is_deleted,
         };
 
-        self.wal.append(&entry)?;
+        self.wal.append(&entry, false)?;
         self.wal_buffer.push(entry.clone());
 
-        if !is_deleted {
         if !is_deleted {
             self.metadata.put(&id, &meta)?;
             self.live_vectors.insert(id.clone(), vector.clone());
@@ -729,11 +749,11 @@ impl TurboQuantEngine {
                 },
             );
         }
-        }
 
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_records.len() as u64;
-
+        self.pending_manifest_updates += 1;
+        self.maybe_persist_state(false)?;
         if self.wal_buffer.len() >= self.wal_flush_threshold {
             self.flush_wal_to_segment()?;
         }
@@ -760,20 +780,26 @@ impl TurboQuantEngine {
             );
         }
         by_id.retain(|_, r| !r.is_deleted);
-        let by_vec: HashMap<String, Array1<f64>> = by_id
-            .iter()
-            .map(|(id, r)| {
-                (
-                    id.clone(),
-                    self.quantizer
-                        .dequantize(&r.quantized_indices, &r.qjl_bits, r.gamma as f64),
-                )
-            })
-            .collect();
+
+        let mut ids = Vec::with_capacity(by_id.len());
+        let mut encoded = Vec::with_capacity(by_id.len());
+        for (id, r) in &by_id {
+            ids.push(id.clone());
+            encoded.push((
+                r.quantized_indices.clone(),
+                r.qjl_bits.clone(),
+                r.gamma as f64,
+            ));
+        }
+
+        let vectors = self.quantizer.dequantize_batch(&encoded);
+        let by_vec: HashMap<String, Array1<f64>> = ids.into_iter().zip(vectors).collect();
+
         self.live_records = by_id;
         self.live_vectors = by_vec;
         Ok(())
     }
+
     fn refresh_index_vectors_cache(
         &mut self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -781,18 +807,22 @@ impl TurboQuantEngine {
         if self.index_ids.is_empty() {
             return Ok(());
         }
+
+        let mut encoded = Vec::with_capacity(self.index_ids.len());
         for id in &self.index_ids {
             let Some(record) = self.live_records.get(id) else {
                 self.index_ids.clear();
                 self.manifest.index_state = None;
                 return Ok(());
             };
-            self.index_vectors.push(self.quantizer.dequantize(
-                &record.quantized_indices,
-                &record.qjl_bits,
+            encoded.push((
+                record.quantized_indices.clone(),
+                record.qjl_bits.clone(),
                 record.gamma as f64,
             ));
         }
+
+        self.index_vectors = self.quantizer.dequantize_batch(&encoded);
         Ok(())
     }
 
@@ -806,9 +836,30 @@ impl TurboQuantEngine {
         self.index_ids.clear();
         self.index_vectors.clear();
         self.manifest.index_state = None;
-        save_index_ids(&self.local_dir, &self.index_ids)?;
-        self.backend
-            .write(INDEX_IDS_FILE, serde_json::to_vec_pretty(&self.index_ids)?)?;
+        self.index_ids_dirty = true;
+        Ok(())
+    }
+
+    fn maybe_persist_state(
+        &mut self,
+        force: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !force
+            && !self.index_ids_dirty
+            && self.pending_manifest_updates < MANIFEST_SAVE_INTERVAL_OPS
+        {
+            return Ok(());
+        }
+
+        if self.index_ids_dirty {
+            save_index_ids(&self.local_dir, &self.index_ids)?;
+            self.backend
+                .write(INDEX_IDS_FILE, serde_json::to_vec_pretty(&self.index_ids)?)?;
+            self.index_ids_dirty = false;
+        }
+
+        self.save_manifest()?;
+        self.pending_manifest_updates = 0;
         Ok(())
     }
 
@@ -910,7 +961,6 @@ fn load_quantizer_state(
 
     Err("Manifest missing quantizer state and quantizer.bin not found".into())
 }
-
 fn save_index_ids(
     local_dir: &str,
     ids: &[String],
@@ -967,6 +1017,23 @@ fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
