@@ -965,9 +965,10 @@ dependencies = [
 
 [[package]]
 name = "turboquantdb"
-version = "0.2.0"
+version = "0.1.9"
 dependencies = [
  "bincode",
+ "matrixmultiply",
  "memmap2",
  "nalgebra",
  "ndarray",
