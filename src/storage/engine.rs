@@ -1,4 +1,5 @@
 use ndarray::Array1;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -421,30 +422,20 @@ impl TurboQuantEngine {
 
         let indexed_ids: Vec<SharedStrArc<str>> = id_slot_pairs.iter().map(|(id, _)| id.clone()).collect();
         let indexed_slots: Vec<u32> = id_slot_pairs.iter().map(|(_, slot)| *slot).collect();
-
-        let mut build_vectors_f32 = vec![0.0f32; indexed_ids.len() * self.d];
-        for (i, id) in indexed_ids.iter().enumerate() {
-            let v = self.live_vectors.get(id.as_ref()).cloned().unwrap_or_else(|| {
-                let slot = self.live_id_to_slot[id.as_ref()] as usize;
-                let (indices, qjl, gamma) = self.live_codes_at_slot(slot);
-                self.quantizer.dequantize(indices, qjl, gamma as f64)
-            });
-            let start = i * self.d;
-            for (j, x) in v.iter().enumerate() {
-                build_vectors_f32[start + j] = *x as f32;
-            }
-        }
+        let all_vectors: Vec<Array1<f64>> = indexed_ids
+            .par_iter()
+            .map(|id| {
+                self.live_vectors.get(id.as_ref()).cloned().unwrap_or_else(|| {
+                    let slot = self.live_id_to_slot[id.as_ref()] as usize;
+                    let (indices, qjl, gamma) = self.live_codes_at_slot(slot);
+                    self.quantizer.dequantize(indices, qjl, gamma as f64)
+                })
+            })
+            .collect();
 
         let metric = self.metric.clone();
-        let d = self.d;
         let build_scorer = |from: u32, to: u32| {
-            let a0 = from as usize * d;
-            let b0 = to as usize * d;
-            score_slices_with_metric_f32(
-                &metric,
-                &build_vectors_f32[a0..a0 + d],
-                &build_vectors_f32[b0..b0 + d],
-            )
+            score_vectors_with_metric(&metric, &all_vectors[from as usize], &all_vectors[to as usize])
         };
 
         self.graph
@@ -1123,42 +1114,6 @@ fn metadata_matches_filter(
 }
 
 
-
-fn score_slices_with_metric_f32(metric: &DistanceMetric, a: &[f32], b: &[f32]) -> f64 {
-    match metric {
-        DistanceMetric::Ip => a
-            .iter()
-            .zip(b.iter())
-            .map(|(x, y)| (*x as f64) * (*y as f64))
-            .sum(),
-        DistanceMetric::Cosine => {
-            let mut dot = 0.0f64;
-            let mut na = 0.0f64;
-            let mut nb = 0.0f64;
-            for (x, y) in a.iter().zip(b.iter()) {
-                let xf = *x as f64;
-                let yf = *y as f64;
-                dot += xf * yf;
-                na += xf * xf;
-                nb += yf * yf;
-            }
-            if na == 0.0 || nb == 0.0 {
-                0.0
-            } else {
-                dot / (na.sqrt() * nb.sqrt())
-            }
-        }
-        DistanceMetric::L2 => {
-            let mut s = 0.0f64;
-            for (x, y) in a.iter().zip(b.iter()) {
-                let d = (*x as f64) - (*y as f64);
-                s += d * d;
-            }
-            -s.sqrt()
-        }
-    }
-}
-
 fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array1<f64>) -> f64 {
     match metric {
         DistanceMetric::Ip => a.iter().zip(b.iter()).map(|(x, y)| x * y).sum(),
@@ -1184,7 +1139,6 @@ fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array
         }
     }
 }
-
 
 
 
