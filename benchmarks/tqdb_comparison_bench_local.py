@@ -288,12 +288,17 @@ def run_turboquantdb(N):
             p50, p95 = p50p95(lambda: db.search(query=q, top_k=TOP_K, use_ann=True))
         cpu = mon.stats()
 
+        # Drop caller-side inputs before final RAM sample to report engine-only footprint.
+        del vecs, ids, metadatas, q
+        gc.collect()
+        ram_engine_mb = rss_mb() - ram0
+
         stats = stats_post_index
         out = {
             "ingest_s": ingest_s,
             "build_s": build_s,
             "disk_mb": dir_mb(d),
-            "ram_mb": rss_mb() - ram0,
+            "ram_mb": ram_engine_mb,
             "cpu_peak": cpu.peak,
             "cpu_avg": cpu.avg,
             "p50": p50,
