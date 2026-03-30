@@ -201,7 +201,7 @@ impl GraphManager {
             .min(n.saturating_sub(1))
             .max(degree_cap);
 
-        let adjacency: Vec<Vec<u32>> = (0..n)
+        let candidate_lists: Vec<Vec<u32>> = (0..n)
             .into_par_iter()
             .map(|i| {
                 let mut candidate_ids: Vec<u32> = Vec::with_capacity(candidate_cap + 4);
@@ -236,7 +236,14 @@ impl GraphManager {
                         candidate_ids.push(cand_u32);
                     }
                 }
+                candidate_ids
+            })
+            .collect();
 
+        let adjacency: Vec<Vec<u32>> = candidate_lists
+            .into_iter()
+            .enumerate()
+            .map(|(i, candidate_ids)| {
                 let mut scored: Vec<(u32, f64)> = build_scorer(i as u32, &candidate_ids);
                 scored.sort_by(|a, b| {
                     b.1.partial_cmp(&a.1)
@@ -270,3 +277,4 @@ impl GraphManager {
         Ok(())
     }
 }
+
