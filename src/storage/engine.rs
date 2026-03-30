@@ -1,5 +1,4 @@
 use ndarray::Array1;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -418,19 +417,51 @@ impl TurboQuantEngine {
         let indexed_ids: Vec<String> = id_slot_pairs.iter().map(|(id, _)| id.clone()).collect();
         let indexed_slots: Vec<u32> = id_slot_pairs.iter().map(|(_, slot)| *slot).collect();
 
-        let all_vectors: Vec<Array1<f64>> = id_slot_pairs
-            .par_iter()
-            .map(|(id, slot)| {
-                self.live_vectors.get(id).cloned().unwrap_or_else(|| {
-                    let (indices, qjl, gamma) = self.live_codes_at_slot(*slot as usize);
-                    self.quantizer.dequantize(indices, qjl, gamma as f64)
-                })
-            })
-            .collect();
-
         let metric = self.metric.clone();
-        let build_scorer = |from: u32, to: u32| {
-            score_vectors_with_metric(&metric, &all_vectors[from as usize], &all_vectors[to as usize])
+        let d = self.d;
+        let qjl_len = self.live_qjl_len();
+        let stride = self.live_stride();
+        let codes = self.live_codes.clone();
+        let quantizer = self.quantizer.clone();
+        let slots_for_graph = indexed_slots.clone();
+
+        let build_scorer = move |from: u32, to: u32| {
+            let slot_from = slots_for_graph[from as usize] as usize;
+            let slot_to = slots_for_graph[to as usize] as usize;
+
+            let base_from = slot_from * stride;
+            let base_to = slot_to * stride;
+
+            let idx_from = &codes[base_from..base_from + d];
+            let qjl_from = &codes[base_from + d..base_from + d + qjl_len];
+            let gamma_from_off = base_from + d + qjl_len;
+            let gamma_from = f32::from_le_bytes(
+                codes[gamma_from_off..gamma_from_off + LIVE_GAMMA_BYTES]
+                    .try_into()
+                    .unwrap(),
+            );
+
+            let idx_to = &codes[base_to..base_to + d];
+            let qjl_to = &codes[base_to + d..base_to + d + qjl_len];
+            let gamma_to_off = base_to + d + qjl_len;
+            let gamma_to = f32::from_le_bytes(
+                codes[gamma_to_off..gamma_to_off + LIVE_GAMMA_BYTES]
+                    .try_into()
+                    .unwrap(),
+            );
+
+            match metric {
+                DistanceMetric::Ip => {
+                    let from_vec = quantizer.dequantize(idx_from, qjl_from, gamma_from as f64);
+                    let prep = quantizer.prepare_ip_query(&from_vec);
+                    quantizer.score_ip_encoded(&prep, idx_to, qjl_to, gamma_to as f64)
+                }
+                DistanceMetric::Cosine | DistanceMetric::L2 => {
+                    let from_vec = quantizer.dequantize(idx_from, qjl_from, gamma_from as f64);
+                    let to_vec = quantizer.dequantize(idx_to, qjl_to, gamma_to as f64);
+                    score_vectors_with_metric(&metric, &from_vec, &to_vec)
+                }
+            }
         };
 
         self.graph
@@ -1126,6 +1157,7 @@ fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array
         }
     }
 }
+
 
 
 
