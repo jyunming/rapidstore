@@ -1,12 +1,13 @@
 use nalgebra::DMatrix;
 use ndarray::Array1;
-use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand::SeedableRng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::codebook::lloyd_max;
+use crate::linalg::matmul::gemm;
 
-/// TurboQuant_mse Quantizer structure
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MseQuantizer {
     pub d: usize,
@@ -16,14 +17,9 @@ pub struct MseQuantizer {
 }
 
 impl MseQuantizer {
-    /// Creates a new MseQuantizer with the specified dimension and bit-width.
     pub fn new(d: usize, b: usize, seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
-
-        // 1. Generate Rotation Matrix using Linalg module
         let rotation = crate::linalg::rotation::generate_random_rotation(d, &mut rng);
-
-        // 2. Compute Lloyd-Max Codebook for beta distribution
         let num_points = 20_000;
         let centroids = lloyd_max(b, d, num_points);
 
@@ -35,9 +31,6 @@ impl MseQuantizer {
         }
     }
 
-    /// Quantizes a single input vector.
-    /// Input x: D-dimensional vector (should be unit length for optimal theoretical match).
-    /// Output: b-bit indices for each coordinate.
     pub fn quantize(&self, x: &Array1<f64>) -> Vec<usize> {
         assert_eq!(x.len(), self.d);
 
@@ -52,8 +45,6 @@ impl MseQuantizer {
             .unwrap_or_default()
     }
 
-    /// Quantizes a batch of vectors arranged as a (d, n) matrix.
-    /// Returns n vectors of centroid indices, each with length d.
     pub fn quantize_batch(&self, xs: &DMatrix<f64>) -> Vec<Vec<usize>> {
         assert_eq!(xs.nrows(), self.d);
 
@@ -62,16 +53,18 @@ impl MseQuantizer {
             return Vec::new();
         }
 
-        // y_batch = Pi * xs
-        let y_batch = &self.rotation * xs;
-
+        let y_batch = gemm(&self.rotation, false, xs, false);
         let mut all_indices = vec![vec![0usize; self.d]; n];
-        for col in 0..n {
-            for row in 0..self.d {
-                let val = y_batch[(row, col)];
-                all_indices[col][row] = self.nearest_centroid_index(val);
-            }
-        }
+
+        all_indices
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(col, idxs)| {
+                for row in 0..self.d {
+                    let val = y_batch[(row, col)];
+                    idxs[row] = self.nearest_centroid_index(val);
+                }
+            });
 
         all_indices
     }
@@ -97,7 +90,6 @@ impl MseQuantizer {
         }
     }
 
-    /// Dequantizes a single index vector back to a real vector.
     pub fn dequantize(&self, indices: &[usize]) -> Array1<f64> {
         assert_eq!(indices.len(), self.d);
         let batch = vec![indices.to_vec()];
@@ -110,7 +102,6 @@ impl MseQuantizer {
         x_tilde
     }
 
-    /// Dequantizes a batch of index vectors into a (d, n) matrix.
     pub fn dequantize_batch(&self, indices_batch: &[Vec<usize>]) -> DMatrix<f64> {
         let n = indices_batch.len();
         if n == 0 {
@@ -125,6 +116,8 @@ impl MseQuantizer {
             }
         }
 
-        self.rotation.transpose() * y_tilde_batch
+        gemm(&self.rotation, true, &y_tilde_batch, false)
     }
 }
+
+
