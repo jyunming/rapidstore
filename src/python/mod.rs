@@ -1,3 +1,5 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(unsafe_op_in_unsafe_fn)]
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -206,7 +208,7 @@ impl Database {
             .map_err(to_py_runtime)
         })?;
 
-        let py_list = PyList::empty(py);
+        let py_list = PyList::empty_bound(py);
         for r in results {
             py_list.append(search_result_to_py(py, &r)?)?;
         }
@@ -248,7 +250,7 @@ impl Database {
             let engine = self.engine.read().unwrap();
             engine.stats()
         };
-        let dict = PyDict::new(py);
+        let dict = PyDict::new_bound(py);
         dict.set_item("vector_count", stats.vector_count)?;
         dict.set_item("segment_count", stats.segment_count)?;
         dict.set_item("buffered_vectors", stats.buffered_vectors)?;
@@ -257,6 +259,15 @@ impl Database {
         dict.set_item("total_disk_bytes", stats.total_disk_bytes)?;
         dict.set_item("has_index", stats.has_index)?;
         dict.set_item("index_nodes", stats.index_nodes)?;
+        dict.set_item("live_codes_bytes", stats.live_codes_bytes)?;
+        dict.set_item("live_slot_count", stats.live_slot_count)?;
+        dict.set_item("live_id_count", stats.live_id_count)?;
+        dict.set_item("live_vectors_count", stats.live_vectors_count)?;
+        dict.set_item("live_vectors_bytes_estimate", stats.live_vectors_bytes_estimate)?;
+        dict.set_item("metadata_entries", stats.metadata_entries)?;
+        dict.set_item("metadata_bytes_estimate", stats.metadata_bytes_estimate)?;
+        dict.set_item("ann_slot_count", stats.ann_slot_count)?;
+        dict.set_item("graph_nodes", stats.graph_nodes)?;
         Ok(dict.into())
     }
 
@@ -355,10 +366,10 @@ fn parse_document_rows(
 }
 
 fn search_result_to_py(py: Python<'_>, r: &SearchResult) -> PyResult<PyObject> {
-    let dict = PyDict::new(py);
+    let dict = PyDict::new_bound(py);
     dict.set_item("id", &r.id)?;
     dict.set_item("score", r.score)?;
-    let meta_dict = PyDict::new(py);
+    let meta_dict = PyDict::new_bound(py);
     for (k, v) in &r.metadata {
         meta_dict.set_item(k, json_to_py(py, v)?)?;
     }
@@ -371,9 +382,9 @@ fn search_result_to_py(py: Python<'_>, r: &SearchResult) -> PyResult<PyObject> {
 }
 
 fn get_result_to_py(py: Python<'_>, r: &GetResult) -> PyResult<PyObject> {
-    let dict = PyDict::new(py);
+    let dict = PyDict::new_bound(py);
     dict.set_item("id", &r.id)?;
-    let meta_dict = PyDict::new(py);
+    let meta_dict = PyDict::new_bound(py);
     for (k, v) in &r.metadata {
         meta_dict.set_item(k, json_to_py(py, v)?)?;
     }
@@ -433,14 +444,14 @@ fn json_to_py(py: Python<'_>, val: &JsonValue) -> PyResult<PyObject> {
         }
         JsonValue::String(s) => s.to_object(py),
         JsonValue::Array(arr) => {
-            let list = PyList::empty(py);
+            let list = PyList::empty_bound(py);
             for v in arr {
                 list.append(json_to_py(py, v)?)?;
             }
             list.into()
         }
         JsonValue::Object(map) => {
-            let dict = PyDict::new(py);
+            let dict = PyDict::new_bound(py);
             for (k, v) in map {
                 dict.set_item(k, json_to_py(py, v)?)?;
             }
@@ -455,8 +466,12 @@ fn to_py_runtime(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
 
 pub fn register(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Database>()?;
+    let db_cls = m.getattr("Database")?;
+    m.add("TurboQuantDB", db_cls)?;
     Ok(())
 }
+
+
 
 
 

@@ -87,6 +87,20 @@ impl MetadataStore {
         Ok(())
     }
 
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn approx_bytes(&self) -> usize {
+        self.data
+            .iter()
+            .map(|(id, meta)| {
+                let payload = serde_json::to_vec(meta).map(|v| v.len()).unwrap_or(0);
+                id.len() + payload
+            })
+            .sum()
+    }
+
     pub fn flush(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !self.dirty {
             return Ok(());

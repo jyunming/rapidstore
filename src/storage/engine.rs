@@ -111,6 +111,15 @@ pub struct DbStats {
     pub total_disk_bytes: u64,
     pub has_index: bool,
     pub index_nodes: usize,
+    pub live_codes_bytes: usize,
+    pub live_slot_count: usize,
+    pub live_id_count: usize,
+    pub live_vectors_count: usize,
+    pub live_vectors_bytes_estimate: usize,
+    pub metadata_entries: usize,
+    pub metadata_bytes_estimate: usize,
+    pub ann_slot_count: usize,
+    pub graph_nodes: usize,
 }
 
 pub struct TurboQuantEngine {
@@ -630,6 +639,15 @@ impl TurboQuantEngine {
             total_disk_bytes: self.total_disk_bytes(),
             has_index: self.can_use_ann_index(),
             index_nodes: self.index_ids.len(),
+            live_codes_bytes: self.live_codes.len(),
+            live_slot_count: self.live_slot_to_id.len(),
+            live_id_count: self.live_id_to_slot.len(),
+            live_vectors_count: self.live_vectors.len(),
+            live_vectors_bytes_estimate: self.live_vectors_bytes_estimate(),
+            metadata_entries: self.metadata.len(),
+            metadata_bytes_estimate: self.metadata.approx_bytes(),
+            ann_slot_count: self.ann_slots.len(),
+            graph_nodes: self.graph.node_count(),
         }
     }
 
@@ -643,6 +661,13 @@ impl TurboQuantEngine {
 
     fn live_active_count(&self) -> usize {
         self.live_id_to_slot.len()
+    }
+
+    fn live_vectors_bytes_estimate(&self) -> usize {
+        self.live_vectors
+            .values()
+            .map(|v| v.len() * std::mem::size_of::<f64>())
+            .sum()
     }
 
     fn live_slot_base(&self, slot: usize) -> usize {
