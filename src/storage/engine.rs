@@ -169,7 +169,7 @@ impl TurboQuantEngine {
         std::fs::create_dir_all(local_dir)?;
         let manifest_path = format!("{}/manifest.json", local_dir);
         let wal_path = format!("{}/wal.log", local_dir);
-        let metadata_path = format!("{}/metadata.redb", local_dir);
+        let metadata_path = format!("{}/metadata.bin", local_dir);
 
         let backend = Arc::new(StorageBackend::from_uri(uri)?);
 
@@ -594,6 +594,7 @@ impl TurboQuantEngine {
 
         self.segments.flush_batch(records)?;
         self.wal.truncate()?;
+        self.metadata.flush()?;
 
         if self.compactor.should_compact(self.segments.segments.len()) {
             self.compact_segments()?;
@@ -609,6 +610,7 @@ impl TurboQuantEngine {
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.flush_wal_to_segment()?;
         save_quantizer_state(&self.local_dir, &self.backend, &self.quantizer)?;
+        self.metadata.flush()?;
         self.pending_manifest_updates += 1;
         self.maybe_persist_state(true)?;
         Ok(())
@@ -1001,7 +1003,7 @@ impl TurboQuantEngine {
 
     fn total_disk_bytes(&self) -> u64 {
         let mut total = self.segments.total_disk_size();
-        for name in ["manifest.json", "metadata.redb", "wal.log", QUANTIZER_STATE_FILE, "graph.bin", INDEX_IDS_FILE] {
+        for name in ["manifest.json", "metadata.bin", "metadata.redb", "wal.log", QUANTIZER_STATE_FILE, "graph.bin", INDEX_IDS_FILE] {
             if let Ok(data) = self.backend.read(name) {
                 total += data.len() as u64;
             }
