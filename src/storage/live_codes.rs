@@ -5,7 +5,7 @@ use std::path::PathBuf;
 const GROW_SLOTS: usize = 4096;
 
 pub struct LiveCodesFile {
-    path: PathBuf,
+    _path: PathBuf,
     file: File,
     mmap: Option<MmapMut>,
     stride: usize,
@@ -24,10 +24,10 @@ impl LiveCodesFile {
         let metadata = file.metadata()?;
         let file_size = metadata.len() as usize;
         let capacity = file_size / stride;
-        let len = capacity; // Assume existing file is fully in use initially
+        let len = capacity;
 
         let mut live_codes = Self {
-            path,
+            _path: path,
             file,
             mmap: None,
             stride,
@@ -43,7 +43,7 @@ impl LiveCodesFile {
     }
 
     fn remap(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.mmap = None; // Drop old map
+        self.mmap = None;
         if self.capacity > 0 {
             let mmap = unsafe { MmapOptions::new().map_mut(&self.file)? };
             self.mmap = Some(mmap);
@@ -66,6 +66,7 @@ impl LiveCodesFile {
     pub fn alloc_slot(&mut self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         if self.len >= self.capacity {
             let new_capacity = self.capacity + GROW_SLOTS;
+            self.mmap = None; // DROP MUST BE FIRST ON WINDOWS
             self.file.set_len((new_capacity * self.stride) as u64)?;
             self.capacity = new_capacity;
             self.remap()?;
@@ -76,6 +77,7 @@ impl LiveCodesFile {
     }
 
     pub fn truncate_to(&mut self, new_len: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.mmap = None; // DROP MUST BE FIRST ON WINDOWS
         self.file.set_len((new_len * self.stride) as u64)?;
         self.capacity = new_len;
         self.len = new_len;
@@ -99,10 +101,10 @@ impl LiveCodesFile {
     }
 
     pub fn clear(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.mmap = None; // DROP MUST BE FIRST ON WINDOWS
         self.len = 0;
         self.capacity = 0;
         self.file.set_len(0)?;
-        self.mmap = None;
         Ok(())
     }
 }
