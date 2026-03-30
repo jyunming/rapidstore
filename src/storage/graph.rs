@@ -184,7 +184,7 @@ impl GraphManager {
         n: usize,
         max_degree: usize,
         _alpha: f64,
-        build_scorer: impl Fn(u32, u32) -> f64 + Sync,
+        build_scorer: impl Fn(u32, &[u32]) -> Vec<(u32, f64)> + Sync,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.mmap = None;
 
@@ -237,10 +237,7 @@ impl GraphManager {
                     }
                 }
 
-                let mut scored: Vec<(u32, f64)> = candidate_ids
-                    .iter()
-                    .map(|&j| (j, build_scorer(i as u32, j)))
-                    .collect();
+                let mut scored: Vec<(u32, f64)> = build_scorer(i as u32, &candidate_ids);
                 scored.sort_by(|a, b| {
                     b.1.partial_cmp(&a.1)
                         .unwrap_or(Ordering::Equal)

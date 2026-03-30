@@ -1,5 +1,4 @@
 use ndarray::Array1;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -253,7 +252,7 @@ impl TurboQuantEngine {
             backend,
             wal,
             wal_buffer: Vec::new(),
-            wal_flush_threshold: 1000,
+            wal_flush_threshold: 100,
             segments,
             metadata,
             graph,
@@ -419,19 +418,44 @@ impl TurboQuantEngine {
         id_slot_pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
         let indexed_slots: Vec<u32> = id_slot_pairs.iter().map(|(_, slot)| *slot).collect();
-        let all_vectors: Vec<Array1<f64>> = indexed_slots
-            .par_iter()
-            .map(|slot| {
-                self.live_vectors.get(slot).cloned().unwrap_or_else(|| {
-                    let (indices, qjl, gamma) = self.live_codes_at_slot(*slot as usize);
-                    self.quantizer.dequantize(indices, qjl, gamma as f64)
-                })
-            })
-            .collect();
-
+        let indexed_slots_for_scorer = indexed_slots.clone();
+        let live_codes = &self.live_codes;
+        let d = self.d;
+        let qjl_len = self.live_qjl_len();
+        let quantizer = self.quantizer.clone();
         let metric = self.metric.clone();
-        let build_scorer = |from: u32, to: u32| {
-            score_vectors_with_metric(&metric, &all_vectors[from as usize], &all_vectors[to as usize])
+
+        let build_scorer = move |from: u32, candidates: &[u32]| -> Vec<(u32, f64)> {
+            let from_slot = indexed_slots_for_scorer[from as usize] as usize;
+            let (from_indices, from_qjl, from_gamma) =
+                live_codes_at_slot_raw(live_codes, d, qjl_len, from_slot);
+            let from_vec = quantizer.dequantize(from_indices, from_qjl, from_gamma as f64);
+
+            if matches!(metric, DistanceMetric::Ip) {
+                let prep = quantizer.prepare_ip_query(&from_vec);
+                candidates
+                    .iter()
+                    .map(|&to| {
+                        let to_slot = indexed_slots_for_scorer[to as usize] as usize;
+                        let (to_indices, to_qjl, to_gamma) =
+                            live_codes_at_slot_raw(live_codes, d, qjl_len, to_slot);
+                        let score = quantizer.score_ip_encoded(&prep, to_indices, to_qjl, to_gamma as f64);
+                        (to, score)
+                    })
+                    .collect()
+            } else {
+                candidates
+                    .iter()
+                    .map(|&to| {
+                        let to_slot = indexed_slots_for_scorer[to as usize] as usize;
+                        let (to_indices, to_qjl, to_gamma) =
+                            live_codes_at_slot_raw(live_codes, d, qjl_len, to_slot);
+                        let to_vec = quantizer.dequantize(to_indices, to_qjl, to_gamma as f64);
+                        let score = score_vectors_with_metric(&metric, &from_vec, &to_vec);
+                        (to, score)
+                    })
+                    .collect()
+            }
         };
 
         self.graph
@@ -1090,6 +1114,23 @@ fn load_index_ids(
     Ok(Vec::new())
 }
 
+fn live_codes_at_slot_raw<'a>(
+    live_codes: &'a [u8],
+    d: usize,
+    qjl_len: usize,
+    slot: usize,
+) -> (&'a [u8], &'a [u8], f32) {
+    let stride = d + qjl_len + LIVE_GAMMA_BYTES + LIVE_DELETED_BYTES;
+    let base = slot * stride;
+    let gamma_off = base + d + qjl_len;
+    let deleted_off = gamma_off + LIVE_GAMMA_BYTES;
+
+    let indices = &live_codes[base..base + d];
+    let qjl = &live_codes[base + d..base + d + qjl_len];
+    let gamma = f32::from_le_bytes(live_codes[gamma_off..gamma_off + 4].try_into().unwrap());
+    debug_assert_eq!(live_codes[deleted_off], 0u8);
+    (indices, qjl, gamma)
+}
 fn metadata_matches_filter(
     meta: &HashMap<String, JsonValue>,
     filter: &HashMap<String, JsonValue>,
@@ -1125,18 +1166,3 @@ fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
