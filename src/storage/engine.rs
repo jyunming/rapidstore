@@ -645,18 +645,9 @@ impl TurboQuantEngine {
         let mut metadata_entries = Vec::with_capacity(items.len());
         let mut live_updates = Vec::with_capacity(items.len());
 
-        // Parallel chunking keeps quantization CPU-bound and avoids one giant batch bottleneck.
-        let quantize_chunk_size = 128usize;
-        let quantized_chunks: Vec<Vec<(Vec<usize>, Vec<i8>, f64)>> = items
-            .par_chunks(quantize_chunk_size)
-            .map(|chunk| {
-                let vectors: Vec<Array1<f64>> =
-                    chunk.iter().map(|item| item.vector.clone()).collect();
-                self.quantizer.quantize_batch(&vectors)
-            })
-            .collect();
+        let vectors: Vec<Array1<f64>> = items.iter().map(|item| item.vector.clone()).collect();
         let quantized: Vec<(Vec<usize>, Vec<i8>, f64)> =
-            quantized_chunks.into_iter().flatten().collect();
+            self.quantizer.quantize_batch(&vectors);
 
         for (item, (indices, qjl, gamma)) in items.into_iter().zip(quantized.into_iter()) {
             let meta = VectorMetadata {
