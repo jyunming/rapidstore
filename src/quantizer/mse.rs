@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::codebook::lloyd_max;
+use super::CodeIndex;
 use crate::linalg::matmul::gemm;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -31,7 +32,7 @@ impl MseQuantizer {
         }
     }
 
-    pub fn quantize(&self, x: &Array1<f64>) -> Vec<usize> {
+    pub fn quantize(&self, x: &Array1<f64>) -> Vec<CodeIndex> {
         assert_eq!(x.len(), self.d);
 
         let mut x_mat = DMatrix::zeros(self.d, 1);
@@ -45,7 +46,7 @@ impl MseQuantizer {
             .unwrap_or_default()
     }
 
-    pub fn quantize_batch(&self, xs: &DMatrix<f64>) -> Vec<Vec<usize>> {
+    pub fn quantize_batch(&self, xs: &DMatrix<f64>) -> Vec<Vec<CodeIndex>> {
         assert_eq!(xs.nrows(), self.d);
 
         let n = xs.ncols();
@@ -54,7 +55,7 @@ impl MseQuantizer {
         }
 
         let y_batch = gemm(&self.rotation, false, xs, false);
-        let mut all_indices = vec![vec![0usize; self.d]; n];
+        let mut all_indices = vec![vec![0 as CodeIndex; self.d]; n];
 
         all_indices
             .par_iter_mut()
@@ -69,7 +70,7 @@ impl MseQuantizer {
         all_indices
     }
 
-    fn nearest_centroid_index(&self, val: f64) -> usize {
+    fn nearest_centroid_index(&self, val: f64) -> CodeIndex {
         let n = self.centroids.len();
         if n == 0 {
             return 0;
@@ -78,19 +79,19 @@ impl MseQuantizer {
         if pos == 0 {
             0
         } else if pos >= n {
-            n - 1
+            (n - 1) as CodeIndex
         } else {
             let lo = pos - 1;
             let hi = pos;
             if (val - self.centroids[lo]).abs() <= (self.centroids[hi] - val).abs() {
-                lo
+                lo as CodeIndex
             } else {
-                hi
+                hi as CodeIndex
             }
         }
     }
 
-    pub fn dequantize(&self, indices: &[usize]) -> Array1<f64> {
+    pub fn dequantize(&self, indices: &[CodeIndex]) -> Array1<f64> {
         assert_eq!(indices.len(), self.d);
         let batch = vec![indices.to_vec()];
         let x_tilde_batch = self.dequantize_batch(&batch);
@@ -102,7 +103,7 @@ impl MseQuantizer {
         x_tilde
     }
 
-    pub fn dequantize_batch(&self, indices_batch: &[Vec<usize>]) -> DMatrix<f64> {
+    pub fn dequantize_batch(&self, indices_batch: &[Vec<CodeIndex>]) -> DMatrix<f64> {
         let n = indices_batch.len();
         if n == 0 {
             return DMatrix::zeros(self.d, 0);
@@ -112,12 +113,10 @@ impl MseQuantizer {
         for (col, indices) in indices_batch.iter().enumerate() {
             assert_eq!(indices.len(), self.d);
             for row in 0..self.d {
-                y_tilde_batch[(row, col)] = self.centroids[indices[row]];
+                y_tilde_batch[(row, col)] = self.centroids[indices[row] as usize];
             }
         }
 
         gemm(&self.rotation, true, &y_tilde_batch, false)
     }
 }
-
-

@@ -7,7 +7,7 @@ use std::sync::Arc;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SegmentRecord {
     pub id: String,
-    pub quantized_indices: Vec<usize>,
+    pub quantized_indices: Vec<u16>,
     pub qjl_bits: Vec<i8>,
     pub gamma: f32,
     #[serde(default)]
@@ -219,3 +219,4 @@ impl SegmentManager {
             .collect()
     }
 }
+

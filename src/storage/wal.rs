@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WalEntry {
     pub id: String,
-    pub quantized_indices: Vec<usize>,
+    pub quantized_indices: Vec<u16>,
     pub qjl_bits: Vec<i8>,
     pub gamma: f32,
     pub metadata_json: String,
@@ -34,15 +34,20 @@ impl Wal {
     pub fn append(
         &mut self,
         entry: &WalEntry,
+        force_sync: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.append_batch(std::slice::from_ref(entry))
+        self.append_batch(std::slice::from_ref(entry), force_sync)
     }
 
     pub fn append_batch(
         &mut self,
         entries: &[WalEntry],
+        force_sync: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if entries.is_empty() {
+            if force_sync {
+                self.sync()?;
+            }
             return Ok(());
         }
         for entry in entries {
@@ -53,9 +58,11 @@ impl Wal {
             self.entry_count += 1;
         }
         self.writer.flush()?;
+        if force_sync {
+            self.writer.get_ref().sync_data()?;
+        }
         Ok(())
     }
-
 
     pub fn sync(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.writer.flush()?;
@@ -66,8 +73,9 @@ impl Wal {
     pub fn replay<P: AsRef<Path>>(
         path: P,
     ) -> Result<Vec<WalEntry>, Box<dyn std::error::Error + Send + Sync>> {
-        let path = path.as_ref();
         use std::io::Read;
+
+        let path = path.as_ref();
         if !path.exists() {
             return Ok(Vec::new());
         }
@@ -102,3 +110,4 @@ impl Wal {
         self.entry_count
     }
 }
+

@@ -13,6 +13,7 @@ use super::metadata::{MetadataStore, VectorMetadata};
 use super::segment::{SegmentManager, SegmentRecord};
 use super::wal::{Wal, WalEntry};
 use crate::quantizer::prod::ProdQuantizer;
+use crate::quantizer::CodeIndex;
 
 const QUANTIZER_STATE_FILE: &str = "quantizer.bin";
 const INDEX_IDS_FILE: &str = "graph_ids.json";
@@ -561,15 +562,7 @@ impl TurboQuantEngine {
                 continue;
             }
             self.live_records.insert(record.id.clone(), record.clone());
-            self.live_vectors
-                .entry(record.id.clone())
-                .or_insert_with(|| {
-                    self.quantizer.dequantize(
-                        &record.quantized_indices,
-                        &record.qjl_bits,
-                        record.gamma as f64,
-                    )
-                });
+            self.live_vectors.remove(&record.id);
         }
 
         self.segments.flush_batch(records)?;
@@ -646,7 +639,7 @@ impl TurboQuantEngine {
         let mut live_updates = Vec::with_capacity(items.len());
 
         let vectors: Vec<Array1<f64>> = items.iter().map(|item| item.vector.clone()).collect();
-        let quantized: Vec<(Vec<usize>, Vec<i8>, f64)> =
+        let quantized: Vec<(Vec<CodeIndex>, Vec<i8>, f64)> =
             self.quantizer.quantize_batch(&vectors);
 
         for (item, (indices, qjl, gamma)) in items.into_iter().zip(quantized.into_iter()) {
@@ -666,7 +659,6 @@ impl TurboQuantEngine {
             metadata_entries.push((item.id.clone(), meta));
             live_updates.push((
                 item.id,
-                item.vector,
                 SegmentRecord {
                     id: wal_entries.last().unwrap().id.clone(),
                     quantized_indices: indices,
@@ -680,8 +672,7 @@ impl TurboQuantEngine {
         self.wal.append_batch(&wal_entries, false)?;
         self.wal_buffer.extend(wal_entries);
         self.metadata.put_many(&metadata_entries)?;
-        for (id, vec, record) in live_updates {
-            self.live_vectors.insert(id.clone(), vec);
+        for (id, record) in live_updates {
             self.live_records.insert(id, record);
         }
 
@@ -728,7 +719,6 @@ impl TurboQuantEngine {
 
         if !is_deleted {
             self.metadata.put(&id, &meta)?;
-            self.live_vectors.insert(id.clone(), vector.clone());
             self.live_records.insert(
                 id,
                 SegmentRecord {
@@ -772,22 +762,8 @@ impl TurboQuantEngine {
         }
         by_id.retain(|_, r| !r.is_deleted);
 
-        let mut ids = Vec::with_capacity(by_id.len());
-        let mut encoded = Vec::with_capacity(by_id.len());
-        for (id, r) in &by_id {
-            ids.push(id.clone());
-            encoded.push((
-                r.quantized_indices.clone(),
-                r.qjl_bits.clone(),
-                r.gamma as f64,
-            ));
-        }
-
-        let vectors = self.quantizer.dequantize_batch(&encoded);
-        let by_vec: HashMap<String, Array1<f64>> = ids.into_iter().zip(vectors).collect();
-
         self.live_records = by_id;
-        self.live_vectors = by_vec;
+        self.live_vectors.clear();
         Ok(())
     }
 
@@ -1008,6 +984,10 @@ fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array
         }
     }
 }
+
+
+
+
 
 
 
