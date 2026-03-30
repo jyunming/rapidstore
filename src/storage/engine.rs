@@ -4,7 +4,6 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use rayon::prelude::*;
 
 use super::backend::StorageBackend;
 use super::compaction::Compactor;
@@ -422,25 +421,22 @@ impl TurboQuantEngine {
         let live_codes = &self.live_codes;
         let d = self.d;
         let qjl_len = self.live_qjl_len();
-        let quantizer = self.quantizer.clone();
         let metric = self.metric.clone();
 
-        let all_vectors: Vec<Array1<f64>> = indexed_slots
-            .par_iter()
+        let encoded_batch: Vec<(Vec<CodeIndex>, Vec<u8>, f64)> = indexed_slots
+            .iter()
             .map(|&slot| {
-                if let Some(v) = self.live_vectors.get(&slot) {
-                    v.clone()
-                } else {
-                    let (indices, qjl, gamma) = live_codes_at_slot_raw(
-                        live_codes,
-                        d,
-                        qjl_len,
-                        slot as usize,
-                    );
-                    quantizer.dequantize(indices, qjl, gamma as f64)
-                }
+                let (indices, qjl, gamma) = live_codes_at_slot_raw(
+                    live_codes,
+                    d,
+                    qjl_len,
+                    slot as usize,
+                );
+                (indices.to_vec(), qjl.to_vec(), gamma as f64)
             })
             .collect();
+
+        let all_vectors: Vec<Array1<f64>> = self.quantizer.dequantize_batch(&encoded_batch);
 
         let build_scorer = move |from: u32, candidates: &[u32]| -> Vec<(u32, f64)> {
             let from_vec = &all_vectors[from as usize];
@@ -1162,6 +1158,10 @@ fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array
         }
     }
 }
+
+
+
+
 
 
 
