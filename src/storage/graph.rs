@@ -197,9 +197,10 @@ impl GraphManager {
         file.set_len((n * BLOCK_SIZE) as u64)?;
 
         let degree_cap = max_degree.min(MAX_DEGREE).max(1);
+        let max_neighbors = n.saturating_sub(1);
         let candidate_cap = (degree_cap * CANDIDATE_MULTIPLIER)
-            .min(n.saturating_sub(1))
-            .max(degree_cap);
+            .max(degree_cap)
+            .min(max_neighbors);
 
         let candidate_lists: Vec<Vec<u32>> = (0..n)
             .into_par_iter()
@@ -277,4 +278,5 @@ impl GraphManager {
         Ok(())
     }
 }
+
 
