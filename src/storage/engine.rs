@@ -257,6 +257,7 @@ impl TurboQuantEngine {
         self.invalidate_index_state()?;
         self.maybe_persist_state(false)?;
         if self.wal_buffer.len() >= self.wal_flush_threshold { self.flush_wal_to_segment()?; }
+        if self.wal_buffer.len() >= self.wal_flush_threshold { self.flush_wal_to_segment()?; }
         Ok(true)
     }
 
@@ -575,7 +576,6 @@ impl TurboQuantEngine {
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_active_count() as u64;
         self.maybe_persist_state(false)?;
-        if self.wal_buffer.len() >= self.wal_flush_threshold { self.flush_wal_to_segment()?; }
         Ok(())
     }
 }
@@ -629,3 +629,4 @@ fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array
         DistanceMetric::L2 => -a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum::<f64>().sqrt(),
     }
 }
+
