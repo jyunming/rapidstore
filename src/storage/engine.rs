@@ -502,7 +502,7 @@ impl TurboQuantEngine {
                     .index_state
                     .as_ref()
                     .map(|s| s.search_list_size)
-                    .unwrap_or(100)
+                    .unwrap_or(32)
             });
             let ann = if matches!(self.metric, DistanceMetric::Ip) {
                 let prep = self.quantizer.prepare_ip_query(query);

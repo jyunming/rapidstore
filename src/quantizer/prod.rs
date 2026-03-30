@@ -2,6 +2,7 @@ use nalgebra::DMatrix;
 use ndarray::Array1;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::f64::consts::PI;
 
 use super::mse::MseQuantizer;
 use super::qjl::QjlQuantizer;
@@ -13,6 +14,14 @@ pub struct ProdQuantizer {
     pub b: usize,
     pub mse_quantizer: MseQuantizer,
     pub qjl_quantizer: QjlQuantizer,
+}
+
+pub struct PreparedIpQuery {
+    // Lookup table flattened as [dim0 c0..cK, dim1 c0..cK, ...]
+    mse_lut: Vec<f64>,
+    mse_lut_width: usize,
+    sq: Vec<f64>,
+    qjl_scale: f64,
 }
 
 impl ProdQuantizer {
@@ -30,12 +39,80 @@ impl ProdQuantizer {
         }
     }
 
-    pub fn quantize(&self, x: &Array1<f64>) -> (Vec<CodeIndex>, Vec<i8>, f64) {
+    pub fn prepare_ip_query(&self, query: &Array1<f64>) -> PreparedIpQuery {
+        assert_eq!(query.len(), self.d);
+
+        let mut y = vec![0.0f64; self.d];
+        let mut sq = vec![0.0f64; self.d];
+
+        // y = R * q
+        for row in 0..self.d {
+            let mut acc = 0.0;
+            for col in 0..self.d {
+                acc += self.mse_quantizer.rotation[(row, col)] * query[col];
+            }
+            y[row] = acc;
+        }
+
+        // Precompute MSE lookup scores for each dimension/code.
+        let centroids = &self.mse_quantizer.centroids;
+        let lut_w = centroids.len();
+        let mut mse_lut = vec![0.0f64; self.d * lut_w];
+        for i in 0..self.d {
+            let yi = y[i];
+            let row_off = i * lut_w;
+            for (k, &c) in centroids.iter().enumerate() {
+                mse_lut[row_off + k] = c * yi;
+            }
+        }
+
+        // sq = S * q
+        for row in 0..self.d {
+            let mut acc = 0.0;
+            for col in 0..self.d {
+                acc += self.qjl_quantizer.projection[(row, col)] * query[col];
+            }
+            sq[row] = acc;
+        }
+
+        PreparedIpQuery {
+            mse_lut,
+            mse_lut_width: lut_w,
+            sq,
+            qjl_scale: (PI / (2.0 * self.d as f64)).sqrt(),
+        }
+    }
+
+    pub fn score_ip_encoded(
+        &self,
+        prep: &PreparedIpQuery,
+        idx: &[CodeIndex],
+        qjl: &[u8],
+        gamma: f64,
+    ) -> f64 {
+        let mut mse_score = 0.0f64;
+        for i in 0..self.d {
+            let row_off = i * prep.mse_lut_width;
+            mse_score += prep.mse_lut[row_off + idx[i] as usize];
+        }
+
+        let mut qjl_score = 0.0f64;
+        for i in 0..self.d {
+            let byte_idx = i / 8;
+            let bit_idx = i % 8;
+            let bit_set = ((qjl[byte_idx] >> bit_idx) & 1u8) == 1u8;
+            qjl_score += if bit_set { prep.sq[i] } else { -prep.sq[i] };
+        }
+
+        mse_score + gamma * prep.qjl_scale * qjl_score
+    }
+
+    pub fn quantize(&self, x: &Array1<f64>) -> (Vec<CodeIndex>, Vec<u8>, f64) {
         let mut out = self.quantize_batch(&[x.clone()]);
         out.pop().unwrap_or_else(|| (Vec::new(), Vec::new(), 0.0))
     }
 
-    pub fn quantize_batch(&self, xs: &[Array1<f64>]) -> Vec<(Vec<CodeIndex>, Vec<i8>, f64)> {
+    pub fn quantize_batch(&self, xs: &[Array1<f64>]) -> Vec<(Vec<CodeIndex>, Vec<u8>, f64)> {
         let n = xs.len();
         if n == 0 {
             return Vec::new();
@@ -88,12 +165,12 @@ impl ProdQuantizer {
             .collect()
     }
 
-    pub fn dequantize(&self, idx: &[CodeIndex], qjl: &[i8], gamma: f64) -> Array1<f64> {
+    pub fn dequantize(&self, idx: &[CodeIndex], qjl: &[u8], gamma: f64) -> Array1<f64> {
         let mut out = self.dequantize_batch(&[(idx.to_vec(), qjl.to_vec(), gamma)]);
         out.pop().unwrap_or_else(|| Array1::zeros(self.d))
     }
 
-    pub fn dequantize_batch(&self, encoded: &[(Vec<CodeIndex>, Vec<i8>, f64)]) -> Vec<Array1<f64>> {
+    pub fn dequantize_batch(&self, encoded: &[(Vec<CodeIndex>, Vec<u8>, f64)]) -> Vec<Array1<f64>> {
         if encoded.is_empty() {
             return Vec::new();
         }
@@ -101,7 +178,7 @@ impl ProdQuantizer {
         let idx_batch: Vec<Vec<CodeIndex>> = encoded.iter().map(|(idx, _, _)| idx.clone()).collect();
         let x_tilde_mse_batch = self.mse_quantizer.dequantize_batch(&idx_batch);
 
-        let qjl_batch: Vec<(Vec<i8>, f64)> = encoded
+        let qjl_batch: Vec<(Vec<u8>, f64)> = encoded
             .iter()
             .map(|(_, qjl, gamma)| (qjl.clone(), *gamma))
             .collect();
