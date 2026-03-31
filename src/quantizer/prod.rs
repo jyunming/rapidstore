@@ -163,6 +163,22 @@ impl ProdQuantizer {
         qjl: &[u8],
         gamma: f64,
     ) -> f64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return unsafe { self.score_ip_encoded_simd(prep, idx, qjl, gamma) };
+            }
+        }
+        self.score_ip_encoded_scalar(prep, idx, qjl, gamma)
+    }
+
+    fn score_ip_encoded_scalar(
+        &self,
+        prep: &PreparedIpQuery,
+        idx: &[CodeIndex],
+        qjl: &[u8],
+        gamma: f64,
+    ) -> f64 {
         let mut mse_score = 0.0f32;
         let lut_width = prep.mse_lut_width;
         let lut = &prep.mse_lut;
@@ -194,6 +210,94 @@ impl ProdQuantizer {
         }
 
         (mse_score + (gamma as f32) * prep.qjl_scale * qjl_score) as f64
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    unsafe fn score_ip_encoded_simd(
+        &self,
+        prep: &PreparedIpQuery,
+        idx: &[CodeIndex],
+        qjl: &[u8],
+        gamma: f64,
+    ) -> f64 {
+        use std::arch::x86_64::*;
+
+        let mut mse_acc = _mm256_setzero_ps();
+        let lut = prep.mse_lut.as_ptr();
+        let lut_width = prep.mse_lut_width;
+
+        // MSE loop: 8 coordinates at a time
+        let mut i = 0;
+        while i + 7 < self.d {
+            let mut vals = [0.0f32; 8];
+            for j in 0..8 {
+                let row = i + j;
+                unsafe {
+                    vals[j] = *lut.add(row * lut_width + idx[row] as usize);
+                }
+            }
+            let v = _mm256_loadu_ps(vals.as_ptr());
+            mse_acc = _mm256_add_ps(mse_acc, v);
+            i += 8;
+        }
+
+        // Horizontal sum for MSE
+        let mut mse_sum = 0.0f32;
+        let mut res = [0.0f32; 8];
+        _mm256_storeu_ps(res.as_mut_ptr(), mse_acc);
+        for val in res {
+            mse_sum += val;
+        }
+        // MSE remainder
+        while i < self.d {
+            unsafe {
+                mse_sum += *lut.add(i * lut_width + idx[i] as usize);
+            }
+            i += 1;
+        }
+
+        // QJL loop: 8 bits at a time (one byte)
+        let mut qjl_acc = _mm256_setzero_ps();
+        let sq = prep.sq.as_ptr();
+        let qjl_ptr = qjl.as_ptr();
+        let qjl_len = qjl.len();
+
+        let mut b = 0;
+        while b < qjl_len {
+            let byte = unsafe { *qjl_ptr.add(b) as i32 };
+            let base_i = b << 3;
+            if base_i + 7 < self.d {
+                let s_vec = _mm256_loadu_ps(unsafe { sq.add(base_i) });
+                
+                // Expand bits to signs: 1.0 or -1.0
+                let mut signs = [0.0f32; 8];
+                for bit in 0..8 {
+                    signs[bit] = if (byte & (1 << bit)) != 0 { 1.0 } else { -1.0 };
+                }
+                let sign_vec = _mm256_loadu_ps(signs.as_ptr());
+                qjl_acc = _mm256_add_ps(qjl_acc, _mm256_mul_ps(s_vec, sign_vec));
+            } else {
+                // Remainder of QJL within the byte
+                let mut qs = 0.0f32;
+                for bit in 0..8 {
+                    let idx = base_i + bit;
+                    if idx >= self.d { break; }
+                    let s = unsafe { *sq.add(idx) };
+                    qs += if (byte & (1 << bit)) != 0 { s } else { -s };
+                }
+                mse_sum += (gamma as f32) * prep.qjl_scale * qs;
+            }
+            b += 1;
+        }
+
+        _mm256_storeu_ps(res.as_mut_ptr(), qjl_acc);
+        let mut qjl_sum = 0.0f32;
+        for val in res {
+            qjl_sum += val;
+        }
+
+        (mse_sum + (gamma as f32) * prep.qjl_scale * qjl_sum) as f64
     }
 
     pub fn quantize(&self, x: &Array1<f64>) -> (Vec<CodeIndex>, Vec<u8>, f64) {

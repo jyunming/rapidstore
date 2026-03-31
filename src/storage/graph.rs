@@ -19,6 +19,7 @@ struct SearchCandidate {
 impl Eq for SearchCandidate {}
 impl Ord for SearchCandidate {
     fn cmp(&self, other: &Self) -> Ordering {
+        // High scores first (Max-Heap behavior for candidates heap)
         self.score
             .partial_cmp(&other.score)
             .unwrap_or(Ordering::Equal)
@@ -35,6 +36,7 @@ struct OrderingWrapper(SearchCandidate);
 impl Eq for OrderingWrapper {}
 impl Ord for OrderingWrapper {
     fn cmp(&self, other: &Self) -> Ordering {
+        // Low scores first (Min-Heap behavior for results heap)
         other
             .0
             .score
@@ -152,12 +154,17 @@ impl GraphManager {
         Ok(&mmap[start..end])
     }
 
+    pub fn get_entry_node(&self) -> u32 {
+        0 // Future: return node closest to centroid
+    }
+
     pub fn search(
         &self,
         entry_node: u32,
         k: usize,
         search_list_size: usize,
         scorer: impl Fn(u32) -> f64,
+        filter: Option<impl Fn(u32) -> bool>,
     ) -> Result<Vec<(u32, f64)>, Box<dyn std::error::Error + Send + Sync>> {
         if self.node_count == 0 {
             return Ok(Vec::new());
@@ -166,13 +173,28 @@ impl GraphManager {
         let mut candidates = BinaryHeap::new();
         let mut results = BinaryHeap::new();
 
-        let initial = SearchCandidate {
-            id: entry_node,
-            score: scorer(entry_node),
-        };
-        candidates.push(initial);
-        results.push(OrderingWrapper(initial));
-        visited.insert(entry_node);
+        // Use multiple entry points to improve recall
+        let mut entries = Vec::new();
+        entries.push(entry_node);
+        // Add more random entries
+        if self.node_count > 20 {
+            for i in 1..10 {
+                let rd = (entry_node as usize + i * 1234567) % self.node_count;
+                entries.push(rd as u32);
+            }
+        }
+
+        for en in entries {
+            if visited.contains(&en) { continue; }
+            let score = scorer(en);
+            let cand = SearchCandidate { id: en, score };
+            candidates.push(cand);
+            visited.insert(en);
+            let matches = if let Some(f) = &filter { f(en) } else { true };
+            if matches {
+                results.push(OrderingWrapper(cand));
+            }
+        }
 
         while let Some(current) = candidates.pop() {
             if results.len() >= search_list_size && current.score < results.peek().unwrap().0.score {
@@ -189,17 +211,20 @@ impl GraphManager {
                         continue;
                     }
                     visited.insert(nb);
-                    let cand = SearchCandidate {
-                        id: nb,
-                        score: scorer(nb),
-                    };
-                    if results.len() < search_list_size
-                        || cand.score >= results.peek().unwrap().0.score
-                    {
-                        candidates.push(cand);
-                        results.push(OrderingWrapper(cand));
-                        if results.len() > search_list_size {
-                            results.pop();
+                    
+                    let score = scorer(nb);
+                    let cand = SearchCandidate { id: nb, score };
+                    candidates.push(cand);
+
+                    let matches = if let Some(f) = &filter { f(nb) } else { true };
+                    if matches {
+                        if results.len() < search_list_size
+                            || cand.score > results.peek().unwrap().0.score
+                        {
+                            results.push(OrderingWrapper(cand));
+                            if results.len() > search_list_size {
+                                results.pop();
+                            }
                         }
                     }
                 }
@@ -287,11 +312,13 @@ impl GraphManager {
             })
             .collect();
 
-        let adjacency: Vec<Vec<u32>> = candidate_lists
+        // Initial adjacency using Greedy search
+        let mut adjacency: Vec<Vec<u32>> = (0..n)
             .into_par_iter()
-            .enumerate()
-            .map(|(i, candidate_ids)| {
-                let mut scored: Vec<(u32, f64)> = build_scorer(i as u32, &candidate_ids);
+            .map(|i| {
+                // For each node i, find best neighbors among a random sample
+                // AND neighbors of a sample.
+                let mut scored: Vec<(u32, f64)> = build_scorer(i as u32, &candidate_lists[i]);
                 scored.sort_by(|a, b| {
                     b.1.partial_cmp(&a.1)
                         .unwrap_or(Ordering::Equal)
@@ -305,6 +332,43 @@ impl GraphManager {
                     .collect::<Vec<u32>>()
             })
             .collect();
+
+        // Build Refinement (NN-style)
+        // Perform 1 iteration of refinement to align with "virtually zero" indexing time goal
+        for _iter in 0..1 {
+            let next_adjacency: Vec<Vec<u32>> = (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let mut candidates = HashSet::new();
+                    // Current neighbors
+                    for &nb in &adjacency[i] {
+                        candidates.insert(nb);
+                        // Neighbors of neighbors
+                        for &nbnb in &adjacency[nb as usize] {
+                            if nbnb != i as u32 {
+                                candidates.insert(nbnb);
+                            }
+                        }
+                    }
+
+                    // Score all found candidates
+                    let cand_vec: Vec<u32> = candidates.into_iter().collect();
+                    let mut scored = build_scorer(i as u32, &cand_vec);
+                    scored.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1)
+                            .unwrap_or(Ordering::Equal)
+                            .then_with(|| a.0.cmp(&b.0))
+                    });
+
+                    scored
+                        .into_iter()
+                        .take(degree_cap.min(n.saturating_sub(1)))
+                        .map(|(id, _)| id)
+                        .collect()
+                })
+                .collect();
+            adjacency = next_adjacency;
+        }
 
         // V2 variable-length format:
         // [magic:4][node_count:u32][offsets:(n+1)*u64][payload]

@@ -3,9 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 
 const GROW_SLOTS: usize = 16384;
-
 pub struct LiveCodesFile {
-    _path: PathBuf,
     file: File,
     mmap: Option<MmapMut>,
     stride: usize,
@@ -27,7 +25,6 @@ impl LiveCodesFile {
         let len = capacity;
 
         let mut live_codes = Self {
-            _path: path,
             file,
             mmap: None,
             stride,
