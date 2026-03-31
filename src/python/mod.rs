@@ -224,7 +224,7 @@ impl Database {
         Ok(py_list.into())
     }
 
-    #[pyo3(signature = (max_degree=32, search_list_size=32, alpha=1.2))]
+    #[pyo3(signature = (max_degree=16, search_list_size=32, alpha=1.2))]
     fn create_index(
         &self,
         py: Python<'_>,
