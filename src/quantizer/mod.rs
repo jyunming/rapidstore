@@ -4,5 +4,5 @@ pub mod mse;
 pub mod prod;
 pub mod qjl;
 
-pub type CodeIndex = u8;
+pub type CodeIndex = u16;
 

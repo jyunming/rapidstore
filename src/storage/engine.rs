@@ -1,19 +1,20 @@
 use ndarray::Array1;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::cmp::Ordering;
 
 use super::backend::StorageBackend;
-use super::graph::GraphManager;
+use super::graph::{GraphManager, OrderingWrapper, SearchCandidate};
 use super::id_pool::IdPool;
 use super::live_codes::LiveCodesFile;
 use super::metadata::{MetadataStore, VectorMetadata};
 use super::segment::{SegmentManager, SegmentRecord};
 use super::wal::{Wal, WalEntry};
 use crate::quantizer::prod::ProdQuantizer;
+use crate::quantizer::CodeIndex;
 
 const QUANTIZER_STATE_FILE: &str = "quantizer.bin";
 const INDEX_IDS_FILE: &str = "graph_ids.json";
@@ -206,13 +207,16 @@ impl TurboQuantEngine {
         let graph = GraphManager::open(backend.clone(), local_dir)?;
 
         let qjl_len = manifest.d.div_ceil(8);
-        let stride = manifest.d + qjl_len + LIVE_GAMMA_BYTES + LIVE_NORM_BYTES + LIVE_DELETED_BYTES;
+        let mse_len = (manifest.d * (manifest.b - 1)).div_ceil(8);
+        let stride = mse_len + qjl_len + LIVE_GAMMA_BYTES + LIVE_NORM_BYTES + LIVE_DELETED_BYTES;
         let live_codes = LiveCodesFile::open(Path::new(local_dir).join("live_codes.bin"), stride)?;
 
         let mut engine = Self {
             d: manifest.d, b: manifest.b, quantizer, manifest, metric, backend, wal, wal_buffer: Vec::new(),
             wal_flush_threshold: 100, segments, metadata, graph, local_dir: local_dir.to_string(),
-            index_ids: load_index_ids(local_dir).unwrap_or_default(), live_codes, id_pool: IdPool::new(),
+            index_ids: load_index_ids(local_dir).unwrap_or_default(),
+            live_codes,
+            id_pool: IdPool::new(),
             live_vectors: HashMap::new(), index_ids_dirty: false, pending_manifest_updates: 0,
         };
 
@@ -231,7 +235,7 @@ impl TurboQuantEngine {
     }
 
     pub fn insert_with_document(&mut self, id: String, vector: &Array1<f64>, metadata: HashMap<String, JsonValue>, document: Option<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.id_pool.get_slot(&id).is_some() { return Err(format!("ID '{}' already exists", id).into()); }
+        if self.id_pool.contains(&id) { return Err(format!("ID '{}' already exists", id).into()); }
         self.write_vector_entry(id, vector, metadata, document, false)
     }
 
@@ -240,7 +244,7 @@ impl TurboQuantEngine {
     }
 
     pub fn update_with_document(&mut self, id: String, vector: &Array1<f64>, metadata: HashMap<String, JsonValue>, document: Option<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.id_pool.get_slot(&id).is_none() { return Err(format!("ID '{}' does not exist", id).into()); }
+        if !self.id_pool.contains(&id) { return Err(format!("ID '{}' does not exist", id).into()); }
         self.write_vector_entry(id, vector, metadata, document, false)
     }
 
@@ -249,7 +253,7 @@ impl TurboQuantEngine {
     pub fn update_many(&mut self, items: Vec<BatchWriteItem>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { self.insert_many_with_mode(items, BatchWriteMode::Update) }
 
     pub fn delete(&mut self, id: String) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        if self.id_pool.get_slot(&id).is_none() { return Ok(false); }
+        if !self.id_pool.contains(&id) { return Ok(false); }
         let entry = WalEntry { id: id.clone(), quantized_indices: Vec::new(), qjl_bits: Vec::new(), gamma: 0.0, metadata_json: "{}".to_string(), is_deleted: true };
         self.wal.append(&entry, false)?;
         self.wal_buffer.push(entry);
@@ -307,28 +311,29 @@ impl TurboQuantEngine {
         let live_codes = &self.live_codes;
         let d = self.d;
         let qjl_len = self.live_qjl_len();
+        let mse_len = self.live_mse_len();
         let metric = self.metric.clone();
         let quantizer = self.quantizer.clone();
         let slots_ref = indexed_slots.clone();
 
         let build_scorer = move |from: u32, candidates: &[u32]| -> Vec<(u32, f64)> {
             let from_slot = slots_ref[from as usize] as usize;
-            let (from_i, from_q, from_g, from_n) = live_codes_at_slot_raw(live_codes, d, qjl_len, from_slot);
-            let from_vec = quantizer.dequantize_single_no_parallel(from_i, from_q, from_g as f64);
+            let (from_i, from_q, from_g, from_n) = live_codes_at_slot_raw(live_codes, d, mse_len, qjl_len, from_slot, &quantizer);
+            let from_vec = quantizer.dequantize_single_no_parallel(&from_i, from_q, from_g as f64);
             if matches!(metric, DistanceMetric::Ip) {
                 let prep = quantizer.prepare_ip_query_lite(&from_vec);
                 candidates.iter().map(|&to| {
                     let to_slot = slots_ref[to as usize] as usize;
-                    let (to_i, to_q, to_g, _) = live_codes_at_slot_raw(live_codes, d, qjl_len, to_slot);
-                    (to, quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64))
+                    let (to_i, to_q, to_g, _) = live_codes_at_slot_raw(live_codes, d, mse_len, qjl_len, to_slot, &quantizer);
+                    (to, quantizer.score_ip_encoded_lite(&prep, &to_i, to_q, to_g as f64))
                 }).collect()
             } else if matches!(metric, DistanceMetric::Cosine) {
                 let prep = quantizer.prepare_ip_query_lite(&from_vec);
                 let from_norm = from_n;
                 candidates.iter().map(|&to| {
                     let to_slot = slots_ref[to as usize] as usize;
-                    let (to_i, to_q, to_g, to_n) = live_codes_at_slot_raw(live_codes, d, qjl_len, to_slot);
-                    let ip = quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64);
+                    let (to_i, to_q, to_g, to_n) = live_codes_at_slot_raw(live_codes, d, mse_len, qjl_len, to_slot, &quantizer);
+                    let ip = quantizer.score_ip_encoded_lite(&prep, &to_i, to_q, to_g as f64);
                     let score = if from_norm > 0.0 && to_n > 0.0 {
                         ip / (from_norm as f64 * to_n as f64)
                     } else { 0.0 };
@@ -337,8 +342,8 @@ impl TurboQuantEngine {
             } else {
                 candidates.iter().map(|&to| {
                     let to_slot = slots_ref[to as usize] as usize;
-                    let (to_i, to_q, to_g, _) = live_codes_at_slot_raw(live_codes, d, qjl_len, to_slot);
-                    let to_vec = quantizer.dequantize_single_no_parallel(to_i, to_q, to_g as f64);
+                    let (to_i, to_q, to_g, _) = live_codes_at_slot_raw(live_codes, d, mse_len, qjl_len, to_slot, &quantizer);
+                    let to_vec = quantizer.dequantize_single_no_parallel(&to_i, to_q, to_g as f64);
                     (to, score_vectors_with_metric(&metric, &from_vec, &to_vec))
                 }).collect()
             }
@@ -395,7 +400,7 @@ impl TurboQuantEngine {
                 self.graph.search(0, top_k, sls.max(top_k), |node| {
                     let slot = index_ids[node as usize];
                     let (indices, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
-                    self.quantizer.score_ip_encoded(&prep, indices, qjl, gamma as f64)
+                    self.quantizer.score_ip_encoded(&prep, &indices, qjl, gamma as f64)
                 }, slot_set.map(|ss| move |node_idx: u32| ss.contains(&index_ids[node_idx as usize])))?
             } else if matches!(self.metric, DistanceMetric::Cosine) {
                 let prep = self.quantizer.prepare_ip_query(query);
@@ -406,7 +411,7 @@ impl TurboQuantEngine {
                 self.graph.search(0, top_k, sls.max(top_k), |node| {
                     let slot = index_ids[node as usize];
                     let (indices, qjl, gamma, doc_norm) = self.live_codes_at_slot(slot as usize);
-                    let ip = self.quantizer.score_ip_encoded(&prep, indices, qjl, gamma as f64);
+                    let ip = self.quantizer.score_ip_encoded(&prep, &indices, qjl, gamma as f64);
                     if query_norm > 0.0 && doc_norm > 0.0 {
                         ip / (query_norm * doc_norm as f64)
                     } else { 0.0 }
@@ -418,7 +423,7 @@ impl TurboQuantEngine {
                 self.graph.search(0, top_k, sls.max(top_k), |node| {
                     let slot = index_ids[node as usize];
                     let (indices, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
-                    let v = self.quantizer.dequantize(indices, qjl, gamma as f64);
+                    let v = self.quantizer.dequantize(&indices, qjl, gamma as f64);
                     score_vectors_with_metric(&self.metric, query, &v)
                 }, slot_set.map(|ss| move |node_idx: u32| ss.contains(&index_ids[node_idx as usize])))?
             };
@@ -444,28 +449,28 @@ impl TurboQuantEngine {
         let active = self.id_pool.iter_active();
         if active.is_empty() { return Ok(Vec::new()); }
 
-        let mut results: Vec<(u32, f64)> = Vec::new();
+        let mut results = BinaryHeap::new();
         let q_norm = query.iter().map(|x| x * x).sum::<f64>().sqrt();
 
         if matches!(self.metric, DistanceMetric::Ip) {
             let prep = self.quantizer.prepare_ip_query(query);
-            for (id, slot) in active {
+            for (_, slot) in active {
                 let (indices, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
-                let score = self.quantizer.score_ip_encoded(&prep, indices, qjl, gamma as f64);
+                let score = self.quantizer.score_ip_encoded(&prep, &indices, qjl, gamma as f64);
                 
-                // Post-filter
                 if let Some(f) = filter {
                     let meta = self.metadata.get(slot)?.unwrap_or_default();
                     if !metadata_matches_filter(&meta.properties, f) { continue; }
                 }
 
-                results.push((slot, score));
+                results.push(OrderingWrapper(SearchCandidate { id: slot, score }));
+                if results.len() > top_k { results.pop(); }
             }
         } else if matches!(self.metric, DistanceMetric::Cosine) {
             let prep = self.quantizer.prepare_ip_query(query);
-            for (id, slot) in active {
+            for (_, slot) in active {
                 let (indices, qjl, gamma, doc_norm) = self.live_codes_at_slot(slot as usize);
-                let ip = self.quantizer.score_ip_encoded(&prep, indices, qjl, gamma as f64);
+                let ip = self.quantizer.score_ip_encoded(&prep, &indices, qjl, gamma as f64);
                 let score = if q_norm > 0.0 && doc_norm > 0.0 { ip / (q_norm * doc_norm as f64) } else { 0.0 };
 
                 if let Some(f) = filter {
@@ -473,13 +478,13 @@ impl TurboQuantEngine {
                     if !metadata_matches_filter(&meta.properties, f) { continue; }
                 }
 
-                results.push((slot, score));
+                results.push(OrderingWrapper(SearchCandidate { id: slot, score }));
+                if results.len() > top_k { results.pop(); }
             }
         } else {
-            // L2 or other: dequantize (slower fallback)
-            for (id, slot) in active {
+            for (_, slot) in active {
                 let (indices, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
-                let v = self.quantizer.dequantize(indices, qjl, gamma as f64);
+                let v = self.quantizer.dequantize(&indices, qjl, gamma as f64);
                 let score = score_vectors_with_metric(&self.metric, query, &v);
 
                 if let Some(f) = filter {
@@ -487,21 +492,18 @@ impl TurboQuantEngine {
                     if !metadata_matches_filter(&meta.properties, f) { continue; }
                 }
 
-                results.push((slot, score));
+                results.push(OrderingWrapper(SearchCandidate { id: slot, score }));
+                if results.len() > top_k { results.pop(); }
             }
         }
 
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-        if results.len() > top_k {
-            results.truncate(top_k);
-        }
-        let slots: Vec<u32> = results.iter().map(|(slot, _)| *slot).collect();
+        let slots: Vec<u32> = results.iter().map(|OrderingWrapper(c)| c.id).collect();
         let meta_map = self.metadata.get_many(&slots)?;
         let mut out = Vec::with_capacity(results.len());
-        for (slot, score) in results {
-            let id = self.id_pool.get_str(slot).unwrap_or_default().to_string();
-            let meta = meta_map.get(&slot).cloned().unwrap_or_default();
-            out.push(SearchResult { id, score, metadata: meta.properties, document: meta.document });
+        for OrderingWrapper(cand) in results {
+            let id = self.id_pool.get_str(cand.id).unwrap_or_default().to_string();
+            let meta = meta_map.get(&cand.id).cloned().unwrap_or_default();
+            out.push(SearchResult { id, score: cand.score, metadata: meta.properties, document: meta.document });
         }
         out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
         Ok(out)
@@ -515,6 +517,7 @@ impl TurboQuantEngine {
         for r in &records {
             if r.is_deleted { self.live_delete_slot(&r.id); }
         }
+        self.rebuild_live_codes_cache()?;
         self.live_compact_slab()?;
         self.live_codes.flush()?;
         self.segments.flush_batch(records)?;
@@ -552,40 +555,49 @@ impl TurboQuantEngine {
         }
     }
 
+    fn live_mse_len(&self) -> usize { (self.d * (self.b - 1)).div_ceil(8) }
     fn live_qjl_len(&self) -> usize { self.d.div_ceil(8) }
-    fn live_stride(&self) -> usize { self.d + self.live_qjl_len() + LIVE_GAMMA_BYTES + LIVE_NORM_BYTES + LIVE_DELETED_BYTES }
+    fn live_stride(&self) -> usize { self.live_mse_len() + self.live_qjl_len() + LIVE_GAMMA_BYTES + LIVE_NORM_BYTES + LIVE_DELETED_BYTES }
     fn live_active_count(&self) -> usize { self.id_pool.active_count() }
 
-    fn live_codes_at_slot(&self, slot: usize) -> (&[u8], &[u8], f32, f32) {
+    fn live_codes_at_slot(&self, slot: usize) -> (Vec<CodeIndex>, &[u8], f32, f32) {
         let rec = self.live_codes.get_slot(slot);
+        let mse_len = self.live_mse_len();
         let qjl_len = self.live_qjl_len();
-        let gamma = f32::from_le_bytes(rec[self.d + qjl_len..self.d + qjl_len + 4].try_into().unwrap());
-        let norm = f32::from_le_bytes(rec[self.d + qjl_len + 4..self.d + qjl_len + 8].try_into().unwrap());
-        (&rec[0..self.d], &rec[self.d..self.d + qjl_len], gamma, norm)
+        let mut indices = vec![0 as CodeIndex; self.d];
+        self.quantizer.unpack_mse_indices(&rec[0..mse_len], &mut indices);
+        let qjl = &rec[mse_len..mse_len + qjl_len];
+        let gamma = f32::from_le_bytes(rec[mse_len + qjl_len..mse_len + qjl_len + 4].try_into().unwrap());
+        let norm = f32::from_le_bytes(rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].try_into().unwrap());
+        (indices, qjl, gamma, norm)
     }
 
-    fn live_alloc_slot(&mut self, id: &str, indices: &[u8], qjl: &[u8], gamma: f32, norm: f32) -> u32 {
+    fn live_alloc_slot(&mut self, id: &str, indices: &[CodeIndex], qjl: &[u8], gamma: f32, norm: f32) -> u32 {
         let slot = self.id_pool.insert(id);
         let new_slot = self.live_codes.alloc_slot().unwrap();
+        let mse_len = self.live_mse_len();
         let qjl_len = self.live_qjl_len();
+        let packed_mse = self.quantizer.pack_mse_indices(indices);
         let rec = self.live_codes.get_slot_mut(new_slot);
-        rec[0..self.d].copy_from_slice(indices);
-        rec[self.d..self.d + qjl_len].copy_from_slice(qjl);
-        rec[self.d + qjl_len..self.d + qjl_len + 4].copy_from_slice(&gamma.to_le_bytes());
-        rec[self.d + qjl_len + 4..self.d + qjl_len + 8].copy_from_slice(&norm.to_le_bytes());
-        rec[self.d + qjl_len + 8] = 0u8;
+        rec[0..mse_len].copy_from_slice(&packed_mse);
+        rec[mse_len..mse_len + qjl_len].copy_from_slice(qjl);
+        rec[mse_len + qjl_len..mse_len + qjl_len + 4].copy_from_slice(&gamma.to_le_bytes());
+        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].copy_from_slice(&norm.to_le_bytes());
+        rec[mse_len + qjl_len + 8] = 0u8;
         slot
     }
 
-    fn live_alloc_or_update(&mut self, id: &str, indices: &[u8], qjl: &[u8], gamma: f32, norm: f32) -> u32 {
+    fn live_alloc_or_update(&mut self, id: &str, indices: &[CodeIndex], qjl: &[u8], gamma: f32, norm: f32) -> u32 {
         if let Some(slot) = self.id_pool.get_slot(id) {
+            let mse_len = self.live_mse_len();
             let qjl_len = self.live_qjl_len();
+            let packed_mse = self.quantizer.pack_mse_indices(indices);
             let rec = self.live_codes.get_slot_mut(slot as usize);
-            rec[0..self.d].copy_from_slice(indices);
-            rec[self.d..self.d + qjl_len].copy_from_slice(qjl);
-            rec[self.d + qjl_len..self.d + qjl_len + 4].copy_from_slice(&gamma.to_le_bytes());
-            rec[self.d + qjl_len + 4..self.d + qjl_len + 8].copy_from_slice(&norm.to_le_bytes());
-            rec[self.d + qjl_len + 8] = 0u8;
+            rec[0..mse_len].copy_from_slice(&packed_mse);
+            rec[mse_len..mse_len + qjl_len].copy_from_slice(qjl);
+            rec[mse_len + qjl_len..mse_len + qjl_len + 4].copy_from_slice(&gamma.to_le_bytes());
+            rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].copy_from_slice(&norm.to_le_bytes());
+            rec[mse_len + qjl_len + 8] = 0u8;
             slot
         } else { self.live_alloc_slot(id, indices, qjl, gamma, norm) }
     }
@@ -602,15 +614,33 @@ impl TurboQuantEngine {
 
     fn live_compact_slab(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let stride = self.live_stride();
+        let old_stride = self.live_codes.stride();
         let temp_path = Path::new(&self.local_dir).join("live_codes.bin.tmp");
         let mut new_codes = LiveCodesFile::open(temp_path.clone(), stride)?;
         new_codes.clear()?;
         let mut new_pool = IdPool::new();
-        for (id, old_slot) in self.live_iter_id_slots() {
-            let old_rec = self.live_codes.get_slot(old_slot as usize);
-            let next_alloc = new_codes.alloc_slot()?;
-            new_codes.get_slot_mut(next_alloc).copy_from_slice(old_rec);
-            new_pool.insert(&id);
+        if old_stride == stride {
+            for (id, old_slot) in self.live_iter_id_slots() {
+                let old_rec = self.live_codes.get_slot(old_slot as usize);
+                let next_alloc = new_codes.alloc_slot()?;
+                new_codes.get_slot_mut(next_alloc).copy_from_slice(old_rec);
+                new_pool.insert(&id);
+            }
+        } else {
+            let mse_len = self.live_mse_len();
+            let qjl_len = self.live_qjl_len();
+            for (id, old_slot) in self.live_iter_id_slots() {
+                let (indices, qjl, gamma, norm) = self.live_codes_at_slot(old_slot as usize);
+                let next_alloc = new_codes.alloc_slot()?;
+                let rec = new_codes.get_slot_mut(next_alloc);
+                let packed_mse = self.quantizer.pack_mse_indices(&indices);
+                rec[0..mse_len].copy_from_slice(&packed_mse);
+                rec[mse_len..mse_len + qjl_len].copy_from_slice(qjl);
+                rec[mse_len + qjl_len..mse_len + qjl_len + 4].copy_from_slice(&gamma.to_le_bytes());
+                rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].copy_from_slice(&norm.to_le_bytes());
+                rec[mse_len + qjl_len + 8] = 0u8;
+                new_pool.insert(&id);
+            }
         }
         new_codes.truncate_to(new_pool.active_count())?;
         new_codes.flush()?; drop(new_codes);
@@ -703,7 +733,6 @@ impl TurboQuantEngine {
         for chunk in items.chunks(5000) {
             let mut wal_entries = Vec::with_capacity(chunk.len());
             let mut metadata_entries: Vec<(u32, VectorMetadata)> = Vec::with_capacity(chunk.len());
-
             let vectors: Vec<_> = chunk.iter().map(|i| i.vector.clone()).collect();
             let quantized = self.quantizer.quantize_batch(&vectors);
 
@@ -717,16 +746,13 @@ impl TurboQuantEngine {
                     }
                     _ => {}
                 }
-
                 let norm = vectors[i].iter().map(|x| x * x).sum::<f64>().sqrt() as f32;
                 let meta = VectorMetadata { properties: item.metadata.clone(), document: item.document.clone() };
                 let entry = WalEntry { id: item.id.clone(), quantized_indices: indices, qjl_bits: qjl, gamma: gamma as f32, metadata_json: serde_json::to_string(&meta)?, is_deleted: false };
-                
                 let slot = self.live_alloc_or_update(&item.id, &entry.quantized_indices, &entry.qjl_bits, entry.gamma, norm);
                 metadata_entries.push((slot, meta));
                 wal_entries.push(entry);
             }
-
             self.wal.append_batch(&wal_entries, false)?;
             self.metadata.put_many(&metadata_entries)?;
             self.wal_buffer.extend(wal_entries);
@@ -766,11 +792,13 @@ fn load_index_ids(local_dir: &str) -> Result<Vec<u32>, Box<dyn std::error::Error
     Ok(Vec::new())
 }
 
-fn live_codes_at_slot_raw<'a>(live_codes: &'a LiveCodesFile, d: usize, qjl_len: usize, slot: usize) -> (&'a [u8], &'a [u8], f32, f32) {
+fn live_codes_at_slot_raw<'a>(live_codes: &'a LiveCodesFile, d: usize, mse_len: usize, qjl_len: usize, slot: usize, quantizer: &ProdQuantizer) -> (Vec<CodeIndex>, &'a [u8], f32, f32) {
     let rec = live_codes.get_slot(slot);
-    let gamma = f32::from_le_bytes(rec[d + qjl_len..d + qjl_len + 4].try_into().unwrap());
-    let norm = f32::from_le_bytes(rec[d + qjl_len + 4..d + qjl_len + 8].try_into().unwrap());
-    (&rec[0..d], &rec[d..d + qjl_len], gamma, norm)
+    let mut indices = vec![0 as CodeIndex; d];
+    quantizer.unpack_mse_indices(&rec[0..mse_len], &mut indices);
+    let gamma = f32::from_le_bytes(rec[mse_len + qjl_len..mse_len + qjl_len + 4].try_into().unwrap());
+    let norm = f32::from_le_bytes(rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].try_into().unwrap());
+    (indices, &rec[mse_len..mse_len + qjl_len], gamma, norm)
 }
 
 fn metadata_matches_filter(meta: &HashMap<String, JsonValue>, filter: &HashMap<String, JsonValue>) -> bool {

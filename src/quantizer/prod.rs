@@ -434,4 +434,48 @@ impl ProdQuantizer {
             })
             .collect()
     }
+
+    pub fn pack_mse_indices(&self, indices: &[CodeIndex]) -> Vec<u8> {
+        let bits_per_idx = self.b - 1;
+        if bits_per_idx == 8 {
+            return indices.iter().map(|v| *v as u8).collect();
+        }
+
+        let total_bits = self.d * bits_per_idx;
+        let mut packed = vec![0u8; total_bits.div_ceil(8)];
+
+        for i in 0..self.d {
+            let val = indices[i] as u32;
+            let bit_start = i * bits_per_idx;
+            for b in 0..bits_per_idx {
+                if (val >> b) & 1 == 1 {
+                    let bit_pos = bit_start + b;
+                    packed[bit_pos / 8] |= 1 << (bit_pos % 8);
+                }
+            }
+        }
+        packed
+    }
+
+    pub fn unpack_mse_indices(&self, packed: &[u8], out: &mut [CodeIndex]) {
+        let bits_per_idx = self.b - 1;
+        if bits_per_idx == 8 {
+            for (dst, src) in out.iter_mut().zip(packed.iter()) {
+                *dst = *src as CodeIndex;
+            }
+            return;
+        }
+
+        for i in 0..self.d {
+            let mut val = 0u32;
+            let bit_start = i * bits_per_idx;
+            for b in 0..bits_per_idx {
+                let bit_pos = bit_start + b;
+                if (packed[bit_pos / 8] >> (bit_pos % 8)) & 1 == 1 {
+                    val |= 1 << b;
+                }
+            }
+            out[i] = val as CodeIndex;
+        }
+    }
 }

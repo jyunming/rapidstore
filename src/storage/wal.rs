@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+
+use crate::quantizer::CodeIndex;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -6,7 +8,7 @@ use std::path::{Path, PathBuf};
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WalEntry {
     pub id: String,
-    pub quantized_indices: Vec<u8>,
+    pub quantized_indices: Vec<CodeIndex>,
     pub qjl_bits: Vec<u8>,
     pub gamma: f32,
     pub metadata_json: String,
