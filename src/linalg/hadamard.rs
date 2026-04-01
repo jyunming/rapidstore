@@ -26,15 +26,15 @@ pub fn fwht(a: &mut [f32]) {
 pub fn srht(x: &[f32], signs: &[f32], out: &mut [f32]) {
     let d = x.len();
     let n = d.next_power_of_two();
-    
+
     // Copy and pad to power of 2
     let mut temp = vec![0.0f32; n];
     for i in 0..d {
         temp[i] = x[i] * signs[i];
     }
-    
+
     fwht(&mut temp);
-    
+
     let norm = 1.0 / (n as f32).sqrt();
     for i in 0..d {
         out[i] = temp[i] * norm;

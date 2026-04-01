@@ -1,14 +1,40 @@
+# Rust build artifacts
 /target
-/target_*
+/target_*/
+
+# Python environments and caches
 /.venv
 /.hf_home
 /.pydeps
-/.tmp*
-/rq_fix_*
 /benchmarks/__pycache__/
+**/__pycache__/
+
+# Wheel builds
+/dist/
+
+# Secrets and local config
+.env
+/.claude/
+
+# Temporary probe and test directories
+/tmp_*/
+/rq_fix_*/
+
+# Benchmark artifacts and result data
 /benchmarks/artifacts*/
 /benchmarks/store_compare_work*/
 /benchmarks/tmp*/
+/benchmarks/*_results*.json
+/benchmarks/*_results_*.json
+/recall_results.json
+
+# Server data
 /server/tenants/
+
+# Test database artifacts
+/.tmp_db/
+/tmp_bench_temp/
+
+# Misc
 /build_error.txt
-/t
+/C：/

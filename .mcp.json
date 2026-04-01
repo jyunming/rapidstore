@@ -1,0 +1,55 @@
+{
+  "mcpServers": {
+    "turboquant-build": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["build", "--release"],
+      "cwd": "C:\\dev\\turboquantDB"
+    },
+    "turboquant-test": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["test", "--lib"],
+      "cwd": "C:\\dev\\turboquantDB"
+    },
+    "turboquant-bench": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["bench"],
+      "cwd": "C:\\dev\\turboquantDB"
+    },
+    "python-linter": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "pylint"],
+      "cwd": "C:\\dev\\turboquantDB\\python"
+    },
+    "python-formatter": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "black", "--line-length", "100"],
+      "cwd": "C:\\dev\\turboquantDB"
+    },
+    "python-type-checker": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "mypy", "--ignore-missing-imports"],
+      "cwd": "C:\\dev\\turboquantDB\\python"
+    },
+    "rust-format": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["fmt", "--all"],
+      "cwd": "C:\\dev\\turboquantDB"
+    },
+    "maturin-dev": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "maturin", "develop"],
+      "cwd": "C:\\dev\\turboquantDB",
+      "env": {
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only"
+      }
+    }
+  }
+}

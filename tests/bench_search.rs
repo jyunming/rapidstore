@@ -88,8 +88,8 @@ fn test_benchmark_compaction_and_search() -> Result<(), Box<dyn std::error::Erro
     let stats = engine.stats();
     let insertion_throughput = inserted as f64 / (insert_total_ms / 1000.0);
 
-    let artifact_dir = std::env::var("TQ_BENCH_ARTIFACT_DIR")
-        .unwrap_or_else(|_| "target/benchmarks".to_string());
+    let artifact_dir =
+        std::env::var("TQ_BENCH_ARTIFACT_DIR").unwrap_or_else(|_| "target/benchmarks".to_string());
     fs::create_dir_all(&artifact_dir)?;
     let artifact_path = PathBuf::from(artifact_dir).join("bench_search.json");
 

@@ -2,9 +2,8 @@ pub mod backend;
 pub mod compaction;
 pub mod engine;
 pub mod graph;
+pub mod id_pool;
+pub mod live_codes;
 pub mod metadata;
 pub mod segment;
 pub mod wal;
-pub mod id_pool;
-pub mod live_codes;
-

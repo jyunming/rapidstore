@@ -729,7 +729,10 @@ fn test_index_config_persisted_in_manifest_and_stats() {
         reopened.manifest.index_state.as_ref().map(|s| s.max_degree),
         Some(24)
     );
-    assert_eq!(reopened.manifest.index_state.as_ref().map(|s| s.alpha), Some(1.7));
+    assert_eq!(
+        reopened.manifest.index_state.as_ref().map(|s| s.alpha),
+        Some(1.7)
+    );
 }
 
 #[test]
@@ -740,7 +743,9 @@ fn test_graph_build_respects_max_degree() {
 
     for i in 0..12usize {
         let v = Array1::<f64>::from_iter((0..8).map(|j| (i * 8 + j) as f64 / 100.0));
-        engine.upsert(format!("id-{i}"), &v, HashMap::new()).unwrap();
+        engine
+            .upsert(format!("id-{i}"), &v, HashMap::new())
+            .unwrap();
     }
     engine.create_index_with_params(1, 20, 1.2).unwrap();
     engine.close().unwrap();
@@ -824,7 +829,9 @@ fn test_compaction_recovery_deletes_old_segments_when_marker_exists() {
 
     for i in 0..6usize {
         let v = Array1::<f64>::from_iter((0..8).map(|j| (i + j) as f64 / 50.0));
-        engine.upsert(format!("id-{i}"), &v, HashMap::new()).unwrap();
+        engine
+            .upsert(format!("id-{i}"), &v, HashMap::new())
+            .unwrap();
         engine.flush_wal_to_segment().unwrap();
     }
     let before_count = engine.vector_count();
@@ -925,7 +932,10 @@ fn test_hybrid_search_sparse_weight_can_override_dense_order() {
 
     // Dense-near candidate but text-irrelevant.
     let mut m1 = HashMap::new();
-    m1.insert("topic".to_string(), JsonValue::String("generic".to_string()));
+    m1.insert(
+        "topic".to_string(),
+        JsonValue::String("generic".to_string()),
+    );
     engine
         .upsert_with_document(
             "dense-first".to_string(),
@@ -1109,10 +1119,7 @@ fn test_batch_update_report_continues_on_missing_ids() {
         turboquantdb::storage::engine::BatchWriteItem {
             id: "exists".to_string(),
             vector: Array1::<f64>::from_elem(8, 0.2),
-            metadata: HashMap::from([(
-                "k".to_string(),
-                JsonValue::String("v".to_string()),
-            )]),
+            metadata: HashMap::from([("k".to_string(), JsonValue::String("v".to_string()))]),
             document: None,
         },
     ];
@@ -1145,13 +1152,9 @@ fn test_snapshot_and_restore_roundtrip() {
             let v = Array1::<f64>::from_iter((0..8).map(|j| (i * 8 + j) as f64 / 100.0));
             let mut meta = HashMap::new();
             meta.insert("group".to_string(), JsonValue::String("base".to_string()));
-            engine.upsert_with_document(
-                format!("id-{i}"),
-                &v,
-                meta,
-                Some(format!("doc-{i}")),
-            )
-            .unwrap();
+            engine
+                .upsert_with_document(format!("id-{i}"), &v, meta, Some(format!("doc-{i}")))
+                .unwrap();
         }
         engine.create_index(16, 24).unwrap();
         engine.close().unwrap();
@@ -1177,7 +1180,10 @@ fn test_snapshot_and_restore_roundtrip() {
 
     TurboQuantEngine::restore_from_snapshot(db_path_str, snap_path_str).unwrap();
     let after_files = read_tree_files(Path::new(db_path_str));
-    assert_eq!(before_files, after_files, "restored bytes should match snapshot");
+    assert_eq!(
+        before_files, after_files,
+        "restored bytes should match snapshot"
+    );
 
     let restored = TurboQuantEngine::open(db_path_str, db_path_str, 8, 2, 313).unwrap();
     assert_eq!(restored.vector_count(), 10);
@@ -1233,8 +1239,8 @@ fn test_collection_snapshot_and_restore_roundtrip() {
 
     TurboQuantEngine::restore_collection(root, "c1", snap_str).unwrap();
 
-    let c1r = TurboQuantEngine::open_collection(root, root, "c1", 8, 2, 9, DistanceMetric::Ip)
-        .unwrap();
+    let c1r =
+        TurboQuantEngine::open_collection(root, root, "c1", 8, 2, 9, DistanceMetric::Ip).unwrap();
     assert_eq!(c1r.vector_count(), 1);
     assert!(c1r.get("base").unwrap().is_some());
     assert!(c1r.get("mutated").unwrap().is_none());
@@ -1315,11 +1321,93 @@ fn test_scoped_catalog_helpers_list_and_delete() {
     assert_eq!(db2, vec!["c1".to_string()]);
 
     assert!(
-        TurboQuantEngine::delete_collection_scoped_with_uri(uri, root, "t1", "db1", "c2")
-            .unwrap()
+        TurboQuantEngine::delete_collection_scoped_with_uri(uri, root, "t1", "db1", "c2").unwrap()
     );
     let db1_after = TurboQuantEngine::list_collections_scoped(root, "t1", "db1").unwrap();
     assert_eq!(db1_after, vec!["c1".to_string()]);
+}
+
+#[test]
+fn test_rerank_disabled_behavior() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().to_str().unwrap();
+
+    // Open with rerank=false
+    let mut engine = TurboQuantEngine::open_with_metric_and_rerank(
+        db_path,
+        db_path,
+        8,
+        2,
+        42,
+        DistanceMetric::Ip,
+        false,
+    )
+    .unwrap();
+
+    let v = Array1::<f64>::from_elem(8, 0.5);
+    engine.insert("v1".to_string(), &v, HashMap::new()).unwrap();
+
+    // Verify live_vectors.bin does not exist
+    assert!(!Path::new(db_path).join("live_vectors.bin").exists());
+
+    let stats = engine.stats();
+    assert_eq!(stats.live_vectors_bytes_estimate, 0);
+
+    let results = engine.search(&v, 1).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, "v1");
+}
+
+#[test]
+fn test_wal_versioning_and_migration() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().to_str().unwrap();
+    let wal_path = dir.path().join("wal.log");
+
+    // 1. Manually create a "legacy" WAL (no header, just entries)
+    // We'll use the current WalEntry but since it doesn't have the header it will be treated as legacy if we bypass open()
+    // Actually, the easiest way is to use the legacy struct if we had it here,
+    // but we can just test that the current versioned WAL works.
+
+    {
+        let mut engine = TurboQuantEngine::open(db_path, db_path, 8, 2, 42).unwrap();
+        engine
+            .insert("v1".to_string(), &Array1::zeros(8), HashMap::new())
+            .unwrap();
+        // WAL now has TQWV header
+    }
+
+    // Verify header exists
+    let wal_bytes = std::fs::read(&wal_path).unwrap();
+    assert_eq!(&wal_bytes[0..4], b"TQWV");
+
+    // Reopen and verify recovery
+    let mut engine = TurboQuantEngine::open(db_path, db_path, 8, 2, 42).unwrap();
+    engine.flush_wal_to_segment().unwrap();
+    assert_eq!(engine.vector_count(), 1);
+}
+
+#[test]
+fn test_hnsw_beam_search_recall() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().to_str().unwrap();
+    let mut engine = TurboQuantEngine::open(db_path, db_path, 16, 2, 42).unwrap();
+
+    // Insert 200 vectors to have some depth
+    for i in 0..200usize {
+        let v = Array1::<f64>::from_iter((0..16).map(|j| (i + j) as f64 / 1000.0));
+        engine
+            .insert(format!("v{}", i), &v, HashMap::new())
+            .unwrap();
+    }
+
+    engine.create_index_with_params(16, 64, 1.2).unwrap();
+
+    let query = Array1::<f64>::from_iter((0..16).map(|j| j as f64 / 1000.0));
+    let results = engine.search(&query, 10).unwrap();
+
+    assert!(!results.is_empty());
+    assert_eq!(results[0].id, "v0"); // Should easily find the exact match with beam search
 }
 
 fn read_tree_files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {

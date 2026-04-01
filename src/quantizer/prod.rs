@@ -4,9 +4,9 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
 
+use super::CodeIndex;
 use super::mse::MseQuantizer;
 use super::qjl::QjlQuantizer;
-use super::CodeIndex;
 use crate::linalg::hadamard::srht;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -251,7 +251,9 @@ impl ProdQuantizer {
                 let mut qs = 0.0f32;
                 for bit in 0..8 {
                     let idx = base_i + bit;
-                    if idx >= self.d { break; }
+                    if idx >= self.d {
+                        break;
+                    }
                     let s = unsafe { *sq.add(idx) };
                     qs += if (byte & (1 << bit)) != 0 { s } else { -s };
                 }
@@ -271,7 +273,7 @@ impl ProdQuantizer {
 
     pub fn quantize(&self, x: &Array1<f64>) -> (Vec<CodeIndex>, Vec<u8>, f64) {
         let (idx, qjl, gamma) = (self.mse_quantizer.quantize(x), Vec::<u8>::new(), 0.0);
-        
+
         let x_tilde_mse = self.mse_quantizer.dequantize(&idx);
         let mut residual = Array1::zeros(self.d);
         let mut gamma_sq = 0.0f64;
@@ -282,7 +284,7 @@ impl ProdQuantizer {
         }
         let gamma = gamma_sq.sqrt();
         let qjl = self.qjl_quantizer.quantize(&residual);
-        
+
         (idx, qjl, gamma)
     }
 
@@ -306,7 +308,10 @@ impl ProdQuantizer {
     }
 
     pub fn dequantize_batch(&self, encoded: &[(Vec<CodeIndex>, Vec<u8>, f64)]) -> Vec<Array1<f64>> {
-        encoded.iter().map(|(idx, qjl, gamma)| self.dequantize(idx, qjl, *gamma)).collect()
+        encoded
+            .iter()
+            .map(|(idx, qjl, gamma)| self.dequantize(idx, qjl, *gamma))
+            .collect()
     }
 
     pub fn pack_mse_indices(&self, indices: &[CodeIndex]) -> Vec<u8> {

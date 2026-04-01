@@ -12,7 +12,10 @@ pub struct LiveCodesFile {
 }
 
 impl LiveCodesFile {
-    pub fn open(path: PathBuf, stride: usize) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn open(
+        path: PathBuf,
+        stride: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -73,7 +76,10 @@ impl LiveCodesFile {
         Ok(slot)
     }
 
-    pub fn truncate_to(&mut self, new_len: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn truncate_to(
+        &mut self,
+        new_len: usize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.mmap = None; // DROP MUST BE FIRST ON WINDOWS
         self.file.set_len((new_len * self.stride) as u64)?;
         self.capacity = new_len;
@@ -82,7 +88,6 @@ impl LiveCodesFile {
         Ok(())
     }
 
-    
     pub fn flush(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(mmap) = &self.mmap {
             mmap.flush()?;
@@ -114,5 +119,3 @@ impl LiveCodesFile {
         Ok(())
     }
 }
-
-

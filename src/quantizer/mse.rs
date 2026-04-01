@@ -5,8 +5,8 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use super::codebook::lloyd_max;
 use super::CodeIndex;
+use super::codebook::lloyd_max;
 use crate::linalg::hadamard::{fwht, srht};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -24,10 +24,16 @@ impl MseQuantizer {
         for s in &mut rotation_signs {
             *s = if rng.gen_bool(0.5) { 1.0 } else { -1.0 };
         }
-        
+
         let num_points = 20_000;
-        let centroids: Vec<f32> = lloyd_max(b, d, num_points).into_iter().map(|c| c as f32).collect();
-        assert!(centroids.len() <= u16::MAX as usize + 1, "codebook too large for u16 indices; reduce bits");
+        let centroids: Vec<f32> = lloyd_max(b, d, num_points)
+            .into_iter()
+            .map(|c| c as f32)
+            .collect();
+        assert!(
+            centroids.len() <= u16::MAX as usize + 1,
+            "codebook too large for u16 indices; reduce bits"
+        );
 
         Self {
             d,
@@ -53,32 +59,44 @@ impl MseQuantizer {
     pub fn quantize_batch(&self, xs: &DMatrix<f32>) -> Vec<Vec<CodeIndex>> {
         assert_eq!(xs.nrows(), self.d);
         let n = xs.ncols();
-        if n == 0 { return Vec::new(); }
+        if n == 0 {
+            return Vec::new();
+        }
 
         let mut all_indices = vec![vec![0 as CodeIndex; self.d]; n];
-        all_indices.par_iter_mut().enumerate().for_each(|(col, idxs)| {
-            let x_col_owned: Vec<f32> = xs.column(col).iter().copied().collect();
-            let mut y = vec![0.0f32; self.d];
-            srht(&x_col_owned, &self.rotation_signs, &mut y);
-            for row in 0..self.d {
-                idxs[row] = self.nearest_centroid_index(y[row]);
-            }
-        });
+        all_indices
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(col, idxs)| {
+                let x_col_owned: Vec<f32> = xs.column(col).iter().copied().collect();
+                let mut y = vec![0.0f32; self.d];
+                srht(&x_col_owned, &self.rotation_signs, &mut y);
+                for row in 0..self.d {
+                    idxs[row] = self.nearest_centroid_index(y[row]);
+                }
+            });
 
         all_indices
     }
 
     fn nearest_centroid_index(&self, val: f32) -> CodeIndex {
         let n = self.centroids.len();
-        if n == 0 { return 0; }
+        if n == 0 {
+            return 0;
+        }
         let pos = self.centroids.partition_point(|&c| c < val);
-        if pos == 0 { 0 }
-        else if pos >= n { (n - 1) as CodeIndex }
-        else {
+        if pos == 0 {
+            0
+        } else if pos >= n {
+            (n - 1) as CodeIndex
+        } else {
             let lo = pos - 1;
             let hi = pos;
-            if (val - self.centroids[lo]).abs() <= (self.centroids[hi] - val).abs() { lo as CodeIndex }
-            else { hi as CodeIndex }
+            if (val - self.centroids[lo]).abs() <= (self.centroids[hi] - val).abs() {
+                lo as CodeIndex
+            } else {
+                hi as CodeIndex
+            }
         }
     }
 
@@ -104,13 +122,15 @@ impl MseQuantizer {
 
     pub fn dequantize_batch(&self, indices_batch: &[Vec<CodeIndex>]) -> DMatrix<f32> {
         let n = indices_batch.len();
-        if n == 0 { return DMatrix::zeros(self.d, 0); }
+        if n == 0 {
+            return DMatrix::zeros(self.d, 0);
+        }
 
         let mut out = DMatrix::zeros(self.d, n);
         let d = self.d;
         let signs = &self.rotation_signs;
         let centroids = &self.centroids;
-        
+
         let pad = d.next_power_of_two();
         let norm = 1.0 / (pad as f32).sqrt();
         for (col, indices) in indices_batch.iter().enumerate() {

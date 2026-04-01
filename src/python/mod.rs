@@ -35,12 +35,20 @@ impl Database {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Invalid metric: {}",
                     metric
-                )))
+                )));
             }
         };
 
-        let engine = TurboQuantEngine::open_with_metric_and_rerank(&path, &path, dimension, bits, seed, dist_metric, rerank)
-            .map_err(to_py_runtime)?;
+        let engine = TurboQuantEngine::open_with_metric_and_rerank(
+            &path,
+            &path,
+            dimension,
+            bits,
+            seed,
+            dist_metric,
+            rerank,
+        )
+        .map_err(to_py_runtime)?;
         Ok(Self {
             engine: Arc::new(RwLock::new(engine)),
         })
@@ -57,7 +65,10 @@ impl Database {
         let vec = if let Ok(v) = vector.extract::<PyReadonlyArray1<f32>>(py) {
             v.as_array().mapv(|x| x as f64)
         } else {
-            vector.extract::<PyReadonlyArray1<f64>>(py)?.as_array().to_owned()
+            vector
+                .extract::<PyReadonlyArray1<f64>>(py)?
+                .as_array()
+                .to_owned()
         };
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
@@ -107,7 +118,8 @@ impl Database {
                 }
                 py.allow_threads(|| {
                     let mut engine = self.engine.write().unwrap();
-                    engine.insert_many_with_mode(chunk_items, b_mode)
+                    engine
+                        .insert_many_with_mode(chunk_items, b_mode)
                         .map_err(to_py_runtime)
                 })?;
             }
@@ -134,7 +146,8 @@ impl Database {
                 }
                 py.allow_threads(|| {
                     let mut engine = self.engine.write().unwrap();
-                    engine.insert_many_with_mode(chunk_items, b_mode)
+                    engine
+                        .insert_many_with_mode(chunk_items, b_mode)
                         .map_err(to_py_runtime)
                 })?;
             }
@@ -153,7 +166,10 @@ impl Database {
         let vec = if let Ok(v) = vector.extract::<PyReadonlyArray1<f32>>(py) {
             v.as_array().mapv(|x| x as f64)
         } else {
-            vector.extract::<PyReadonlyArray1<f64>>(py)?.as_array().to_owned()
+            vector
+                .extract::<PyReadonlyArray1<f64>>(py)?
+                .as_array()
+                .to_owned()
         };
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
@@ -175,7 +191,10 @@ impl Database {
         let vec = if let Ok(v) = vector.extract::<PyReadonlyArray1<f32>>(py) {
             v.as_array().mapv(|x| x as f64)
         } else {
-            vector.extract::<PyReadonlyArray1<f64>>(py)?.as_array().to_owned()
+            vector
+                .extract::<PyReadonlyArray1<f64>>(py)?
+                .as_array()
+                .to_owned()
         };
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
@@ -237,10 +256,17 @@ impl Database {
         let q = if let Ok(v) = query.extract::<PyReadonlyArray1<f32>>(py) {
             v.as_array().mapv(|x| x as f64)
         } else {
-            query.extract::<PyReadonlyArray1<f64>>(py)?.as_array().to_owned()
+            query
+                .extract::<PyReadonlyArray1<f64>>(py)?
+                .as_array()
+                .to_owned()
         };
         let parsed_filter = parse_pydict(filter)?;
-        let filter_ref = if parsed_filter.is_empty() { None } else { Some(&parsed_filter) };
+        let filter_ref = if parsed_filter.is_empty() {
+            None
+        } else {
+            Some(&parsed_filter)
+        };
 
         let results = py.allow_threads(|| {
             let engine = self.engine.read().unwrap();
@@ -304,7 +330,10 @@ impl Database {
         dict.set_item("live_slot_count", stats.live_slot_count)?;
         dict.set_item("live_id_count", stats.live_id_count)?;
         dict.set_item("live_vectors_count", stats.live_vectors_count)?;
-        dict.set_item("live_vectors_bytes_estimate", stats.live_vectors_bytes_estimate)?;
+        dict.set_item(
+            "live_vectors_bytes_estimate",
+            stats.live_vectors_bytes_estimate,
+        )?;
         dict.set_item("metadata_entries", stats.metadata_entries)?;
         dict.set_item("metadata_bytes_estimate", stats.metadata_bytes_estimate)?;
         dict.set_item("ann_slot_count", stats.ann_slot_count)?;
@@ -332,43 +361,59 @@ fn json_to_py(py: Python<'_>, v: &JsonValue) -> PyResult<PyObject> {
         JsonValue::Null => Ok(py.None()),
         JsonValue::Bool(b) => Ok(b.to_object(py)),
         JsonValue::Number(n) => {
-            if let Some(i) = n.as_i64() { Ok(i.to_object(py)) }
-            else { Ok(n.as_f64().unwrap().to_object(py)) }
+            if let Some(i) = n.as_i64() {
+                Ok(i.to_object(py))
+            } else {
+                Ok(n.as_f64().unwrap().to_object(py))
+            }
         }
         JsonValue::String(s) => Ok(s.to_object(py)),
         JsonValue::Array(arr) => {
             let list = PyList::empty_bound(py);
-            for item in arr { list.append(json_to_py(py, item)?)?; }
+            for item in arr {
+                list.append(json_to_py(py, item)?)?;
+            }
             Ok(list.into())
         }
         JsonValue::Object(obj) => {
             let dict = PyDict::new_bound(py);
-            for (k, val) in obj { dict.set_item(k, json_to_py(py, val)?)?; }
+            for (k, val) in obj {
+                dict.set_item(k, json_to_py(py, val)?)?;
+            }
             Ok(dict.into())
         }
     }
 }
 
 fn py_to_json(obj: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
-    if obj.is_none() { Ok(JsonValue::Null) }
-    else if let Ok(b) = obj.extract::<bool>() { Ok(JsonValue::Bool(b)) }
-    else if let Ok(i) = obj.extract::<i64>() { Ok(JsonValue::from(i)) }
-    else if let Ok(f) = obj.extract::<f64>() { Ok(JsonValue::from(f)) }
-    else if let Ok(s) = obj.extract::<String>() { Ok(JsonValue::String(s)) }
-    else if let Ok(list) = obj.downcast::<PyList>() {
+    if obj.is_none() {
+        Ok(JsonValue::Null)
+    } else if let Ok(b) = obj.extract::<bool>() {
+        Ok(JsonValue::Bool(b))
+    } else if let Ok(i) = obj.extract::<i64>() {
+        Ok(JsonValue::from(i))
+    } else if let Ok(f) = obj.extract::<f64>() {
+        Ok(JsonValue::from(f))
+    } else if let Ok(s) = obj.extract::<String>() {
+        Ok(JsonValue::String(s))
+    } else if let Ok(list) = obj.downcast::<PyList>() {
         let mut arr = Vec::new();
-        for item in list { arr.push(py_to_json(&item)?); }
+        for item in list {
+            arr.push(py_to_json(&item)?);
+        }
         Ok(JsonValue::Array(arr))
     } else if let Ok(dict) = obj.downcast::<PyDict>() {
         let mut map = serde_json::Map::new();
-        for (k, v) in dict { map.insert(k.extract::<String>()?, py_to_json(&v)?); }
+        for (k, v) in dict {
+            map.insert(k.extract::<String>()?, py_to_json(&v)?);
+        }
         Ok(JsonValue::Object(map))
-    } else { Ok(JsonValue::Null) }
+    } else {
+        Ok(JsonValue::Null)
+    }
 }
 
-fn parse_pydict(
-    dict: Option<&Bound<'_, PyDict>>,
-) -> PyResult<HashMap<String, JsonValue>> {
+fn parse_pydict(dict: Option<&Bound<'_, PyDict>>) -> PyResult<HashMap<String, JsonValue>> {
     let mut map = HashMap::new();
     if let Some(d) = dict {
         for (k, v) in d {
@@ -390,8 +435,12 @@ fn parse_metadata_rows(
                 out.push(parse_pydict(Some(dict))?);
             }
             Ok(out)
-        } else { Ok(vec![HashMap::new(); n]) }
-    } else { Ok(vec![HashMap::new(); n]) }
+        } else {
+            Ok(vec![HashMap::new(); n])
+        }
+    } else {
+        Ok(vec![HashMap::new(); n])
+    }
 }
 
 fn parse_document_rows(
@@ -401,10 +450,16 @@ fn parse_document_rows(
     if let Some(d) = documents {
         if let Ok(list) = d.downcast::<PyList>() {
             let mut out = Vec::with_capacity(n);
-            for item in list { out.push(item.extract::<Option<String>>()?); }
+            for item in list {
+                out.push(item.extract::<Option<String>>()?);
+            }
             Ok(out)
-        } else { Ok(vec![None; n]) }
-    } else { Ok(vec![None; n]) }
+        } else {
+            Ok(vec![None; n])
+        }
+    } else {
+        Ok(vec![None; n])
+    }
 }
 
 fn to_py_runtime(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {

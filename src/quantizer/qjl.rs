@@ -21,7 +21,10 @@ impl QjlQuantizer {
         for s in &mut projection_signs {
             *s = if rng.gen_bool(0.5) { 1.0 } else { -1.0 };
         }
-        Self { d, projection_signs }
+        Self {
+            d,
+            projection_signs,
+        }
     }
 
     pub fn quantize(&self, r: &Array1<f64>) -> Vec<u8> {
@@ -45,23 +48,28 @@ impl QjlQuantizer {
     pub fn quantize_batch(&self, rs: &DMatrix<f32>) -> Vec<Vec<u8>> {
         assert_eq!(rs.nrows(), self.d);
         let n = rs.ncols();
-        if n == 0 { return Vec::new(); }
+        if n == 0 {
+            return Vec::new();
+        }
 
         let packed_len = self.d.div_ceil(8);
         let mut all_qjl = vec![vec![0u8; packed_len]; n];
-        
-        all_qjl.par_iter_mut().enumerate().for_each(|(col, packed)| {
-            let r_col_owned: Vec<f32> = rs.column(col).iter().copied().collect();
-            let mut s_r = vec![0.0f32; self.d];
-            srht(&r_col_owned, &self.projection_signs, &mut s_r);
-            for row in 0..self.d {
-                if s_r[row] >= 0.0 {
-                    let byte_idx = row / 8;
-                    let bit_idx = row % 8;
-                    packed[byte_idx] |= 1u8 << bit_idx;
+
+        all_qjl
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(col, packed)| {
+                let r_col_owned: Vec<f32> = rs.column(col).iter().copied().collect();
+                let mut s_r = vec![0.0f32; self.d];
+                srht(&r_col_owned, &self.projection_signs, &mut s_r);
+                for row in 0..self.d {
+                    if s_r[row] >= 0.0 {
+                        let byte_idx = row / 8;
+                        let bit_idx = row % 8;
+                        packed[byte_idx] |= 1u8 << bit_idx;
+                    }
                 }
-            }
-        });
+            });
 
         all_qjl
     }
@@ -73,11 +81,13 @@ impl QjlQuantizer {
     }
 
     pub fn dequantize_batch(&self, encoded: &[(Vec<u8>, f64)]) -> Vec<Array1<f64>> {
-        if encoded.is_empty() { return Vec::new(); }
+        if encoded.is_empty() {
+            return Vec::new();
+        }
 
         let n = encoded.len();
         let scale_base = (PI / (2.0 * self.d as f32)).sqrt();
-        
+
         let mut out = vec![Array1::zeros(self.d); n];
         out.par_iter_mut().enumerate().for_each(|(col, result)| {
             let (qjl, gamma) = &encoded[col];
@@ -88,10 +98,10 @@ impl QjlQuantizer {
                 let bit_set = ((qjl[byte_idx] >> bit_idx) & 1u8) == 1u8;
                 qjl_f32[row] = if bit_set { 1.0 } else { -1.0 };
             }
-            
+
             let mut st_qjl = vec![0.0f32; self.d];
             srht(&qjl_f32, &self.projection_signs, &mut st_qjl);
-            
+
             let multiplier = (scale_base * *gamma as f32) as f64;
             for row in 0..self.d {
                 result[row] = multiplier * st_qjl[row] as f64;

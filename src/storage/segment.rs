@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
 
-
 /// Fixed-size record stored in a segment file.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SegmentRecord {
@@ -269,5 +268,3 @@ impl SegmentManager {
             .collect()
     }
 }
-
-

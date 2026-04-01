@@ -44,7 +44,7 @@ impl Wal {
         let path = path.as_ref().to_path_buf();
         let exists = path.exists();
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        
+
         if !exists || file.metadata()?.len() == 0 {
             file.write_all(WAL_MAGIC)?;
             file.write_all(&WAL_VERSION.to_le_bytes())?;
@@ -106,7 +106,7 @@ impl Wal {
         let mut file = File::open(path)?;
         let mut magic = [0u8; 4];
         let mut version = 0u32;
-        
+
         let has_header = if file.read_exact(&mut magic).is_ok() && &magic == WAL_MAGIC {
             let mut v_buf = [0u8; 4];
             file.read_exact(&mut v_buf)?;
@@ -132,7 +132,7 @@ impl Wal {
                 Ok(_) => {}
                 Err(_) => break,
             }
-            
+
             if has_header && version == 2 {
                 if let Ok(entry) = bincode::deserialize::<WalEntry>(&payload) {
                     entries.push(entry);

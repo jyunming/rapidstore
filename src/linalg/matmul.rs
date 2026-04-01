@@ -13,7 +13,11 @@ pub fn gemm(a: &DMatrix<f64>, trans_a: bool, b: &DMatrix<f64>, trans_b: bool) ->
         (b.nrows(), b.ncols(), 1isize, b.nrows() as isize)
     };
 
-    assert_eq!(k_a, k_b, "gemm dimension mismatch: {}x{} times {}x{}", m, k_a, k_b, n);
+    assert_eq!(
+        k_a, k_b,
+        "gemm dimension mismatch: {}x{} times {}x{}",
+        m, k_a, k_b, n
+    );
 
     let mut c = DMatrix::<f64>::zeros(m, n);
     unsafe {
@@ -50,7 +54,11 @@ pub fn sgemm(a: &DMatrix<f32>, trans_a: bool, b: &DMatrix<f32>, trans_b: bool) -
         (b.nrows(), b.ncols(), 1isize, b.nrows() as isize)
     };
 
-    assert_eq!(k_a, k_b, "sgemm dimension mismatch: {}x{} times {}x{}", m, k_a, k_b, n);
+    assert_eq!(
+        k_a, k_b,
+        "sgemm dimension mismatch: {}x{} times {}x{}",
+        m, k_a, k_b, n
+    );
 
     let mut c = DMatrix::<f32>::zeros(m, n);
     unsafe {

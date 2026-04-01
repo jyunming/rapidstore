@@ -32,10 +32,8 @@ impl Compactor {
             old_segment_names: old_segment_names.to_vec(),
             new_segment_name: new_segment_name.to_string(),
         };
-        self.backend.write(
-            COMPACTION_STATE_FILE,
-            &serde_json::to_vec_pretty(&state)?,
-        )?;
+        self.backend
+            .write(COMPACTION_STATE_FILE, &serde_json::to_vec_pretty(&state)?)?;
         Ok(())
     }
 
