@@ -21,7 +21,7 @@ impl LiveCodesFile {
 
         let metadata = file.metadata()?;
         let file_size = metadata.len() as usize;
-        let capacity = file_size / stride;
+        let capacity = if stride > 0 { file_size / stride } else { 0 };
         let len = capacity;
 
         let mut live_codes = Self {
@@ -96,6 +96,10 @@ impl LiveCodesFile {
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    pub fn stride(&self) -> usize {
+        self.stride
     }
 
     pub fn byte_len(&self) -> usize {
