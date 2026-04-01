@@ -7,6 +7,7 @@ import psutil
 import numpy as np
 import shutil
 import gc
+import ctypes
 from tempfile import mkdtemp
 
 # Import engines
@@ -102,8 +103,8 @@ def main():
                 ingest_peak_rss = max(ingest_peak_rss, rss_mb())
 
             elif args.engine == "chromadb":
-                client = chromadb.PersistentClient(path=tmp_dir)
-                col = client.create_collection("vectors", metadata={"hnsw:space": "ip"})
+                _chroma_client = chromadb.PersistentClient(path=tmp_dir)
+                col = _chroma_client.create_collection("vectors", metadata={"hnsw:space": "ip"})
                 t0 = time.perf_counter()
                 batch_size = 5000
                 for i in range(0, N, batch_size):
@@ -144,6 +145,10 @@ def main():
                     res = col.query(query_embeddings=queries[i:i+1].tolist(), n_results=TOP_K)
                     latencies.append((time.perf_counter() - t_s) * 1000)
                     found_ids_list.append([int(idx) for idx in res['ids'][0]])
+                # Release ChromaDB handles before cleanup (Windows file-lock fix)
+                del col, _chroma_client
+                gc.collect()
+                time.sleep(0.2)
             elif args.engine == "tqdb":
                 db.search(np.random.randn(DIM).astype(np.float32), top_k=TOP_K) # Warmup
                 for i in range(RUNS):
@@ -170,7 +175,8 @@ def main():
         print(json.dumps(result))
 
     finally:
-        shutil.rmtree(tmp_dir)
+        gc.collect()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 if __name__ == "__main__":
     main()
