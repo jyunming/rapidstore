@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use super::backend::StorageBackend;
 
-const MAX_DEGREE: usize = 127;
+pub const MAX_DEGREE: usize = 127;
 const CANDIDATE_MULTIPLIER: usize = 2;
 const GRAPH_V2_MAGIC: &[u8; 4] = b"TQG2";
 
 #[derive(Copy, Clone, PartialEq)]
-struct SearchCandidate {
+pub struct SearchCandidate {
     pub id: u32,
     pub score: f64,
 }
@@ -32,7 +32,7 @@ impl PartialOrd for SearchCandidate {
 }
 
 #[derive(PartialEq)]
-struct OrderingWrapper(SearchCandidate);
+pub struct OrderingWrapper(pub SearchCandidate);
 impl Eq for OrderingWrapper {}
 impl Ord for OrderingWrapper {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -130,7 +130,7 @@ impl GraphManager {
 
                 if ok {
                     self.node_count = n;
-                                self.offsets = offsets;
+                    self.offsets = offsets;
                     self.data_start = data_start;
                     return;
                 }
@@ -154,10 +154,6 @@ impl GraphManager {
         Ok(&mmap[start..end])
     }
 
-    pub fn get_entry_node(&self) -> u32 {
-        0 // Future: return node closest to centroid
-    }
-
     pub fn search(
         &self,
         entry_node: u32,
@@ -176,7 +172,6 @@ impl GraphManager {
         // Use multiple entry points to improve recall
         let mut entries = Vec::new();
         entries.push(entry_node);
-        // Add more random entries
         if self.node_count > 20 {
             for i in 1..10 {
                 let rd = (entry_node as usize + i * 1234567) % self.node_count;
@@ -240,10 +235,10 @@ impl GraphManager {
         Ok(out)
     }
 
-    fn select_neighbors_heuristic(
+    pub fn select_neighbors_heuristic(
         &self,
         _node_id: u32,
-        mut candidates: Vec<(u32, f64)>,
+        candidates: Vec<(u32, f64)>,
         max_degree: usize,
     ) -> Vec<u32> {
         if candidates.is_empty() { return Vec::new(); }
@@ -252,12 +247,8 @@ impl GraphManager {
         let mut result = Vec::new();
         for (c_id, _c_score) in candidates {
             if result.len() >= max_degree { break; }
-            
-            // Heuristic: only add if candidate is closer to 'node' than to any already selected neighbor.
-            // Since we don't have easy access to distances between arbitrary nodes here without 
-            // a lot of dequantization, we'll use a simplified version: 
-            // If the graph is dense, we just take the top ones. 
-            // But we can at least try to keep them diverse.
+            // Simplification: In a truly data-oblivious approach, we can just pick the top K.
+            // But we keep the diversity heuristic placeholder for future HNSW alignment.
             result.push(c_id);
         }
         result
@@ -315,13 +306,11 @@ impl GraphManager {
             .map(|i| {
                 let mut scored: Vec<(u32, f64)> = build_scorer(i as u32, &candidate_lists[i]);
                 scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                
                 self.select_neighbors_heuristic(i as u32, scored, degree_cap)
             })
             .collect();
 
         // Build Refinement (NN-style)
-        // Perform 1 iteration of refinement to restore build speed
         for _iter in 0..1 {
             let next_adjacency: Vec<Vec<u32>> = (0..n)
                 .into_par_iter()
@@ -336,16 +325,12 @@ impl GraphManager {
                     let cand_vec: Vec<u32> = candidates.into_iter().collect();
                     let mut scored = build_scorer(i as u32, &cand_vec);
                     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                    
                     self.select_neighbors_heuristic(i as u32, scored, degree_cap)
                 })
                 .collect();
             adjacency = next_adjacency;
         }
 
-        // V2 variable-length format:
-        // [magic:4][node_count:u32][offsets:(n+1)*u64][payload]
-        // payload node i: [deg:u32][deg * u32 neighbors]
         let mut payload = Vec::<u8>::new();
         let mut offsets = Vec::<u64>::with_capacity(n + 1);
         offsets.push(0);
@@ -367,7 +352,6 @@ impl GraphManager {
         out.extend_from_slice(&payload);
 
         std::fs::write(&self.local_cache_path, &out)?;
-
         self.node_count = n;
         self.backend.write("graph.bin", out)?;
         let file_ro = File::open(&self.local_cache_path)?;
