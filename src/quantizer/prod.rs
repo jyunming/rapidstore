@@ -465,17 +465,21 @@ impl ProdQuantizer {
             }
             return;
         }
-
+        let mask = (1u32 << bits_per_idx) - 1;
+        let mut bit_pos = 0usize;
         for i in 0..self.d {
-            let mut val = 0u32;
-            let bit_start = i * bits_per_idx;
-            for b in 0..bits_per_idx {
-                let bit_pos = bit_start + b;
-                if (packed[bit_pos / 8] >> (bit_pos % 8)) & 1 == 1 {
-                    val |= 1 << b;
-                }
+            let byte_idx = bit_pos >> 3;
+            let bit_off = bit_pos & 7;
+            let mut val = (packed[byte_idx] as u32) >> bit_off;
+            let mut bits = 8 - bit_off;
+            let mut byte_offset = 1usize;
+            while bits < bits_per_idx {
+                val |= (packed[byte_idx + byte_offset] as u32) << bits;
+                bits += 8;
+                byte_offset += 1;
             }
-            out[i] = val as CodeIndex;
+            out[i] = (val & mask) as CodeIndex;
+            bit_pos += bits_per_idx;
         }
     }
 }
