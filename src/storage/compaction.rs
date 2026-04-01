@@ -34,7 +34,7 @@ impl Compactor {
         };
         self.backend.write(
             COMPACTION_STATE_FILE,
-            serde_json::to_vec_pretty(&state)?,
+            &serde_json::to_vec_pretty(&state)?,
         )?;
         Ok(())
     }

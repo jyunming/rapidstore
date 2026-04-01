@@ -39,7 +39,7 @@ impl Segment {
             buf.write_all(&encoded)?;
         }
 
-        backend.write(name, buf)?;
+        backend.write(name, &buf)?;
 
         Ok(Self {
             name: name.to_string(),

@@ -53,6 +53,12 @@ pub struct Manifest {
     pub metric: DistanceMetric,
     #[serde(default)]
     pub index_state: Option<IndexState>,
+    #[serde(default = "default_rerank_enabled")]
+    pub rerank_enabled: bool,
+}
+
+fn default_rerank_enabled() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -131,6 +137,7 @@ pub struct TurboQuantEngine {
     pub quantizer: ProdQuantizer,
     pub manifest: Manifest,
     pub metric: DistanceMetric,
+    pub rerank_enabled: bool,
 
     backend: Arc<StorageBackend>,
     wal: Wal,
@@ -143,8 +150,8 @@ pub struct TurboQuantEngine {
 
     index_ids: Vec<u32>,
     live_codes: LiveCodesFile,
+    live_vraw: Option<LiveCodesFile>,
     id_pool: IdPool,
-    live_vectors: HashMap<u32, Array1<f64>>,
     index_ids_dirty: bool,
     pending_manifest_updates: usize,
 }
@@ -175,6 +182,18 @@ impl TurboQuantEngine {
         seed: u64,
         metric: DistanceMetric,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::open_with_metric_and_rerank(uri, local_dir, d, b, seed, metric, true)
+    }
+
+    pub fn open_with_metric_and_rerank(
+        uri: &str,
+        local_dir: &str,
+        d: usize,
+        b: usize,
+        seed: u64,
+        metric: DistanceMetric,
+        rerank: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(local_dir)?;
         let manifest_path = format!("{}/manifest.json", local_dir);
         let wal_path = format!("{}/wal.log", local_dir);
@@ -195,10 +214,11 @@ impl TurboQuantEngine {
             let m = Manifest {
                 version: 2, d, b, seed, vector_count: 0, storage_uri: uri.to_string(),
                 quantizer: None, metric: metric.clone(), index_state: None,
+                rerank_enabled: rerank,
             };
             save_quantizer_state(local_dir, &backend, &q)?;
             m.save(&manifest_path)?;
-            backend.write("manifest.json", serde_json::to_vec_pretty(&m)?)?;
+            backend.write("manifest.json", &serde_json::to_vec_pretty(&m)?)?;
             (m, q)
         };
 
@@ -211,14 +231,21 @@ impl TurboQuantEngine {
         let mse_len = (manifest.d * (manifest.b - 1)).div_ceil(8);
         let stride = mse_len + qjl_len + LIVE_GAMMA_BYTES + LIVE_NORM_BYTES + LIVE_DELETED_BYTES;
         let live_codes = LiveCodesFile::open(Path::new(local_dir).join("live_codes.bin"), stride)?;
+        let live_vraw = if manifest.rerank_enabled {
+            Some(LiveCodesFile::open(Path::new(local_dir).join("live_vectors.bin"), manifest.d * 4)?)
+        } else {
+            None
+        };
 
         let mut engine = Self {
-            d: manifest.d, b: manifest.b, quantizer, manifest, metric, backend, wal, wal_buffer: Vec::new(),
+            d: manifest.d, b: manifest.b, quantizer, manifest: manifest.clone(), metric, backend, wal, wal_buffer: Vec::new(),
             wal_flush_threshold: 100, segments, metadata, graph, local_dir: local_dir.to_string(),
             index_ids: load_index_ids(local_dir).unwrap_or_default(),
             live_codes,
+            live_vraw,
             id_pool: IdPool::new(),
-            live_vectors: HashMap::new(), index_ids_dirty: false, pending_manifest_updates: 0,
+            index_ids_dirty: false, pending_manifest_updates: 0,
+            rerank_enabled: manifest.rerank_enabled,
         };
 
         if let Ok(id_pool) = load_id_pool(local_dir, &engine.backend) {
@@ -399,12 +426,13 @@ impl TurboQuantEngine {
                 Some(matches)
             } else { None };
 
+            let internal_k = if self.rerank_enabled { top_k * 4 } else { top_k };
             let ann = if matches!(self.metric, DistanceMetric::Ip) {
                 let prep = self.quantizer.prepare_ip_query(query);
                 let index_ids = &self.index_ids;
                 let slot_set: Option<std::collections::HashSet<u32>> = filter_slots.map(|s| s.into_iter().collect());
                 
-                self.graph.search(0, top_k, sls.max(top_k), |node| {
+                self.graph.search(0, internal_k, sls.max(internal_k), |node| {
                     let slot = index_ids[node as usize];
                     let (indices, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
                     self.quantizer.score_ip_encoded(&prep, &indices, qjl, gamma as f64)
@@ -415,7 +443,7 @@ impl TurboQuantEngine {
                 let index_ids = &self.index_ids;
                 let slot_set: Option<std::collections::HashSet<u32>> = filter_slots.map(|s| s.into_iter().collect());
 
-                self.graph.search(0, top_k, sls.max(top_k), |node| {
+                self.graph.search(0, internal_k, sls.max(internal_k), |node| {
                     let slot = index_ids[node as usize];
                     let (indices, qjl, gamma, doc_norm) = self.live_codes_at_slot(slot as usize);
                     let ip = self.quantizer.score_ip_encoded(&prep, &indices, qjl, gamma as f64);
@@ -427,7 +455,7 @@ impl TurboQuantEngine {
                 let index_ids = &self.index_ids;
                 let slot_set: Option<std::collections::HashSet<u32>> = filter_slots.map(|s| s.into_iter().collect());
 
-                self.graph.search(0, top_k, sls.max(top_k), |node| {
+                self.graph.search(0, internal_k, sls.max(internal_k), |node| {
                     let slot = index_ids[node as usize];
                     let (indices, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
                     let v = self.quantizer.dequantize(&indices, qjl, gamma as f64);
@@ -438,13 +466,22 @@ impl TurboQuantEngine {
             let slots: Vec<u32> = ann.iter().map(|(n, _)| self.index_ids[*n as usize]).collect();
             let meta_map = self.metadata.get_many(&slots)?;
             let mut out = Vec::with_capacity(ann.len());
-            for (node, score) in ann {
+            for (node, approx_score) in ann {
                 let slot = self.index_ids[node as usize];
                 let id = self.id_pool.get_str(slot).unwrap_or_default().to_string();
                 let meta = meta_map.get(&slot).cloned().unwrap_or_default();
+                
+                let score = if self.rerank_enabled {
+                    let raw_vec = self.live_raw_vector_at_slot(slot as usize);
+                    score_vectors_with_metric(&self.metric, query, &raw_vec)
+                } else {
+                    approx_score
+                };
+                
                 out.push(SearchResult { id, score, metadata: meta.properties, document: meta.document });
             }
             out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            if out.len() > top_k { out.truncate(top_k); }
             return Ok(out);
         }
 
@@ -458,6 +495,7 @@ impl TurboQuantEngine {
 
         let mut results = BinaryHeap::new();
         let q_norm = query.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let internal_k = top_k * 4;
 
         if matches!(self.metric, DistanceMetric::Ip) {
             let prep = self.quantizer.prepare_ip_query(query);
@@ -471,7 +509,7 @@ impl TurboQuantEngine {
                 }
 
                 results.push(OrderingWrapper(SearchCandidate { id: slot, score }));
-                if results.len() > top_k { results.pop(); }
+                if results.len() > internal_k { results.pop(); }
             }
         } else if matches!(self.metric, DistanceMetric::Cosine) {
             let prep = self.quantizer.prepare_ip_query(query);
@@ -486,7 +524,7 @@ impl TurboQuantEngine {
                 }
 
                 results.push(OrderingWrapper(SearchCandidate { id: slot, score }));
-                if results.len() > top_k { results.pop(); }
+                if results.len() > internal_k { results.pop(); }
             }
         } else {
             for (_, slot) in active {
@@ -500,7 +538,7 @@ impl TurboQuantEngine {
                 }
 
                 results.push(OrderingWrapper(SearchCandidate { id: slot, score }));
-                if results.len() > top_k { results.pop(); }
+                if results.len() > internal_k { results.pop(); }
             }
         }
 
@@ -510,9 +548,18 @@ impl TurboQuantEngine {
         for OrderingWrapper(cand) in results {
             let id = self.id_pool.get_str(cand.id).unwrap_or_default().to_string();
             let meta = meta_map.get(&cand.id).cloned().unwrap_or_default();
-            out.push(SearchResult { id, score: cand.score, metadata: meta.properties, document: meta.document });
+            
+            let score = if self.rerank_enabled {
+                let raw_vec = self.live_raw_vector_at_slot(cand.id as usize);
+                score_vectors_with_metric(&self.metric, query, &raw_vec)
+            } else {
+                cand.score
+            };
+            
+            out.push(SearchResult { id, score, metadata: meta.properties, document: meta.document });
         }
         out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+        if out.len() > top_k { out.truncate(top_k); }
         Ok(out)
     }
 
@@ -530,15 +577,28 @@ impl TurboQuantEngine {
         // live_codes is already updated during ingest; compact without full rebuild.
         self.live_compact_slab()?;
         self.live_codes.flush()?;
+        if let Some(vraw) = &mut self.live_vraw { vraw.flush()?; }
         self.wal.truncate()?;
         self.metadata.flush()?;
         self.persist_id_pool()?;
 
         self.live_codes.release_mmap();
+        if let Some(vraw) = &mut self.live_vraw { vraw.release_mmap(); }
         let live_codes_path = Path::new(&self.local_dir).join("live_codes.bin");
+        let live_vraw_path = Path::new(&self.local_dir).join("live_vectors.bin");
+
         let live_codes_data = std::fs::read(&live_codes_path)?;
-        self.backend.write("live_codes.bin", live_codes_data)?;
+        self.backend.write("live_codes.bin", &live_codes_data)?;
+
+        if self.rerank_enabled {
+            let live_vraw_data = std::fs::read(&live_vraw_path)?;
+            self.backend.write("live_vectors.bin", &live_vraw_data)?;
+        }
+
         self.live_codes = LiveCodesFile::open(live_codes_path, self.live_stride())?;
+        if self.rerank_enabled {
+            self.live_vraw = Some(LiveCodesFile::open(live_vraw_path, self.d * 4)?);
+        }
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_active_count() as u64;
         self.maybe_persist_state(false)?;
@@ -560,7 +620,7 @@ impl TurboQuantEngine {
             vector_count: self.vector_count(), segment_count: self.segments.segments.len(), buffered_vectors: self.wal_buffer.len(),
             d: self.d, b: self.b, total_disk_bytes: self.total_disk_bytes(), has_index: self.can_use_ann_index(),
             index_nodes: self.index_ids.len(), live_codes_bytes: self.live_codes.byte_len(), live_slot_count: self.live_codes.len(),
-            live_id_count: self.id_pool.active_count(), live_vectors_count: self.live_vectors.len(), live_vectors_bytes_estimate: 0,
+            live_id_count: self.id_pool.active_count(), live_vectors_count: self.live_active_count(), live_vectors_bytes_estimate: self.live_vraw.as_ref().map_or(0, |v| v.byte_len()),
             metadata_entries: self.metadata.len(), metadata_bytes_estimate: self.metadata.approx_bytes(),
             ann_slot_count: self.index_ids.len(), graph_nodes: self.graph.node_count(),
         }
@@ -583,9 +643,30 @@ impl TurboQuantEngine {
         (indices, qjl, gamma, norm)
     }
 
+    fn live_raw_vector_at_slot(&self, slot: usize) -> Array1<f64> {
+        let Some(vraw) = &self.live_vraw else { return Array1::zeros(self.d); };
+        let rec = vraw.get_slot(slot);
+        let mut out = Array1::zeros(self.d);
+        for i in 0..self.d {
+            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+            out[i] = f32::from_le_bytes(bytes) as f64;
+        }
+        out
+    }
+
+    fn live_save_raw_vector(&mut self, slot: u32, vector: &Array1<f64>) {
+        let Some(vraw) = &mut self.live_vraw else { return; };
+        let rec = vraw.get_slot_mut(slot as usize);
+        for (i, &val) in vector.iter().enumerate() {
+            let bytes = (val as f32).to_le_bytes();
+            rec[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
+        }
+    }
+
     fn live_alloc_slot(&mut self, id: &str, indices: &[CodeIndex], qjl: &[u8], gamma: f32, norm: f32) -> u32 {
         let slot = self.id_pool.insert(id);
         let new_slot = self.live_codes.alloc_slot().unwrap();
+        if let Some(vraw) = &mut self.live_vraw { let _ = vraw.alloc_slot().unwrap(); } // Keep aligned
         let mse_len = self.live_mse_len();
         let qjl_len = self.live_qjl_len();
         let packed_mse = self.quantizer.pack_mse_indices(indices);
@@ -625,40 +706,58 @@ impl TurboQuantEngine {
 
     fn live_compact_slab(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let stride = self.live_stride();
-        let old_stride = self.live_codes.stride();
+        let vstride = self.d * 4;
         let temp_path = Path::new(&self.local_dir).join("live_codes.bin.tmp");
+        let vtemp_path = Path::new(&self.local_dir).join("live_vectors.bin.tmp");
+
         let mut new_codes = LiveCodesFile::open(temp_path.clone(), stride)?;
-        new_codes.clear()?;
-        let mut new_pool = IdPool::new();
-        if old_stride == stride {
-            for (id, old_slot) in self.live_iter_id_slots() {
-                let old_rec = self.live_codes.get_slot(old_slot as usize);
-                let next_alloc = new_codes.alloc_slot()?;
-                new_codes.get_slot_mut(next_alloc).copy_from_slice(old_rec);
-                new_pool.insert(&id);
-            }
+        let mut new_vraw = if self.rerank_enabled {
+            Some(LiveCodesFile::open(vtemp_path.clone(), vstride)?)
         } else {
-            let mse_len = self.live_mse_len();
-            let qjl_len = self.live_qjl_len();
-            for (id, old_slot) in self.live_iter_id_slots() {
-                let (indices, qjl, gamma, norm) = self.live_codes_at_slot(old_slot as usize);
-                let next_alloc = new_codes.alloc_slot()?;
-                let rec = new_codes.get_slot_mut(next_alloc);
-                let packed_mse = self.quantizer.pack_mse_indices(&indices);
-                rec[0..mse_len].copy_from_slice(&packed_mse);
-                rec[mse_len..mse_len + qjl_len].copy_from_slice(qjl);
-                rec[mse_len + qjl_len..mse_len + qjl_len + 4].copy_from_slice(&gamma.to_le_bytes());
-                rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].copy_from_slice(&norm.to_le_bytes());
-                rec[mse_len + qjl_len + 8] = 0u8;
-                new_pool.insert(&id);
+            None
+        };
+
+        new_codes.clear()?;
+        if let Some(nv) = &mut new_vraw { nv.clear()?; }
+
+        let mut new_pool = IdPool::new();
+
+        for (id, old_slot) in self.live_iter_id_slots() {
+            let old_rec = self.live_codes.get_slot(old_slot as usize);
+            let next_alloc = new_codes.alloc_slot()?;
+            new_codes.get_slot_mut(next_alloc).copy_from_slice(old_rec);
+
+            if let (Some(nv), Some(ov)) = (&mut new_vraw, &mut self.live_vraw) {
+                let old_vrec = ov.get_slot(old_slot as usize);
+                let _ = nv.alloc_slot()?;
+                nv.get_slot_mut(next_alloc).copy_from_slice(old_vrec);
             }
+
+            new_pool.insert(&id);
         }
+
         new_codes.truncate_to(new_pool.active_count())?;
+        if let Some(nv) = &mut new_vraw { nv.truncate_to(new_pool.active_count())?; }
+
         new_codes.flush()?; drop(new_codes);
+        if let Some(nv) = new_vraw { nv.flush()?; drop(nv); }
+
         let final_path = Path::new(&self.local_dir).join("live_codes.bin");
+        let vfinal_path = Path::new(&self.local_dir).join("live_vectors.bin");
+
         self.live_codes.release_mmap();
+        if let Some(vraw) = &mut self.live_vraw { vraw.release_mmap(); }
+
         std::fs::rename(temp_path, &final_path)?;
+        if self.rerank_enabled {
+            std::fs::rename(vtemp_path, &vfinal_path)?;
+        }
+
         self.live_codes = LiveCodesFile::open(final_path, stride)?;
+        if self.rerank_enabled {
+            self.live_vraw = Some(LiveCodesFile::open(vfinal_path, vstride)?);
+        }
+
         self.id_pool = new_pool;
         Ok(())
     }
@@ -680,7 +779,7 @@ impl TurboQuantEngine {
         if !force && !self.index_ids_dirty && self.pending_manifest_updates < MANIFEST_SAVE_INTERVAL_OPS { return Ok(()); }
         if self.index_ids_dirty {
             save_index_ids(&self.local_dir, &self.index_ids)?;
-            self.backend.write(INDEX_IDS_FILE, serialize_index_ids(&self.index_ids)?)?;
+            self.backend.write(INDEX_IDS_FILE, &serialize_index_ids(&self.index_ids)?)?;
             self.index_ids_dirty = false;
         }
         self.save_manifest()?; self.pending_manifest_updates = 0;
@@ -696,14 +795,16 @@ impl TurboQuantEngine {
         let mut m = self.manifest.clone(); m.quantizer = None;
         let manifest_path = format!("{}/manifest.json", self.local_dir);
         m.save(&manifest_path)?;
-        self.backend.write("manifest.json", serde_json::to_vec_pretty(&m)?)?;
+        self.backend.write("manifest.json", &serde_json::to_vec_pretty(&m)?)?;
         Ok(())
     }
 
     fn total_disk_bytes(&self) -> u64 {
         let mut total = self.segments.total_disk_size();
-        for name in ["manifest.json", "metadata.bin", "wal.log", QUANTIZER_STATE_FILE, "graph.bin", INDEX_IDS_FILE, "live_codes.bin"] {
-            if let Ok(data) = self.backend.read(name) { total += data.len() as u64; }
+        let mut files = vec!["manifest.json", "metadata.bin", "wal.log", QUANTIZER_STATE_FILE, "graph.bin", INDEX_IDS_FILE, "live_codes.bin"];
+        if self.rerank_enabled { files.push("live_vectors.bin"); }
+        for name in files {
+            if let Ok(size) = self.backend.size(name) { total += size; }
         }
         total
     }
@@ -712,10 +813,18 @@ impl TurboQuantEngine {
         let (indices, qjl, gamma) = self.quantizer.quantize(vector);
         let norm = vector.iter().map(|x| x * x).sum::<f64>().sqrt() as f32;
         let meta = VectorMetadata { properties: metadata, document };
-        let entry = WalEntry { id: id.clone(), quantized_indices: indices, qjl_bits: qjl, gamma: gamma as f32, metadata_json: serde_json::to_string(&meta)?, is_deleted };
+        let entry = WalEntry { 
+            id: id.clone(), 
+            quantized_indices: indices, 
+            qjl_bits: qjl, 
+            gamma: gamma as f32, 
+            metadata_json: serde_json::to_string(&meta)?, 
+            is_deleted,
+        };
         self.wal.append(&entry, false)?; self.wal_buffer.push(entry.clone());
         if !is_deleted {
             let slot = self.live_alloc_or_update(&id, &entry.quantized_indices, &entry.qjl_bits, entry.gamma, norm);
+            self.live_save_raw_vector(slot, vector);
             self.metadata.put(slot, &meta)?;
         }
         self.invalidate_index_state()?;
@@ -744,8 +853,16 @@ impl TurboQuantEngine {
                 }
                 let norm = vectors[i].iter().map(|x| x * x).sum::<f64>().sqrt() as f32;
                 let meta = VectorMetadata { properties: item.metadata.clone(), document: item.document.clone() };
-                let entry = WalEntry { id: item.id.clone(), quantized_indices: indices, qjl_bits: qjl, gamma: gamma as f32, metadata_json: serde_json::to_string(&meta)?, is_deleted: false };
+                let entry = WalEntry { 
+                    id: item.id.clone(), 
+                    quantized_indices: indices, 
+                    qjl_bits: qjl, 
+                    gamma: gamma as f32, 
+                    metadata_json: serde_json::to_string(&meta)?, 
+                    is_deleted: false,
+                };
                 let slot = self.live_alloc_or_update(&item.id, &entry.quantized_indices, &entry.qjl_bits, entry.gamma, norm);
+                self.live_save_raw_vector(slot, &vectors[i]);
                 metadata_entries.push((slot, meta));
                 wal_entries.push(entry);
             }
@@ -764,7 +881,7 @@ impl TurboQuantEngine {
 fn save_quantizer_state(local_dir: &str, backend: &Arc<StorageBackend>, quantizer: &ProdQuantizer) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bytes = bincode::serialize(quantizer)?;
     std::fs::write(format!("{}/{}", local_dir, QUANTIZER_STATE_FILE), &bytes)?;
-    backend.write(QUANTIZER_STATE_FILE, bytes)?; Ok(())
+    backend.write(QUANTIZER_STATE_FILE, &bytes)?; Ok(())
 }
 
 fn load_quantizer_state(local_dir: &str, backend: &Arc<StorageBackend>) -> Result<ProdQuantizer, Box<dyn std::error::Error + Send + Sync>> {
@@ -780,7 +897,7 @@ fn save_id_pool(local_dir: &str, backend: &Arc<StorageBackend>, pool: &IdPool) -
     let bytes = bincode::serialize(pool)?;
     let local = format!("{}/{}", local_dir, ID_POOL_FILE);
     std::fs::write(&local, &bytes)?;
-    backend.write(ID_POOL_FILE, bytes)?;
+    backend.write(ID_POOL_FILE, &bytes)?;
     Ok(())
 }
 
