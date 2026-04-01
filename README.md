@@ -1,94 +1,252 @@
 # TurboQuantDB
 
-A high-performance, embedded vector database engine written in Rust, powered by Google DeepMind's **TurboQuant** algorithm. It provides near-optimal, data-oblivious vector quantization for ultra-fast, memory-efficient Retrieval-Augmented Generation (RAG) applications in Python.
+A high-performance, embedded vector database written in Rust with Python bindings. It implements Google DeepMind's **TurboQuant** algorithm (arXiv:2504.19874) for data-oblivious vector quantization — zero training time, 8–16x memory compression, and provably unbiased inner product estimation.
 
-Unlike traditional vector databases that require expensive training phases (like FAISS) to build codebooks, TurboQuantDB uses provably near-optimal randomized rotations and scalar quantization to compress vectors down to 2-bit or 4-bit representations *on the fly*, with zero index training.
+---
 
 ## Key Features
 
-*   **Zero Training Time:** Insert vectors immediately. No `train()` step required.
-*   **Extreme Compression:** Quantizes float32 embeddings down to 2 or 4 bits per coordinate, saving 8x to 16x in RAM overhead.
-*   **Unbiased Inner Products:** Uses Quantized Johnson-Lindenstrauss (QJL) transforms to guarantee unbiased cosine similarity/inner product estimation.
-*   **Python Native:** Built with `PyO3` and `maturin`, giving you the speed of Rust directly inside your Python REPL.
+- **Zero training time** — No `train()` step. Vectors are quantized and stored immediately on insert.
+- **Extreme compression** — Reduces float32 embeddings to 2–4 bits per coordinate (8–16x less RAM).
+- **Unbiased scoring** — Quantized Johnson-Lindenstrauss (QJL) transforms guarantee unbiased inner product estimation.
+- **Optional ANN index** — Build an HNSW graph after loading data for sub-millisecond search on large collections.
+- **Metadata filtering** — Filter search results by metadata fields, with support for MongoDB-style operators.
+- **Crash recovery** — Write-ahead log (WAL) ensures inserts survive process crashes without explicit flushing.
+- **Python native** — Built with PyO3 and Maturin; runs in-process, no server required.
+- **Server mode** — Optional Axum HTTP service with multi-tenancy, RBAC, quotas, and async jobs.
 
 ---
 
-## Installation Guide
+## Installation
 
-### Prerequisites (Crucial for Windows Users)
+### Prerequisites
 
-Because TurboQuantDB is a Rust extension built tightly into Python's C-API, your system **must have a C++ build chain installed**.
+TurboQuantDB is a Rust extension that compiles into Python. You need:
 
-#### **Windows**
-You must install the **Visual Studio Build Tools**:
-1. Download the [Visual Studio Build Tools](https://aka.ms/vs/17/release/vs_BuildTools.exe).
-2. Run the installer and select the **"Desktop development with C++"** workload.
-3. Ensure the Windows 10/11 SDK and MSVC v143 build tools are checked.
-4. Restart your terminal.
+- [Rust](https://rustup.rs/) (stable toolchain)
+- Python 3.8+
+- A C++ compiler:
+  - **Windows**: [Visual Studio Build Tools](https://aka.ms/vs/17/release/vs_BuildTools.exe) — select **"Desktop development with C++"** workload
+  - **macOS**: `xcode-select --install`
+  - **Linux**: `sudo apt-get install build-essential`
 
-#### **macOS / Linux**
-You typically already have the necessary compiler tools. If not:
-*   **macOS:** Run `xcode-select --install`
-*   **Ubuntu/Debian:** Run `sudo apt-get install build-essential`
+### Build
 
-### Building the Package
-
-1. Ensure you have [Rust installed](https://rustup.rs/).
-2. Create and activate a Python virtual environment:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: .\venv\Scripts\activate
-   ```
-3. Install `maturin`, the Rust-to-Python build system:
-   ```bash
-   pip install maturin
-   ```
-4. Build and install the TurboQuantDB module into your environment:
-   ```bash
-   maturin develop --release
-   ```
+```bash
+python -m venv venv
+source venv/bin/activate        # Windows: .\venv\Scripts\activate
+pip install maturin
+maturin develop --release       # Compiles Rust and installs into venv
+```
 
 ---
 
-## Usage: RAG Integration
+## Quick Start
 
-TurboQuantDB comes with a LangChain-style retriever interface out of the box.
+```python
+import numpy as np
+from turboquantdb import Database
+
+# Open (or create) a database
+db = Database.open("./my_db", dimension=128, bits=4, metric="cosine")
+
+# Insert vectors
+db.insert("doc-1", np.random.randn(128).tolist(), metadata={"topic": "ml"}, document="Machine learning intro")
+db.insert("doc-2", np.random.randn(128).tolist(), metadata={"topic": "systems"}, document="Rust memory model")
+
+# Search
+query = np.random.randn(128).tolist()
+results = db.search(query, top_k=5)
+
+for r in results:
+    print(r["id"], r["score"], r["document"])
+```
+
+---
+
+## Python API Reference
+
+### `Database.open(path, dimension, bits=4, seed=42, metric="ip", rerank=True)`
+
+Opens an existing database or creates a new one.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `path` | `str` | Directory path for database files |
+| `dimension` | `int` | Vector dimension (must match on reopen) |
+| `bits` | `int` | Quantization bits — `2` (16x compression) or `4` (8x compression, higher recall) |
+| `seed` | `int` | Random seed for quantizer initialization (must match on reopen) |
+| `metric` | `str` | `"ip"` (inner product), `"cosine"`, or `"l2"` |
+| `rerank` | `bool` | Store raw vectors for reranking; improves recall at the cost of extra disk/RAM |
+
+### Insert & Update
+
+```python
+# Single insert
+db.insert(id, vector, metadata=None, document=None)
+
+# Batch insert — chunked internally at 2000 vectors for memory efficiency
+db.insert_batch(ids, vectors, metadatas=None, documents=None, mode="insert")
+# mode: "insert" | "upsert" | "update"
+
+# Upsert / update
+db.upsert(id, vector, metadata=None, document=None)   # insert or replace
+db.update(id, vector, metadata=None, document=None)   # error if id not found
+```
+
+### Delete & Retrieve
+
+```python
+db.delete(id)                     # Returns True if id existed
+db.get(id)                        # Returns {id, metadata, document} or None
+db.get_many(ids)                  # Returns list; None for missing ids
+db.list_all()                     # Returns all ids as a list
+```
+
+### Search
+
+```python
+results = db.search(
+    query,                        # list[float] or np.ndarray
+    top_k=10,
+    filter=None,                  # metadata filter dict (see Filtering section)
+    _use_ann=True,                # use HNSW index if available
+    ann_search_list_size=None,    # HNSW ef_search parameter (default: max_degree * 2)
+)
+# Each result: {"id": str, "score": float, "metadata": dict, "document": str | None}
+```
+
+### Index (HNSW)
+
+Building an HNSW index is optional but dramatically improves search latency on large collections.
+
+```python
+db.create_index(
+    max_degree=16,          # Max neighbors per node (higher = better recall, larger graph)
+    search_list_size=64,    # Beam size during construction (higher = better quality)
+    alpha=1.2,              # Pruning factor
+)
+```
+
+Build the index **after** loading your data. It is not updated incrementally — rebuild after large batches of inserts.
+
+### Stats
+
+```python
+stats = db.stats()
+# Returns: vector_count, segment_count, total_disk_bytes, index_nodes,
+#          live_slots, has_index, ram_estimate_bytes, etc.
+```
+
+---
+
+## Metadata Filtering
+
+Filters are applied server-side during search. Two syntaxes are supported:
+
+**Simple equality** (shorthand):
+```python
+results = db.search(query, top_k=5, filter={"topic": "ml", "year": 2024})
+```
+
+**MongoDB-style operators**:
+```python
+# Comparison: $eq, $ne, $gt, $gte, $lt, $lte
+filter = {"year": {"$gte": 2023}}
+
+# Logical: $and, $or
+filter = {
+    "$and": [
+        {"topic": {"$eq": "ml"}},
+        {"year": {"$gte": 2023}}
+    ]
+}
+```
+
+---
+
+## Distance Metrics
+
+| Metric | `metric=` | Best for |
+|--------|-----------|----------|
+| Inner product | `"ip"` | Pre-normalized embeddings (fastest) |
+| Cosine similarity | `"cosine"` | Text embeddings where magnitude varies |
+| Euclidean (L2) | `"l2"` | Image features, coordinate spaces |
+
+The metric is fixed at database creation time.
+
+---
+
+## RAG Integration
 
 ```python
 import numpy as np
 from turboquantdb.rag import TurboQuantRetriever
 
-# 1. Initialize the Database (e.g., d=1536 for OpenAI embeddings, 4-bit compression)
-retriever = TurboQuantRetriever(dimension=1536, bits=4, seed=42)
+retriever = TurboQuantRetriever(db_path="./rag_db", dimension=1536, bits=4, metric="cosine")
 
-# 2. Prepare your data and embeddings
 texts = [
-    "TurboQuant is a revolutionary data-oblivious quantization algorithm.",
-    "Rust provides memory safety without a garbage collector.",
-    "Vector databases are essential for RAG pipelines."
+    "TurboQuant is a near-optimal quantization algorithm.",
+    "Rust provides memory safety without garbage collection.",
+    "Vector databases power modern RAG pipelines.",
 ]
-
-# Generate embeddings (mocked here, use OpenAI/HuggingFace in reality)
 embeddings = [np.random.randn(1536).tolist() for _ in texts]
-metadatas = [{"source": "paper"}, {"source": "manual"}, {"source": "blog"}]
+metadatas = [{"source": "paper"}, {"source": "docs"}, {"source": "blog"}]
 
-# 3. Ingest data instantly (No training required!)
 retriever.add_texts(texts=texts, embeddings=embeddings, metadatas=metadatas)
 
-# 4. Search for the most relevant context
-query_emb = np.random.randn(1536).tolist()
-results = retriever.similarity_search(query_embedding=query_emb, k=2)
-
-for result in results:
-    print(f"Score: {result['score']:.4f}")
-    print(f"Text: {result['text']}")
-    print(f"Metadata: {result['metadata']}\n")
+results = retriever.similarity_search(query_embedding=np.random.randn(1536).tolist(), k=2)
+for r in results:
+    print(r["score"], r["text"])
 ```
 
-## Architecture & Roadmap
+---
 
-TurboQuantDB is currently architected as an **embedded database** (similar to LanceDB or DuckDB). It runs in the same process as your Python application and performs highly optimized, SIMD-accelerated brute-force scans over deeply compressed vector representations.
+## Server Mode
 
-While it is phenomenally fast for datasets up to 1 million vectors due to its tiny memory footprint, it does not currently feature an Approximate Nearest Neighbor (ANN) graph structure like HNSW.
+An optional Axum-based HTTP server is available in `server/`. It adds multi-tenancy, API key authentication, quota enforcement, and async job management (compaction, index building, snapshots).
 
-*Currently implemented algorithms based on arXiv:2504.19874 ("TurboQuant: Near-Optimal Data-Oblivious Vector Quantization").*
+```bash
+cd server && cargo build --release
+TQ_SERVER_ADDR=0.0.0.0:8080 TQ_LOCAL_ROOT=./data ./target/release/turboquantdb-server
+```
+
+See [`server/README.md`](server/README.md) for the full API reference and environment variable documentation.
+
+---
+
+## Architecture
+
+TurboQuantDB is an embedded database (like DuckDB or LanceDB) — it runs in-process with no daemon required. The storage layout on disk:
+
+```
+./my_db/
+├── manifest.json        — DB config (dimension, bits, seed, metric)
+├── quantizer.bin        — Serialized quantizer state
+├── live_codes.bin       — Memory-mapped quantized vectors (hot path)
+├── live_vectors.bin     — Raw float32 vectors (only if rerank=True)
+├── wal.log              — Write-ahead log (crash recovery)
+├── metadata.bin         — Vector metadata and documents
+├── live_ids.bin         — ID → slot index
+├── graph.bin            — HNSW adjacency list (if index built)
+├── graph_ids.json       — Slot list for index nodes
+└── seg-00000001.bin     — Immutable segment files (flushed from WAL)
+```
+
+**Write path:** `insert()` → quantize (SRHT → MSE → QJL) → WAL entry → `live_codes.bin` → periodic flush to segment
+
+**Search path (brute-force):** query → precompute lookup tables → score all live vectors → top-k
+
+**Search path (ANN):** query → HNSW beam search → candidate rerank (if `rerank=True`) → top-k
+
+**Quantization pipeline:** Each vector goes through two stages:
+1. **MSE stage** — Structured Random Hadamard Transform (SRHT) rotation, then Lloyd-Max scalar quantization to `b-1` bits per dimension
+2. **QJL stage** — A second independent SRHT projection, 1-bit quantized (sign), packed into bytes
+
+The combination gives unbiased inner product estimates with provably near-optimal distortion.
+
+---
+
+## Reference
+
+TurboQuant algorithm: [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) — *TurboQuant: Near-Optimal Data-Oblivious Vector Quantization*
