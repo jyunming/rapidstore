@@ -43,6 +43,17 @@ impl ProdQuantizer {
         }
     }
 
+    /// O(d log d) fast-path: uses SRHT for both rotation and projection.
+    /// Statistically equivalent to `new` for d ≥ 512; ~O(d log d) vs O(d²) per vector.
+    pub fn new_srht(d: usize, b: usize, seed: u64) -> Self {
+        assert!(b >= 2, "ProdQuantizer requires at least b=2");
+
+        let mse_quantizer = MseQuantizer::new_srht(d, b - 1, seed);
+        let qjl_quantizer = QjlQuantizer::new_srht(d, seed ^ 0xdeadbeef);
+
+        Self { d, b, mse_quantizer, qjl_quantizer }
+    }
+
     pub fn prepare_ip_query(&self, query: &Array1<f64>) -> PreparedIpQuery {
         assert_eq!(query.len(), self.d);
 

@@ -53,6 +53,8 @@ pub struct Manifest {
     pub metric: DistanceMetric,
     #[serde(default)]
     pub index_state: Option<IndexState>,
+    #[serde(default)]
+    pub fast_mode: bool,
     #[serde(default = "default_rerank_enabled")]
     pub rerank_enabled: bool,
 }
@@ -174,6 +176,18 @@ impl TurboQuantEngine {
         Self::open_with_metric(uri, local_dir, d, b, seed, DistanceMetric::Ip)
     }
 
+    /// Open (or create) with O(d log d) SRHT fast-path quantizer.
+    /// Equivalent to `open` but uses SRHT for both MSE rotation and QJL projection.
+    pub fn open_fast(
+        uri: &str,
+        local_dir: &str,
+        d: usize,
+        b: usize,
+        seed: u64,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::open_with_metric_and_rerank(uri, local_dir, d, b, seed, DistanceMetric::Ip, true, true)
+    }
+
     pub fn open_with_metric(
         uri: &str,
         local_dir: &str,
@@ -182,7 +196,7 @@ impl TurboQuantEngine {
         seed: u64,
         metric: DistanceMetric,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::open_with_metric_and_rerank(uri, local_dir, d, b, seed, metric, true)
+        Self::open_with_metric_and_rerank(uri, local_dir, d, b, seed, metric, true, false)
     }
 
     pub fn open_with_metric_and_rerank(
@@ -193,6 +207,7 @@ impl TurboQuantEngine {
         seed: u64,
         metric: DistanceMetric,
         rerank: bool,
+        fast_mode: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(local_dir)?;
         let manifest_path = format!("{}/manifest.json", local_dir);
@@ -210,7 +225,11 @@ impl TurboQuantEngine {
             let q = load_quantizer_state(local_dir, &backend)?;
             (m, q)
         } else {
-            let q = ProdQuantizer::new(d, b, seed);
+            let q = if fast_mode {
+                ProdQuantizer::new_srht(d, b, seed)
+            } else {
+                ProdQuantizer::new(d, b, seed)
+            };
             let m = Manifest {
                 version: 2,
                 d,
@@ -222,6 +241,7 @@ impl TurboQuantEngine {
                 metric: metric.clone(),
                 index_state: None,
                 rerank_enabled: rerank,
+                fast_mode,
             };
             save_quantizer_state(local_dir, &backend, &q)?;
             m.save(&manifest_path)?;
