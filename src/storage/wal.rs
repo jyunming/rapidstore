@@ -2,8 +2,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::quantizer::CodeIndex;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+
+const WAL_MAGIC: &[u8; 4] = b"TQWV";
+const WAL_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WalEntry {
@@ -16,6 +19,20 @@ pub struct WalEntry {
     pub is_deleted: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[doc(hidden)]
+struct WalEntryLegacy {
+    pub id: String,
+    pub quantized_indices: Vec<CodeIndex>,
+    pub qjl_bits: Vec<u8>,
+    pub gamma: f32,
+    pub metadata_json: String,
+    #[serde(default)]
+    pub is_deleted: bool,
+    #[serde(default)]
+    pub original_vector: Option<Vec<f32>>,
+}
+
 pub struct Wal {
     path: PathBuf,
     writer: BufWriter<File>,
@@ -25,7 +42,14 @@ pub struct Wal {
 impl Wal {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let exists = path.exists();
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        
+        if !exists || file.metadata()?.len() == 0 {
+            file.write_all(WAL_MAGIC)?;
+            file.write_all(&WAL_VERSION.to_le_bytes())?;
+        }
+
         Ok(Self {
             path,
             writer: BufWriter::new(file),
@@ -75,13 +99,25 @@ impl Wal {
     pub fn replay<P: AsRef<Path>>(
         path: P,
     ) -> Result<Vec<WalEntry>, Box<dyn std::error::Error + Send + Sync>> {
-        use std::io::Read;
-
         let path = path.as_ref();
         if !path.exists() {
             return Ok(Vec::new());
         }
         let mut file = File::open(path)?;
+        let mut magic = [0u8; 4];
+        let mut version = 0u32;
+        
+        let has_header = if file.read_exact(&mut magic).is_ok() && &magic == WAL_MAGIC {
+            let mut v_buf = [0u8; 4];
+            file.read_exact(&mut v_buf)?;
+            version = u32::from_le_bytes(v_buf);
+            true
+        } else {
+            // No magic, reset to start for legacy read
+            file = File::open(path)?;
+            false
+        };
+
         let mut entries = Vec::new();
         loop {
             let mut len_buf = [0u8; 8];
@@ -96,15 +132,32 @@ impl Wal {
                 Ok(_) => {}
                 Err(_) => break,
             }
-            if let Ok(entry) = bincode::deserialize::<WalEntry>(&payload) {
-                entries.push(entry);
+            
+            if has_header && version == 2 {
+                if let Ok(entry) = bincode::deserialize::<WalEntry>(&payload) {
+                    entries.push(entry);
+                }
+            } else {
+                // Legacy v1 path
+                if let Ok(legacy) = bincode::deserialize::<WalEntryLegacy>(&payload) {
+                    entries.push(WalEntry {
+                        id: legacy.id,
+                        quantized_indices: legacy.quantized_indices,
+                        qjl_bits: legacy.qjl_bits,
+                        gamma: legacy.gamma,
+                        metadata_json: legacy.metadata_json,
+                        is_deleted: legacy.is_deleted,
+                    });
+                }
             }
         }
         Ok(entries)
     }
 
     pub fn truncate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        File::create(&self.path)?;
+        let mut file = File::create(&self.path)?;
+        file.write_all(WAL_MAGIC)?;
+        file.write_all(&WAL_VERSION.to_le_bytes())?;
         Ok(())
     }
 
@@ -112,5 +165,3 @@ impl Wal {
         self.entry_count
     }
 }
-
-

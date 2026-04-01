@@ -18,13 +18,14 @@ pub struct Database {
 #[pymethods]
 impl Database {
     #[staticmethod]
-    #[pyo3(signature = (path, dimension, bits=8, seed=42, metric="ip"))]
+    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true))]
     fn open(
         path: String,
         dimension: usize,
         bits: usize,
         seed: u64,
         metric: &str,
+        rerank: bool,
     ) -> PyResult<Self> {
         let dist_metric = match metric.to_lowercase().as_str() {
             "ip" => DistanceMetric::Ip,
@@ -38,7 +39,7 @@ impl Database {
             }
         };
 
-        let engine = TurboQuantEngine::open_with_metric(&path, &path, dimension, bits, seed, dist_metric)
+        let engine = TurboQuantEngine::open_with_metric_and_rerank(&path, &path, dimension, bits, seed, dist_metric, rerank)
             .map_err(to_py_runtime)?;
         Ok(Self {
             engine: Arc::new(RwLock::new(engine)),
@@ -277,8 +278,8 @@ impl Database {
             let mut engine = self.engine.write().unwrap();
             engine
                 .create_index_with_params(
-                    max_degree.unwrap_or(16),
-                    search_list_size.unwrap_or(64),
+                    max_degree.unwrap_or(32),
+                    search_list_size.unwrap_or(128),
                     alpha.unwrap_or(1.2),
                 )
                 .map_err(to_py_runtime)

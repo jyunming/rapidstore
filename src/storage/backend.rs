@@ -11,7 +11,7 @@ pub trait StorageProvider: Send + Sync {
     fn write(
         &self,
         path: &str,
-        data: Vec<u8>,
+        data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// List files matching a prefix.
@@ -22,6 +22,9 @@ pub trait StorageProvider: Send + Sync {
 
     /// Check if a file exists.
     fn exists(&self, path: &str) -> bool;
+
+    /// Get file size.
+    fn size(&self, path: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Local filesystem storage provider.
@@ -46,7 +49,7 @@ impl StorageProvider for LocalProvider {
     fn write(
         &self,
         path: &str,
-        data: Vec<u8>,
+        data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let full = self.root.join(path);
         if let Some(parent) = full.parent() {
@@ -59,9 +62,6 @@ impl StorageProvider for LocalProvider {
     fn list(&self, prefix: &str) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         let mut results = Vec::new();
         let search_path = self.root.join(prefix);
-
-        // Debug
-        // println!("Listing root: {:?}, prefix: {}, search_path: {:?}", self.root, prefix, search_path);
 
         let target_dir = if search_path.is_dir() {
             search_path
@@ -91,6 +91,11 @@ impl StorageProvider for LocalProvider {
 
     fn exists(&self, path: &str) -> bool {
         self.root.join(path).exists()
+    }
+
+    fn size(&self, path: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let full = self.root.join(path);
+        Ok(fs::metadata(full)?.len())
     }
 }
 
@@ -127,7 +132,7 @@ impl StorageBackend {
     pub fn write(
         &self,
         path: &str,
-        data: Vec<u8>,
+        data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.provider.write(path, data)
     }
@@ -145,5 +150,9 @@ impl StorageBackend {
 
     pub fn exists(&self, path: &str) -> bool {
         self.provider.exists(path)
+    }
+
+    pub fn size(&self, path: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        self.provider.size(path)
     }
 }
