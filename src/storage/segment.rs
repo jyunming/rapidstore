@@ -3,15 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
 
-use crate::quantizer::CodeIndex;
 
 /// Fixed-size record stored in a segment file.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SegmentRecord {
     pub id: String,
-    pub quantized_indices: Vec<CodeIndex>,
-    pub qjl_bits: Vec<u8>,
-    pub gamma: f32,
     #[serde(default)]
     pub is_deleted: bool,
 }

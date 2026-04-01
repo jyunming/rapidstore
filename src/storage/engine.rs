@@ -18,6 +18,7 @@ use crate::quantizer::CodeIndex;
 
 const QUANTIZER_STATE_FILE: &str = "quantizer.bin";
 const INDEX_IDS_FILE: &str = "graph_ids.json";
+const ID_POOL_FILE: &str = "live_ids.bin";
 const MANIFEST_SAVE_INTERVAL_OPS: usize = 64;
 
 const LIVE_GAMMA_BYTES: usize = 4;
@@ -220,12 +221,18 @@ impl TurboQuantEngine {
             live_vectors: HashMap::new(), index_ids_dirty: false, pending_manifest_updates: 0,
         };
 
+        if let Ok(id_pool) = load_id_pool(local_dir, &engine.backend) {
+            engine.id_pool = id_pool;
+        } else if engine.live_codes.len() > 0 {
+            return Err("live_ids.bin missing; cannot rebuild id_pool without legacy segment data".into());
+        }
+
         let pending = Wal::replay(&wal_path)?;
         if !pending.is_empty() {
             engine.wal_buffer.extend(pending);
             engine.flush_wal_to_segment()?;
-        } else {
-            engine.rebuild_live_codes_cache()?;
+        } else if engine.id_pool.active_count() == 0 && engine.live_codes.len() > 0 {
+            return Err("live_ids.bin missing; cannot rebuild id_pool without legacy segment data".into());
         }
         Ok(engine)
     }
@@ -512,7 +519,8 @@ impl TurboQuantEngine {
     pub fn flush_wal_to_segment(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.wal_buffer.is_empty() { return Ok(()); }
         let records: Vec<SegmentRecord> = self.wal_buffer.drain(..).map(|e| SegmentRecord {
-            id: e.id, quantized_indices: e.quantized_indices, qjl_bits: e.qjl_bits, gamma: e.gamma, is_deleted: e.is_deleted,
+            id: e.id,
+            is_deleted: e.is_deleted,
         }).collect();
         for r in &records {
             if r.is_deleted { self.live_delete_slot(&r.id); }
@@ -524,6 +532,7 @@ impl TurboQuantEngine {
         self.live_codes.flush()?;
         self.wal.truncate()?;
         self.metadata.flush()?;
+        self.persist_id_pool()?;
 
         self.live_codes.release_mmap();
         let live_codes_path = Path::new(&self.local_dir).join("live_codes.bin");
@@ -539,6 +548,7 @@ impl TurboQuantEngine {
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.flush_wal_to_segment()?;
         self.metadata.flush()?;
+        self.persist_id_pool()?;
         self.maybe_persist_state(true)?;
         Ok(())
     }
@@ -654,26 +664,11 @@ impl TurboQuantEngine {
     }
 
     fn rebuild_live_codes_cache(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut deleted = std::collections::HashSet::new();
-        for res in self.segments.iter_records_streaming() {
-            let r = res?;
-            if r.is_deleted { deleted.insert(r.id); }
-        }
-        self.live_codes.clear()?; self.id_pool.clear();
-        let mut latest = HashMap::new();
-        for res in self.segments.iter_records_streaming() {
-            let r = res?;
-            if !r.is_deleted && !deleted.contains(&r.id) { latest.insert(r.id.clone(), r); }
-        }
-        let mut ids: Vec<_> = latest.keys().cloned().collect();
-        ids.sort();
-        for id in ids {
-            let r = latest.get(&id).unwrap();
-            let v = self.quantizer.dequantize(&r.quantized_indices, &r.qjl_bits, r.gamma as f64);
-            let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt() as f32;
-            self.live_alloc_or_update(&r.id, &r.quantized_indices, &r.qjl_bits, r.gamma, norm);
-        }
-        Ok(())
+        Err("rebuild_live_codes_cache is disabled; live_ids.bin is required for recovery".into())
+    }
+
+    fn persist_id_pool(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        save_id_pool(&self.local_dir, &self.backend, &self.id_pool)
     }
 
     fn invalidate_index_state(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -779,6 +774,31 @@ fn load_quantizer_state(local_dir: &str, backend: &Arc<StorageBackend>) -> Resul
         std::fs::write(&local, &bytes)?; return Ok(bincode::deserialize(&bytes)?);
     }
     Err("Quantizer state not found".into())
+}
+
+fn save_id_pool(local_dir: &str, backend: &Arc<StorageBackend>, pool: &IdPool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = bincode::serialize(pool)?;
+    let local = format!("{}/{}", local_dir, ID_POOL_FILE);
+    std::fs::write(&local, &bytes)?;
+    backend.write(ID_POOL_FILE, bytes)?;
+    Ok(())
+}
+
+fn load_id_pool(local_dir: &str, backend: &Arc<StorageBackend>) -> Result<IdPool, Box<dyn std::error::Error + Send + Sync>> {
+    let local = format!("{}/{}", local_dir, ID_POOL_FILE);
+    if Path::new(&local).exists() {
+        let bytes = std::fs::read(&local)?;
+        let mut pool: IdPool = bincode::deserialize(&bytes)?;
+        pool.rebuild_lookup();
+        return Ok(pool);
+    }
+    if let Ok(bytes) = backend.read(ID_POOL_FILE) {
+        std::fs::write(&local, &bytes)?;
+        let mut pool: IdPool = bincode::deserialize(&bytes)?;
+        pool.rebuild_lookup();
+        return Ok(pool);
+    }
+    Err("live_ids.bin not found".into())
 }
 
 fn save_index_ids(local_dir: &str, ids: &[u32]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

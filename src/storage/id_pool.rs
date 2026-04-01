@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct IdPool {
     bytes: Vec<u8>,
     offsets: Vec<u32>,
@@ -117,6 +118,17 @@ impl IdPool {
         self.alive.clear();
         self.lookup.clear();
         self.active_count = 0;
+    }
+
+    pub fn rebuild_lookup(&mut self) {
+        self.lookup.clear();
+        self.active_count = 0;
+        for (i, &hash) in self.hashes.iter().enumerate() {
+            if self.alive.get(i).copied().unwrap_or(false) {
+                self.lookup.entry(hash).or_default().push(i as u32);
+                self.active_count += 1;
+            }
+        }
     }
 }
 
