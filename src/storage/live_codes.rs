@@ -111,6 +111,14 @@ impl LiveCodesFile {
         self.len * self.stride
     }
 
+    /// Returns a read-only view of the entire mmap, safe to share across threads.
+    pub fn as_bytes(&self) -> &[u8] {
+        match &self.mmap {
+            Some(m) => &m[..],
+            None => &[],
+        }
+    }
+
     pub fn clear(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.mmap = None; // DROP MUST BE FIRST ON WINDOWS
         self.len = 0;

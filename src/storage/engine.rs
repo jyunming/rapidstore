@@ -1,4 +1,5 @@
 use ndarray::Array1;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::cmp::Ordering;
@@ -725,72 +726,145 @@ impl TurboQuantEngine {
             return Ok(Vec::new());
         }
 
-        let mut results = BinaryHeap::new();
-        let q_norm = query.iter().map(|x| x * x).sum::<f64>().sqrt();
         let internal_k = top_k * 4;
+        let q_norm = query.iter().map(|x| x * x).sum::<f64>().sqrt();
 
-        if matches!(self.metric, DistanceMetric::Ip) {
-            let prep = self.quantizer.prepare_ip_query(query);
-            for (_, slot) in active {
-                let (indices, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
-                let score = self
-                    .quantizer
-                    .score_ip_encoded(&prep, &indices, qjl, gamma as f64);
-
-                if let Some(f) = filter {
-                    let meta = self.metadata.get(slot)?.unwrap_or_default();
-                    if !metadata_matches_filter(&meta.properties, f) {
-                        continue;
-                    }
-                }
-
-                results.push(OrderingWrapper(SearchCandidate { id: slot, score }));
-                if results.len() > internal_k {
-                    results.pop();
-                }
-            }
-        } else if matches!(self.metric, DistanceMetric::Cosine) {
-            let prep = self.quantizer.prepare_ip_query(query);
-            for (_, slot) in active {
-                let (indices, qjl, gamma, doc_norm) = self.live_codes_at_slot(slot as usize);
-                let ip = self
-                    .quantizer
-                    .score_ip_encoded(&prep, &indices, qjl, gamma as f64);
-                let score = if q_norm > 0.0 && doc_norm > 0.0 {
-                    ip / (q_norm * doc_norm as f64)
-                } else {
-                    0.0
-                };
-
-                if let Some(f) = filter {
-                    let meta = self.metadata.get(slot)?.unwrap_or_default();
-                    if !metadata_matches_filter(&meta.properties, f) {
-                        continue;
-                    }
-                }
-
-                results.push(OrderingWrapper(SearchCandidate { id: slot, score }));
-                if results.len() > internal_k {
-                    results.pop();
-                }
-            }
+        // Pre-filter slots upfront to keep the hot scoring loop filter-free.
+        // For the no-filter path this is just a collect; for filter it does one
+        // bulk metadata read (cheaper than per-slot reads inside the parallel loop).
+        let candidate_slots: Vec<u32> = if let Some(f) = filter {
+            let all_slots: Vec<u32> = active.iter().map(|(_, s)| *s).collect();
+            let meta_map = self.metadata.get_many(&all_slots)?;
+            all_slots
+                .into_iter()
+                .filter(|s| {
+                    meta_map
+                        .get(s)
+                        .is_some_and(|m| metadata_matches_filter(&m.properties, f))
+                })
+                .collect()
         } else {
-            for (_, slot) in active {
-                let (indices, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
-                let v = self.quantizer.dequantize(&indices, qjl, gamma as f64);
-                let score = score_vectors_with_metric(&self.metric, query, &v);
+            active.iter().map(|(_, s)| *s).collect()
+        };
 
-                if let Some(f) = filter {
-                    let meta = self.metadata.get(slot)?.unwrap_or_default();
-                    if !metadata_matches_filter(&meta.properties, f) {
-                        continue;
-                    }
-                }
+        if candidate_slots.is_empty() {
+            return Ok(Vec::new());
+        }
 
-                results.push(OrderingWrapper(SearchCandidate { id: slot, score }));
-                if results.len() > internal_k {
-                    results.pop();
-                }
+        // Borrow mmap bytes once — &[u8] is Sync so safe to share across Rayon threads.
+        let codes_bytes = self.live_codes.as_bytes();
+        let stride = self.live_stride();
+        let mse_len = self.live_mse_len();
+        let qjl_len = self.live_qjl_len();
+        let d = self.d;
+        let quantizer = &self.quantizer;
+        let metric = &self.metric;
+
+        // Parallel scoring: each 512-slot chunk reuses one CodeIndex scratch buffer.
+        const CHUNK: usize = 512;
+        let scored: Vec<(u32, f64)> = match metric {
+            DistanceMetric::Ip => {
+                let prep = quantizer.prepare_ip_query(query);
+                candidate_slots
+                    .par_chunks(CHUNK)
+                    .flat_map(|chunk| {
+                        let mut idx = vec![0u16; d];
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for &slot in chunk {
+                            let rec = &codes_bytes
+                                [slot as usize * stride..(slot as usize + 1) * stride];
+                            quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
+                            let gamma = f32::from_le_bytes(
+                                rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            let score = quantizer.score_ip_encoded(
+                                &prep,
+                                &idx,
+                                &rec[mse_len..mse_len + qjl_len],
+                                gamma as f64,
+                            );
+                            out.push((slot, score));
+                        }
+                        out
+                    })
+                    .collect()
+            }
+            DistanceMetric::Cosine => {
+                let prep = quantizer.prepare_ip_query(query);
+                candidate_slots
+                    .par_chunks(CHUNK)
+                    .flat_map(|chunk| {
+                        let mut idx = vec![0u16; d];
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for &slot in chunk {
+                            let rec = &codes_bytes
+                                [slot as usize * stride..(slot as usize + 1) * stride];
+                            quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
+                            let gamma = f32::from_le_bytes(
+                                rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            let doc_norm = f32::from_le_bytes(
+                                rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            let ip = quantizer.score_ip_encoded(
+                                &prep,
+                                &idx,
+                                &rec[mse_len..mse_len + qjl_len],
+                                gamma as f64,
+                            );
+                            let score = if q_norm > 0.0 && doc_norm > 0.0 {
+                                ip / (q_norm * doc_norm as f64)
+                            } else {
+                                0.0
+                            };
+                            out.push((slot, score));
+                        }
+                        out
+                    })
+                    .collect()
+            }
+            _ => {
+                // L2 and any future metrics: dequantize then compute distance
+                candidate_slots
+                    .par_chunks(CHUNK)
+                    .flat_map(|chunk| {
+                        let mut idx = vec![0u16; d];
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for &slot in chunk {
+                            let rec = &codes_bytes
+                                [slot as usize * stride..(slot as usize + 1) * stride];
+                            quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
+                            let gamma = f32::from_le_bytes(
+                                rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            let v = quantizer.dequantize(
+                                &idx,
+                                &rec[mse_len..mse_len + qjl_len],
+                                gamma as f64,
+                            );
+                            let score = score_vectors_with_metric(metric, query, &v);
+                            out.push((slot, score));
+                        }
+                        out
+                    })
+                    .collect()
+            }
+        };
+
+        // Build top-k heap from flat scored list
+        let mut results = BinaryHeap::with_capacity(internal_k + 1);
+        for (slot, score) in scored {
+            results.push(OrderingWrapper(SearchCandidate { id: slot, score }));
+            if results.len() > internal_k {
+                results.pop();
             }
         }
 
