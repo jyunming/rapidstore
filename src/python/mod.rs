@@ -299,6 +299,7 @@ impl Database {
         &self,
         py: Python<'_>,
         max_degree: Option<usize>,
+        ef_construction: Option<usize>,
         search_list_size: Option<usize>,
         alpha: Option<f64>,
     ) -> PyResult<()> {
@@ -307,6 +308,7 @@ impl Database {
             engine
                 .create_index_with_params(
                     max_degree.unwrap_or(32),
+                    ef_construction.unwrap_or(200),
                     search_list_size.unwrap_or(128),
                     alpha.unwrap_or(1.2),
                 )

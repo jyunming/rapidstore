@@ -67,9 +67,15 @@ fn default_rerank_enabled() -> bool {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IndexState {
     pub max_degree: usize,
+    #[serde(default = "default_ef_construction")]
+    pub ef_construction: usize,
     pub search_list_size: usize,
     pub alpha: f64,
     pub indexed_nodes: usize,
+}
+
+fn default_ef_construction() -> usize {
+    200
 }
 
 impl Manifest {
@@ -455,6 +461,7 @@ impl TurboQuantEngine {
     pub fn create_index_with_params(
         &mut self,
         max_degree: usize,
+        ef_construction: usize,
         search_list_size: usize,
         alpha: f64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -529,11 +536,12 @@ impl TurboQuantEngine {
         };
 
         self.graph
-            .build(indexed_slots.len(), max_degree, alpha, build_scorer)?;
+            .build(indexed_slots.len(), max_degree, ef_construction, alpha, build_scorer)?;
         self.index_ids = indexed_slots;
         self.index_ids_dirty = true;
         self.manifest.index_state = Some(IndexState {
             max_degree,
+            ef_construction,
             search_list_size,
             alpha,
             indexed_nodes: self.index_ids.len(),

@@ -61,6 +61,7 @@ def main():
     parser.add_argument("--bits", type=int, default=8)
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--runs", type=int, default=30)
+    parser.add_argument("--fast_mode", action="store_true", default=False)
     args = parser.parse_args()
 
     N = args.n
@@ -115,12 +116,12 @@ def main():
 
             elif args.engine == "tqdb":
                 db_path = os.path.join(tmp_dir, "bench.tqdb")
-                db = turboquantdb.TurboQuantDB.open(db_path, dimension=DIM, bits=args.bits, metric="ip")
+                db = turboquantdb.TurboQuantDB.open(db_path, dimension=DIM, bits=args.bits, metric="ip", fast_mode=args.fast_mode)
                 t0 = time.perf_counter()
                 db.insert_batch(ids, vecs, metadatas=metadatas)
                 ingest_time = time.perf_counter() - t0
                 ingest_peak_rss = max(ingest_peak_rss, rss_mb())
-                db.create_index()
+                db.create_index(max_degree=32, ef_construction=200)
                 ingest_peak_rss = max(ingest_peak_rss, rss_mb())
         
         ingest_cpu = build_timer.util
@@ -134,9 +135,10 @@ def main():
         
         with CpuTimer() as search_timer:
             if args.engine == "lancedb":
+                _ldb_nprobes = min(20, max(4, 256 // 10))
                 for i in range(RUNS):
                     t_s = time.perf_counter()
-                    res = table.search(queries[i]).limit(TOP_K).to_list()
+                    res = table.search(queries[i]).limit(TOP_K).nprobes(_ldb_nprobes).to_list()
                     latencies.append((time.perf_counter() - t_s) * 1000)
                     found_ids_list.append([int(r['id']) for r in res])
             elif args.engine == "chromadb":

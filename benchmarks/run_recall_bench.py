@@ -49,6 +49,12 @@ def parse_args():
         default="recall_bench",
         help="Artifact file prefix",
     )
+    p.add_argument(
+        "--use-ann",
+        action="store_true",
+        default=False,
+        help="Build HNSW index before search (measures ANN recall, not brute-force recall)",
+    )
     return p.parse_args()
 
 
@@ -223,6 +229,13 @@ def run_benchmark(args):
 
         # TurboQuantDB search + recall
         print(f"\nRunning {args.queries} queries, measuring Recall@{args.k}...")
+
+        if args.use_ann:
+            print("  Building HNSW index (max_degree=32, ef_construction=200)...")
+            t_idx = time.perf_counter()
+            db.create_index(max_degree=32, ef_construction=200, search_list_size=128)
+            print(f"  Index built in {time.perf_counter() - t_idx:.2f}s")
+
         tq_latencies = []
         recalls = []
 

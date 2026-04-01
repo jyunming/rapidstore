@@ -181,7 +181,9 @@ impl GraphManager {
             return Ok(Vec::new());
         }
 
-        const EF_UPPER: usize = 16;
+        // Upper-level greedy descent uses ef = search_list_size so the entry
+        // point fed into level-0 is as accurate as the final search itself.
+        let ef_upper = search_list_size.max(16);
         let mut beam = BinaryHeap::new();
         let start_score = scorer(self.entry_point);
         beam.push(OrderingWrapper(SearchCandidate {
@@ -202,7 +204,7 @@ impl GraphManager {
             let mut layer_results = beam.clone();
 
             while let Some(current) = candidates.pop() {
-                if layer_results.len() >= EF_UPPER
+                if layer_results.len() >= ef_upper
                     && current.score < layer_results.peek().unwrap().0.score
                 {
                     break;
@@ -217,12 +219,12 @@ impl GraphManager {
 
                         let score = scorer(nb);
                         let cand = SearchCandidate { id: nb, score };
-                        if layer_results.len() < EF_UPPER
+                        if layer_results.len() < ef_upper
                             || score > layer_results.peek().unwrap().0.score
                         {
                             candidates.push(cand);
                             layer_results.push(OrderingWrapper(cand));
-                            if layer_results.len() > EF_UPPER {
+                            if layer_results.len() > ef_upper {
                                 layer_results.pop();
                             }
                         }
@@ -295,14 +297,23 @@ impl GraphManager {
         &mut self,
         n: usize,
         max_degree: usize,
+        ef_construction: usize,
         _alpha: f64,
         build_scorer: impl Fn(u32, &[u32]) -> Vec<(u32, f64)> + Sync,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.mmap = None;
         let mut rng = rand::thread_rng();
 
-        let m_hnsw = 16;
-        let level_mult = 1.0 / (m_hnsw as f64).ln();
+        // Standard HNSW parameter derivation (Malkov & Yashunin 2018):
+        //   M       = base connectivity = max_degree / 2
+        //   M_max0  = level-0 max degree = max_degree
+        //   M_max   = upper-layer max degree = M
+        //   level_mult = 1 / ln(M)
+        let m = (max_degree / 2).max(4);
+        let m0 = max_degree.min(MAX_DEGREE);
+        let level_mult = 1.0 / (m as f64).ln();
+        let cand_pool = ef_construction.max(m0 * 2); // candidates per node
+
         let mut node_levels = vec![0u32; n];
         let mut max_l = 0u32;
         let mut ep = 0u32;
@@ -329,12 +340,10 @@ impl GraphManager {
             }
 
             let ln = level_nodes.len();
-            let degree_cap = if l == 0 {
-                max_degree.min(MAX_DEGREE)
-            } else {
-                m_hnsw
-            };
+            let degree_cap = if l == 0 { m0 } else { m };
 
+            // Pass 0 — random initialisation: sample cand_pool random candidates,
+            // score them, keep top-degree_cap. Provides a starting graph for refinement.
             let level_adj: Vec<Vec<u32>> = level_nodes
                 .par_iter()
                 .map(|&i| {
@@ -342,7 +351,7 @@ impl GraphManager {
                     let mut x = (i as u64)
                         .wrapping_mul(6364136223846793005)
                         .wrapping_add(1442695040888963407);
-                    while candidates.len() < degree_cap * 2 && candidates.len() < ln - 1 {
+                    while candidates.len() < cand_pool && candidates.len() < ln - 1 {
                         x = x.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
                         let cand_idx = (x % (ln as u64)) as usize;
                         let cand = level_nodes[cand_idx];
@@ -350,7 +359,6 @@ impl GraphManager {
                             candidates.insert(cand);
                         }
                     }
-
                     let cand_vec: Vec<u32> = candidates.into_iter().collect();
                     let mut scored = build_scorer(i, &cand_vec);
                     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
@@ -368,16 +376,29 @@ impl GraphManager {
                 adjacency[i as usize][l as usize] = level_adj[idx].clone();
             }
 
-            for _ in 0..1 {
+            // Passes 1–3 — iterative graph-based refinement: expand the candidate
+            // set by walking 2 hops through the current graph (analogous to
+            // ef_construction beam expansion). More passes → closer to true HNSW quality.
+            for _ in 0..3 {
                 let next_level_adj: Vec<Vec<u32>> = level_nodes
                     .par_iter()
                     .map(|&i| {
                         let mut candidates = HashSet::new();
+                        // 1-hop neighbours
                         for &nb in &adjacency[i as usize][l as usize] {
                             candidates.insert(nb);
+                            // 2-hop expansion
                             for &nbnb in &adjacency[nb as usize][l as usize] {
                                 if nbnb != i {
                                     candidates.insert(nbnb);
+                                }
+                            }
+                        }
+                        // Also include current reverse-neighbours (bidirectional correction)
+                        for &nb in &adjacency[i as usize][l as usize] {
+                            for &rev in &adjacency[nb as usize][l as usize] {
+                                if rev != i {
+                                    candidates.insert(rev);
                                 }
                             }
                         }

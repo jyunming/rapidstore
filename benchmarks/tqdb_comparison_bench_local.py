@@ -175,7 +175,8 @@ def run_lancedb(N):
             build_s = time.perf_counter() - t1
 
             q = rand_f32(1)[0].tolist()
-            p50, p95 = p50p95(lambda: tbl.search(q).limit(TOP_K).to_list())
+            nprobes = min(20, max(4, min(64, max(8, N // 500)) // 3))
+            p50, p95 = p50p95(lambda: tbl.search(q).limit(TOP_K).nprobes(nprobes).to_list())
         cpu = mon.stats()
         return {
             "ingest_s": ingest_s,
