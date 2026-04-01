@@ -201,8 +201,8 @@ Package version is defined in `pyproject.toml`. Follow [Semantic Versioning](htt
 
 - Never bump the version on a feature branch — only in the merge commit to main.
 - Never reuse a version; if a bad release goes out, yank it on PyPI and cut a new patch.
-- The git tag (`v0.3.0`) must always match `pyproject.toml`. Create the tag after the version bump commit lands on main.
-- Current version: `0.3.0`
+- The git tag (e.g. `v0.1.0`) must always match the version in `pyproject.toml`. Create the tag after the version bump commit lands on main.
+- **Single source of truth:** version is defined only in `pyproject.toml`. `Cargo.toml` must be kept manually in sync. The Python package reads it dynamically via `importlib.metadata`.
 
 ### Commits & PRs
 - **Conventional commits:** `type(scope): summary` (e.g., `fix(storage): release mmap before rename`, `perf(quantizer): faster bit-unpack`)

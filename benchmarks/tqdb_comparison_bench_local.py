@@ -360,7 +360,8 @@ def summary_table(all_results, title, fn):
 def main():
     print("Clean 3-Way Comparison: LanceDB (IVF_PQ) vs ChromaDB (HNSW) vs TurboQuantDB (bits=8)")
     print(f"  dim={DIM} top_k={TOP_K} search_runs={N_SEARCH} tqdb_bits={TQDB_BITS}")
-    print(f"  LanceDB {lancedb.__version__} | ChromaDB {chromadb.__version__} | TurboQuantDB 0.1.9")
+    import turboquantdb
+    print(f"  LanceDB {lancedb.__version__} | ChromaDB {chromadb.__version__} | TurboQuantDB {turboquantdb.__version__}")
     print("  Stop rule: if TurboQuantDB exceeds 2x worst competitor metric (or <0.5x speed), stop\n")
 
     all_results = {}
