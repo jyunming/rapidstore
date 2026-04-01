@@ -18,7 +18,7 @@ pub struct Database {
 #[pymethods]
 impl Database {
     #[staticmethod]
-    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true))]
+    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false))]
     fn open(
         path: String,
         dimension: usize,
@@ -26,6 +26,7 @@ impl Database {
         seed: u64,
         metric: &str,
         rerank: bool,
+        fast_mode: bool,
     ) -> PyResult<Self> {
         let dist_metric = match metric.to_lowercase().as_str() {
             "ip" => DistanceMetric::Ip,
@@ -47,6 +48,7 @@ impl Database {
             seed,
             dist_metric,
             rerank,
+            fast_mode,
         )
         .map_err(to_py_runtime)?;
         Ok(Self {
@@ -339,6 +341,20 @@ impl Database {
         dict.set_item("ann_slot_count", stats.ann_slot_count)?;
         dict.set_item("graph_nodes", stats.graph_nodes)?;
         Ok(dict.into())
+    }
+
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| {
+            let mut engine = self.engine.write().unwrap();
+            engine.flush_wal_to_segment().map_err(to_py_runtime)
+        })
+    }
+
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| {
+            let mut engine = self.engine.write().unwrap();
+            engine.close().map_err(to_py_runtime)
+        })
     }
 }
 

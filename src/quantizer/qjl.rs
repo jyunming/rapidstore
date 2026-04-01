@@ -1,5 +1,6 @@
 use nalgebra::DMatrix;
 use ndarray::Array1;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
@@ -19,6 +20,7 @@ pub struct QjlQuantizer {
 }
 
 impl QjlQuantizer {
+    /// Construct with paper-exact dense Gaussian projection (O(d²) per vector, SIMD-accelerated).
     pub fn new(d: usize, seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
 
@@ -27,6 +29,16 @@ impl QjlQuantizer {
         // Store flattened column-major; len == d*d signals paper-conformant mode
         let projection_signs: Vec<f32> = projection.as_slice().to_vec();
 
+        Self { d, projection_signs }
+    }
+
+    /// Construct with O(d log d) SRHT fast-path.
+    /// `projection_signs.len() == d` selects this path at runtime.
+    pub fn new_srht(d: usize, seed: u64) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let projection_signs: Vec<f32> = (0..d)
+            .map(|_| if rng.gen_bool(0.5) { 1.0f32 } else { -1.0f32 })
+            .collect();
         Self { d, projection_signs }
     }
 
@@ -41,15 +53,17 @@ impl QjlQuantizer {
     pub fn apply_projection(&self, x: &[f32], out: &mut [f32]) {
         let d = self.d;
         if self.is_matrix_mode() {
-            // Column-major: S[i,j] = projection_signs[i + j*d]
-            for i in 0..d {
-                let mut sum = 0.0f32;
-                for j in 0..d {
-                    sum += unsafe {
-                        *self.projection_signs.get_unchecked(i + j * d) * *x.get_unchecked(j)
-                    };
-                }
-                out[i] = sum;
+            // s = S · x via SIMD-optimized sgemm.
+            // S stored column-major: row_stride=1, col_stride=d.
+            unsafe {
+                matrixmultiply::sgemm(
+                    d, d, 1,
+                    1.0,
+                    self.projection_signs.as_ptr(), 1, d as isize,
+                    x.as_ptr(), 1, 1,
+                    0.0,
+                    out.as_mut_ptr(), 1, 1,
+                );
             }
         } else {
             srht(x, &self.projection_signs, out);
@@ -60,15 +74,16 @@ impl QjlQuantizer {
     pub fn apply_projection_transpose(&self, y: &[f32], out: &mut [f32]) {
         let d = self.d;
         if self.is_matrix_mode() {
-            // S^T[i,j] = S[j,i] = projection_signs[j + i*d]
-            for i in 0..d {
-                let mut sum = 0.0f32;
-                for j in 0..d {
-                    sum += unsafe {
-                        *self.projection_signs.get_unchecked(j + i * d) * *y.get_unchecked(j)
-                    };
-                }
-                out[i] = sum;
+            // v = S^T · y — transpose by swapping row/col strides.
+            unsafe {
+                matrixmultiply::sgemm(
+                    d, d, 1,
+                    1.0,
+                    self.projection_signs.as_ptr(), d as isize, 1,
+                    y.as_ptr(), 1, 1,
+                    0.0,
+                    out.as_mut_ptr(), 1, 1,
+                );
             }
         } else {
             srht(y, &self.projection_signs, out);

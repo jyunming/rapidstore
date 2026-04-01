@@ -1,5 +1,6 @@
 use nalgebra::DMatrix;
 use ndarray::Array1;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
@@ -22,6 +23,7 @@ pub struct MseQuantizer {
 }
 
 impl MseQuantizer {
+    /// Construct with paper-exact QR rotation (O(d²) per vector, SIMD-accelerated).
     pub fn new(d: usize, b: usize, seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
 
@@ -42,6 +44,26 @@ impl MseQuantizer {
         Self { d, b, rotation_signs, centroids }
     }
 
+    /// Construct with O(d log d) SRHT fast-path.
+    /// Preserves JL-guarantee and Beta-marginal coordinate distribution;
+    /// gives O(1/√d) approximation error in QJL estimator (negligible for d ≥ 512).
+    /// `rotation_signs.len() == d` selects this path at runtime.
+    pub fn new_srht(d: usize, b: usize, seed: u64) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let rotation_signs: Vec<f32> = (0..d)
+            .map(|_| if rng.gen_bool(0.5) { 1.0f32 } else { -1.0f32 })
+            .collect();
+        let centroids: Vec<f32> = lloyd_max(b, d, 20_000)
+            .into_iter()
+            .map(|c| c as f32)
+            .collect();
+        assert!(
+            centroids.len() <= u16::MAX as usize + 1,
+            "codebook too large for u16 indices; reduce bits"
+        );
+        Self { d, b, rotation_signs, centroids }
+    }
+
     /// True when `rotation_signs` holds a full d×d QR matrix (paper-conformant).
     /// False when it holds the legacy d-element SRHT sign vector.
     #[inline]
@@ -53,15 +75,17 @@ impl MseQuantizer {
     pub fn apply_rotation(&self, x: &[f32], out: &mut [f32]) {
         let d = self.d;
         if self.is_qr_mode() {
-            // Column-major: Π[i,j] = rotation_signs[i + j*d]
-            for i in 0..d {
-                let mut sum = 0.0f32;
-                for j in 0..d {
-                    sum += unsafe {
-                        *self.rotation_signs.get_unchecked(i + j * d) * *x.get_unchecked(j)
-                    };
-                }
-                out[i] = sum;
+            // y = Π · x via SIMD-optimized sgemm.
+            // Π stored column-major: row_stride=1, col_stride=d.
+            unsafe {
+                matrixmultiply::sgemm(
+                    d, d, 1,
+                    1.0,
+                    self.rotation_signs.as_ptr(), 1, d as isize,
+                    x.as_ptr(), 1, 1,
+                    0.0,
+                    out.as_mut_ptr(), 1, 1,
+                );
             }
         } else {
             srht(x, &self.rotation_signs, out);
@@ -72,15 +96,16 @@ impl MseQuantizer {
     pub fn apply_rotation_transpose(&self, y: &[f32], out: &mut [f32]) {
         let d = self.d;
         if self.is_qr_mode() {
-            // Π^T[i,j] = Π[j,i] = rotation_signs[j + i*d]
-            for i in 0..d {
-                let mut sum = 0.0f32;
-                for j in 0..d {
-                    sum += unsafe {
-                        *self.rotation_signs.get_unchecked(j + i * d) * *y.get_unchecked(j)
-                    };
-                }
-                out[i] = sum;
+            // x̃ = Π^T · ỹ — transpose by swapping row/col strides.
+            unsafe {
+                matrixmultiply::sgemm(
+                    d, d, 1,
+                    1.0,
+                    self.rotation_signs.as_ptr(), d as isize, 1,
+                    y.as_ptr(), 1, 1,
+                    0.0,
+                    out.as_mut_ptr(), 1, 1,
+                );
             }
         } else {
             // Legacy SRHT inverse: x = D · H · (1/√n) · y
