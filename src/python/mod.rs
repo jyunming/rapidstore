@@ -22,6 +22,7 @@ pub struct Database {
     engine: Arc<RwLock<TurboQuantEngine>>,
 }
 
+
 #[pymethods]
 impl Database {
     /// Open (or create) a TurboQuantDB database at the given directory path.
@@ -102,6 +103,8 @@ impl Database {
         })
     }
 
+    /// Insert a single vector with optional metadata and document.
+    #[pyo3(signature = (id, vector, metadata=None, document=None))]
     fn insert(
         &self,
         py: Python<'_>,
@@ -550,6 +553,15 @@ fn parse_document_rows(
 
 fn to_py_runtime(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+}
+
+#[allow(dead_code)]
+fn parse_include_set(include: Option<Vec<String>>, defaults: &[&str]) -> std::collections::HashSet<String> {
+    include
+        .unwrap_or_else(|| defaults.iter().map(|s| s.to_string()).collect())
+        .into_iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
 }
 
 pub fn register(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {

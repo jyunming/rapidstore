@@ -1,4 +1,4 @@
-# turboquantdb-server
+# rapidstore-server (crate: turboquantdb-server)
 
 Optional Axum HTTP service providing TurboQuantDB in multi-tenant server mode. Use this when you need REST API access, multi-tenancy, authentication, quotas, or async job management. For single-process Python use, the embedded `turboquantdb` package is simpler.
 
@@ -28,6 +28,21 @@ cargo build --release
 
 ### Health
 - `GET /healthz`
+- `GET/POST /v1/tenants/:tenant/databases/:database/collections`
+- `DELETE /v1/tenants/:tenant/databases/:database/collections/:collection`
+- `POST /v1/tenants/:tenant/databases/:database/collections/:collection/add`
+- `POST /v1/tenants/:tenant/databases/:database/collections/:collection/upsert`
+- `POST /v1/tenants/:tenant/databases/:database/collections/:collection/update`
+- `POST /v1/tenants/:tenant/databases/:database/collections/:collection/delete`
+- `POST /v1/tenants/:tenant/databases/:database/collections/:collection/get`
+- `POST /v1/tenants/:tenant/databases/:database/collections/:collection/query`
+- `POST /v1/tenants/:tenant/databases/:database/collections/:collection/compact`
+- `POST /v1/tenants/:tenant/databases/:database/collections/:collection/index`
+- `POST /v1/tenants/:tenant/databases/:database/collections/:collection/snapshot`
+- `GET /v1/tenants/:tenant/databases/:database/collections/:collection/jobs`
+- `GET /v1/jobs/:job_id`
+- `POST /v1/jobs/:job_id/cancel`
+- `POST /v1/jobs/:job_id/retry`
 
 ### Collection Management
 - `GET /v1/tenants/:tenant/databases/:database/collections` — List collections
@@ -56,6 +71,13 @@ cargo build --release
 - **Quotas** — Per-collection limits on vector count, disk bytes, and concurrent jobs, persisted in `quota_store.json`
 - **Async jobs** — Compaction, index build, and snapshots run in background workers; restart-safe with up to 3 retry attempts, state persisted in `job_store.json`
 - **Partial-failure reporting** — `add` and `upsert` with `report=true` return `{applied: N, failed: [...]}` instead of fail-fast
+
+### Data-Plane Request Notes
+
+- `POST .../add` and `POST .../upsert` support optional `report` (when `true`, returns partial-failure report with `applied` and `failed[]` instead of fail-fast).
+- `POST .../get` supports optional selectors (`ids`, `filter`, `where_filter`) plus `include`, `offset`, `limit`.
+- `POST .../query` supports `top_k` (or alias `n_results`), `filter` (or alias `where_filter`), optional `include`, and `offset`.
+- `include` defaults to all allowed fields for each endpoint.
 
 ## Request Notes
 

@@ -65,25 +65,6 @@ class MemorySampler:
         return self.peak_rss
 
 
-
-def resolve_embedding_model(model_name: str, hf_home: Path) -> str:
-    if model_name != "BAAI/bge-large-en-v1.5":
-        return model_name
-
-    candidates = [
-        hf_home / "transformers" / "models--BAAI--bge-large-en-v1.5" / "snapshots",
-        hf_home / "hub" / "models--BAAI--bge-large-en-v1.5" / "snapshots",
-    ]
-    for base in candidates:
-        if not base.exists():
-            continue
-        snaps = [p for p in base.iterdir() if p.is_dir()]
-        snaps.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        for snap in snaps:
-            cfg = snap / "config.json"
-            if cfg.exists():
-                return str(snap)
-    return model_name
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
@@ -228,13 +209,7 @@ def bench_turboquant(db_dir: Path, ids: List[str], vectors: np.ndarray, texts: L
     ensure_clean_dir(db_dir)
     proc = psutil.Process(os.getpid())
     d = int(vectors.shape[1])
-    try:
-        db = turboquantdb.Database.open(str(db_dir), d, bits, 42, None, "ip")
-    except TypeError:
-        db = turboquantdb.Database.open(str(db_dir), d, bits, 42)
-
-    vectors64 = np.asarray(vectors, dtype=np.float64)
-    queries64 = np.asarray(query_vecs, dtype=np.float64)
+    db = turboquantdb.Database.open(str(db_dir), d, bits, 42, None, "ip")
 
     baseline_write = proc.memory_info().rss
     ms_write = MemorySampler()
@@ -242,29 +217,13 @@ def bench_turboquant(db_dir: Path, ids: List[str], vectors: np.ndarray, texts: L
     t0 = time.perf_counter()
     for s in range(0, len(ids), batch_size):
         e = min(len(ids), s + batch_size)
-        batch_ids = ids[s:e]
-        batch_vecs = np.ascontiguousarray(vectors64[s:e], dtype=np.float64)
-        batch_metas = metas[s:e]
-        batch_docs = texts[s:e]
-        if hasattr(db, "insert_batch"):
-            db.insert_batch(batch_ids, batch_vecs, batch_metas, batch_docs, "insert")
-        elif hasattr(db, "insert_many"):
-            db.insert_many(
-                batch_ids,
-                [row for row in batch_vecs],
-                batch_metas,
-                batch_docs,
-                "insert",
-            )
-        else:
-            for i in range(s, e):
-                db.insert(ids[i], vectors64[i], metas[i] if i < len(metas) else None)
+        db.insert_many(
+            ids[s:e],
+            [np.asarray(v, dtype=np.float64) for v in vectors[s:e]],
+            metas[s:e],
+            texts[s:e],
+        )
     db.flush()
-    index_build_s = 0.0
-    if hasattr(db, "create_index"):
-        t_index0 = time.perf_counter()
-        db.create_index(32, 128)
-        index_build_s = time.perf_counter() - t_index0
     write_s = time.perf_counter() - t0
     peak_write = ms_write.stop()
 
@@ -272,32 +231,26 @@ def bench_turboquant(db_dir: Path, ids: List[str], vectors: np.ndarray, texts: L
     ms_read = MemorySampler()
     ms_read.start()
     q_lat: List[float] = []
-    for q in queries64:
+    for q in query_vecs:
         t1 = time.perf_counter()
-        try:
-            _ = db.search(q, top_k, None, True, 128)
-        except TypeError:
-            _ = db.search(q, top_k)
+        _ = db.search(np.asarray(q, dtype=np.float64), top_k, None, True, None)
         q_lat.append(time.perf_counter() - t1)
     read_total_s = sum(q_lat)
     peak_read = ms_read.stop()
 
-    stats = db.stats() if hasattr(db, "stats") else {}
     db.flush()
     db.close()
     gc.collect()
 
     return {
         "write_time_s": float(write_s),
-        "index_build_time_s": float(index_build_s),
         "read_total_time_s": float(read_total_s),
         "read_latency": summarize_times(q_lat),
         "db_size_bytes": int(dir_size_bytes(db_dir)),
         "write_peak_rss_mb": float((peak_write - baseline_write) / MB),
         "read_peak_rss_mb": float((peak_read - baseline_read) / MB),
-        "has_index": bool(stats.get("has_index", False)),
-        "index_nodes": int(stats.get("index_nodes", 0) or 0),
     }
+
 
 def bench_chromadb(db_dir: Path, ids: List[str], vectors: np.ndarray, texts: List[str], metas: List[dict], query_vecs: np.ndarray, top_k: int, batch_size: int) -> Dict[str, object]:
     ensure_clean_dir(db_dir)
@@ -397,7 +350,7 @@ def bench_lancedb(db_dir: Path, ids: List[str], vectors: np.ndarray, texts: List
 
 
 def build_scenarios() -> List[Scenario]:
-    sizes = [1, 10, 20, 50]
+    sizes = [1, 10, 100, 500]
     return [
         Scenario("single", mb, 1) for mb in sizes
     ] + [
@@ -425,11 +378,6 @@ def upsert_run(runs: List[Dict[str, object]], new_run: Dict[str, object]) -> Lis
 
 
 def run(args: argparse.Namespace) -> Dict[str, object]:
-    hf_home = Path(args.hf_home).resolve()
-    hf_home.mkdir(parents=True, exist_ok=True)
-    os.environ["HF_HOME"] = str(hf_home)
-    os.environ.setdefault("TRANSFORMERS_CACHE", str(hf_home / "transformers"))
-    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(hf_home / "hub"))
     random.seed(args.seed)
     np.random.seed(args.seed)
 
@@ -442,8 +390,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
     result_path = out_dir / "vectorstore_compare_results.json"
     runs = load_existing_runs(result_path)
 
-    model_ref = resolve_embedding_model(args.embedding_model, hf_home)
-    model = SentenceTransformer(model_ref, cache_folder=str(hf_home), local_files_only=True)
+    model = SentenceTransformer(args.embedding_model)
 
     scenarios = build_scenarios()
     if args.scenario:
@@ -541,39 +488,6 @@ def write_csv(report: Dict[str, object], csv_path: Path) -> None:
     csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-
-def print_human_summary(report: Dict[str, object]) -> None:
-    runs = report.get("runs", [])
-    if not runs:
-        return
-
-    def avg_metric(store: str, key: str, subkey: str = "") -> float:
-        vals = []
-        for run in runs:
-            m = run["stores"][store]
-            v = m[key] if not subkey else m[key][subkey]
-            vals.append(float(v))
-        return sum(vals) / max(1, len(vals))
-
-    stores = ["turboquantdb", "lancedb", "chromadb"]
-    ingest = {s: avg_metric(s, "write_time_s") for s in stores}
-    ingest_vps = {s: (sum(r["chunk_count"] for r in runs) / ingest[s]) if ingest[s] > 0 else 0.0 for s in stores}
-    disk = {s: avg_metric(s, "db_size_bytes") for s in stores}
-    search = {s: avg_metric(s, "read_latency", "p50_ms") for s in stores}
-    ram = {s: avg_metric(s, "read_peak_rss_mb") for s in stores}
-
-    def win_max(d: Dict[str, float]) -> str:
-        return max(d.items(), key=lambda kv: kv[1])[0]
-
-    def win_min(d: Dict[str, float]) -> str:
-        return min(d.items(), key=lambda kv: kv[1])[0]
-
-    print("\nSummary (avg across scenarios):")
-    print(f"Ingest speed  : tqdb={ingest_vps['turboquantdb']:.0f} v/s, lancedb={ingest_vps['lancedb']:.0f} v/s, chromadb={ingest_vps['chromadb']:.0f} v/s | winner={win_max(ingest_vps)}")
-    print(f"Disk footprint: tqdb={disk['turboquantdb']/MB:.2f} MB, lancedb={disk['lancedb']/MB:.2f} MB, chromadb={disk['chromadb']/MB:.2f} MB | winner={win_min(disk)}")
-    print(f"Search p50    : tqdb={search['turboquantdb']:.2f} ms, lancedb={search['lancedb']:.2f} ms, chromadb={search['chromadb']:.2f} ms | winner={win_min(search)}")
-    print(f"RAM usage     : tqdb={ram['turboquantdb']:.2f} MB, lancedb={ram['lancedb']:.2f} MB, chromadb={ram['chromadb']:.2f} MB | winner={win_min(ram)}")
-
 def main() -> None:
     p = argparse.ArgumentParser(description="Compare TurboQuantDB vs ChromaDB vs LanceDB")
     p.add_argument("--work-dir", default="benchmarks/store_compare_work")
@@ -587,7 +501,6 @@ def main() -> None:
     p.add_argument("--sample-stride-bytes", type=int, default=131072)
     p.add_argument("--turbo-bits", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--hf-home", default=".hf_home")
     p.add_argument("--scenario", default="", help="Run one scenario by name, e.g. single_100mb_1files")
     p.add_argument("--skip-done", action="store_true", help="Skip scenarios already present in vectorstore_compare_results.json")
     args = p.parse_args()
@@ -601,19 +514,7 @@ def main() -> None:
     write_csv(report, out_csv)
     print(f"wrote: {out_json}")
     print(f"wrote: {out_csv}")
-    print_human_summary(report)
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-

@@ -1,10 +1,13 @@
-# TurboQuantDB
+# RapidStore
 
-A high-performance, embedded vector database written in Rust with Python bindings. It implements Google DeepMind's **TurboQuant** algorithm (arXiv:2504.19874) for data-oblivious vector quantization — zero training time, 8–16x memory compression, and provably unbiased inner product estimation.
+A high-performance, embedded vector database written in Rust with Python bindings. It implements Google DeepMind's **TurboQuant** algorithm (arXiv:2504.19874) for data-oblivious vector quantization — zero training time, 8–16x memory compression, and provably unbiased inner product estimation. It supports both:
 
----
+- Embedded mode (library + Python bindings)
+- Service mode (multi-tenant HTTP API with background jobs)
 
-## Key Features
+The quantization approach is inspired by TurboQuant, with practical storage/indexing components implemented in this repository.
+
+## Current Capabilities
 
 - **Zero training time** — No `train()` step. Vectors are quantized and stored immediately on insert.
 - **Extreme compression** — Reduces float32 embeddings to 2–4 bits per coordinate (8–16x less RAM).
@@ -15,8 +18,15 @@ A high-performance, embedded vector database written in Rust with Python binding
 - **Python native** — Built with PyO3 and Maturin; runs in-process, no server required.
 - **Server mode** — Optional Axum HTTP service with multi-tenancy, RBAC, quotas, and async jobs.
 
----
+- Collection-scoped storage model (`tenant/database/collection` in service mode)
+- Batch write APIs: add, upsert, update, delete
+- Query APIs with include controls and pagination (`offset`, `limit`)
+- Filter support (`filter` / `where_filter`) for query/delete/get paths
+- Async maintenance jobs: compact, index build, snapshot
+- Persisted auth/RBAC, quotas, and job store in server mode
+- Quota admission controls for vectors, disk usage, and concurrent jobs
 
+<<<<<<< HEAD
 ## Installation
 
 ### Prerequisites
@@ -299,3 +309,54 @@ GPU acceleration is technically viable **only for batch ingest** where the two d
 ## Reference
 
 TurboQuant algorithm: [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) — *TurboQuant: Near-Optimal Data-Oblivious Vector Quantization*
+
+---
+
+## Repository Layout
+
+- `src/`: core Rust engine, quantization, storage, indexing, Python bindings
+- `server/`: Axum HTTP service crate (`turboquantdb-server`)
+- `python/`: Python package helpers
+- `tests/`: Rust integration and benchmark-style tests
+- `docs/`: design docs, roadmap, API notes
+- `benchmarks/`: recall/latency scripts and CI gates
+
+## Service Mode
+
+See [server/README.md](server/README.md) for endpoints and env vars.
+
+Common env vars:
+
+- `TQ_SERVER_ADDR` (default `127.0.0.1:8080`)
+- `TQ_LOCAL_ROOT` (default `./data`)
+- `TQ_JOB_WORKERS` (default `2`)
+
+## Documentation
+
+- [Python Migration Guide](docs/PYTHON_MIGRATION.md)
+- [M5 Multi-Tenant Service Design](docs/M5_MULTITENANT_SERVICE_DESIGN.md)
+- [M5 API Spec](docs/M5_API_SPEC.md)
+- [Compatibility Matrix](docs/COMPATIBILITY_MATRIX.md)
+- [Roadmap Backlog](docs/ROADMAP_BACKLOG.md)
+
+## Research Basis
+
+This repository is an independent implementation that uses ideas described in the TurboQuant paper; the paper itself was authored by the original researchers.
+
+Reference:
+
+Zandieh, A., Daliri, M., Hadian, M., & Mirrokni, V. (2025). *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate*. arXiv:2504.19874.
+
+- arXiv: https://arxiv.org/abs/2504.19874
+- Local copy in this repo: [2504.19874v1.pdf](2504.19874v1.pdf)
+
+If your academic work depends on the TurboQuant theory, please cite the original paper:
+
+```bibtex
+@article{zandieh2025turboquant,
+  title={TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate},
+  author={Zandieh, Amir and Daliri, Majid and Hadian, Majid and Mirrokni, Vahab},
+  journal={arXiv preprint arXiv:2504.19874},
+  year={2025}
+}
+```
