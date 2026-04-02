@@ -147,12 +147,15 @@ def main():
                     ingest_peak_rss = max(ingest_peak_rss, rss_mb())
                 ingest_time = time.perf_counter() - t0
 
-            # ── Qdrant (persistent, HNSW default) ────────────────────────────
+            # ── Qdrant (persistent, HNSW m=32 ef=200) ───────────────────────
             elif args.engine == "qdrant":
+                from qdrant_client.models import OptimizersConfigDiff, HnswConfigDiff
                 _qclient = QdrantClient(path=os.path.join(tmp, "qdrant"))
                 _qclient.create_collection(
                     "bench",
-                    vectors_config=VectorParams(size=DIM, distance=Distance.DOT))
+                    vectors_config=VectorParams(size=DIM, distance=Distance.DOT),
+                    hnsw_config=HnswConfigDiff(m=32, ef_construct=200),
+                    optimizers_config=OptimizersConfigDiff(indexing_threshold=N + 1))
                 t0 = time.perf_counter()
                 for i in range(0, N, 5000):
                     end = min(i + 5000, N)
@@ -161,6 +164,18 @@ def main():
                         for j in range(i, end)])
                     ingest_peak_rss = max(ingest_peak_rss, rss_mb())
                 ingest_time = time.perf_counter() - t0
+                # trigger HNSW index build now that all vectors are loaded
+                _qclient.update_collection(
+                    "bench",
+                    optimizers_config=OptimizersConfigDiff(indexing_threshold=0))
+                # wait for indexing to complete
+                import time as _time
+                while True:
+                    info = _qclient.get_collection("bench")
+                    if info.status.value == "green":
+                        break
+                    _time.sleep(0.5)
+                ingest_peak_rss = max(ingest_peak_rss, rss_mb())
 
             # ── TurboQuantDB ──────────────────────────────────────────────────
             elif args.engine == "tqdb":
