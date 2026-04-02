@@ -61,7 +61,7 @@ pub struct Manifest {
 }
 
 fn default_rerank_enabled() -> bool {
-    false
+    true
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -266,11 +266,9 @@ impl TurboQuantEngine {
         let mse_len = (n * (manifest.b - 1)).div_ceil(8);
         let stride = mse_len + qjl_len + LIVE_GAMMA_BYTES + LIVE_NORM_BYTES + LIVE_DELETED_BYTES;
         let live_codes = LiveCodesFile::open(Path::new(local_dir).join("live_codes.bin"), stride)?;
-        let live_vraw = if manifest.rerank_enabled {
-            Some(LiveCodesFile::open(
-                Path::new(local_dir).join("live_vectors.bin"),
-                manifest.d * 4,
-            )?)
+        let live_vraw_path = Path::new(local_dir).join("live_vectors.bin");
+        let live_vraw = if manifest.rerank_enabled && live_vraw_path.exists() {
+            Some(LiveCodesFile::open(live_vraw_path, manifest.d * 4)?)
         } else {
             None
         };
@@ -716,8 +714,16 @@ impl TurboQuantEngine {
                 let meta = meta_map.get(&slot).cloned().unwrap_or_default();
 
                 let score = if self.rerank_enabled {
-                    let raw_vec = self.live_raw_vector_at_slot(slot as usize);
-                    score_vectors_with_metric(&self.metric, query, &raw_vec)
+                    if self.live_vraw.is_some() {
+                        let raw_vec = self.live_raw_vector_at_slot(slot as usize);
+                        score_vectors_with_metric(&self.metric, query, &raw_vec)
+                    } else {
+                        // dequantize() applies inverse SRHT → d-dim original space.
+                        // query is also d-dim, so no rotation needed.
+                        let (indices, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
+                        let deq = self.quantizer.dequantize_single_no_parallel(&indices, qjl, gamma as f64);
+                        score_vectors_with_metric(&self.metric, query, &deq)
+                    }
                 } else {
                     approx_score
                 };
@@ -908,8 +914,15 @@ impl TurboQuantEngine {
             let meta = meta_map.get(&cand.id).cloned().unwrap_or_default();
 
             let score = if self.rerank_enabled {
-                let raw_vec = self.live_raw_vector_at_slot(cand.id as usize);
-                score_vectors_with_metric(&self.metric, query, &raw_vec)
+                if self.live_vraw.is_some() {
+                    let raw_vec = self.live_raw_vector_at_slot(cand.id as usize);
+                    score_vectors_with_metric(&self.metric, query, &raw_vec)
+                } else {
+                    // dequantize() applies inverse SRHT → d-dim original space.
+                    let (indices, qjl, gamma, _) = self.live_codes_at_slot(cand.id as usize);
+                    let deq = self.quantizer.dequantize_single_no_parallel(&indices, qjl, gamma as f64);
+                    score_vectors_with_metric(&self.metric, query, &deq)
+                }
             } else {
                 cand.score
             };
@@ -967,13 +980,15 @@ impl TurboQuantEngine {
         let live_codes_data = std::fs::read(&live_codes_path)?;
         self.backend.write("live_codes.bin", &live_codes_data)?;
 
-        if self.rerank_enabled {
+        // Only sync live_vectors.bin if it actually exists (new DBs use dequant reranking).
+        let had_vraw = self.live_vraw.is_some();
+        if had_vraw {
             let live_vraw_data = std::fs::read(&live_vraw_path)?;
             self.backend.write("live_vectors.bin", &live_vraw_data)?;
         }
 
         self.live_codes = LiveCodesFile::open(live_codes_path, self.live_stride())?;
-        if self.rerank_enabled {
+        if had_vraw {
             self.live_vraw = Some(LiveCodesFile::open(live_vraw_path, self.d * 4)?);
         }
         self.invalidate_index_state()?;
@@ -1145,8 +1160,10 @@ impl TurboQuantEngine {
         let temp_path = Path::new(&self.local_dir).join("live_codes.bin.tmp");
         let vtemp_path = Path::new(&self.local_dir).join("live_vectors.bin.tmp");
 
+        // Only compact live_vectors.bin if it actually exists (new DBs use dequant reranking).
+        let had_vraw = self.live_vraw.is_some();
         let mut new_codes = LiveCodesFile::open(temp_path.clone(), stride)?;
-        let mut new_vraw = if self.rerank_enabled {
+        let mut new_vraw = if had_vraw {
             Some(LiveCodesFile::open(vtemp_path.clone(), vstride)?)
         } else {
             None
@@ -1194,12 +1211,12 @@ impl TurboQuantEngine {
         }
 
         std::fs::rename(temp_path, &final_path)?;
-        if self.rerank_enabled {
+        if had_vraw {
             std::fs::rename(vtemp_path, &vfinal_path)?;
         }
 
         self.live_codes = LiveCodesFile::open(final_path, stride)?;
-        if self.rerank_enabled {
+        if had_vraw {
             self.live_vraw = Some(LiveCodesFile::open(vfinal_path, vstride)?);
         }
 
