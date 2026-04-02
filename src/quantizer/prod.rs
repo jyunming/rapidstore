@@ -1,4 +1,6 @@
+use nalgebra::DMatrix;
 use ndarray::Array1;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
 
@@ -9,6 +11,7 @@ use super::qjl::QjlQuantizer;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ProdQuantizer {
     pub d: usize,
+    pub n: usize,
     pub b: usize,
     pub mse_quantizer: MseQuantizer,
     pub qjl_quantizer: QjlQuantizer,
@@ -34,9 +37,11 @@ impl ProdQuantizer {
 
         let mse_quantizer = MseQuantizer::new(d, b - 1, seed);
         let qjl_quantizer = QjlQuantizer::new(d, seed ^ 0xdeadbeef);
+        let n = d.next_power_of_two();
 
         Self {
             d,
+            n,
             b,
             mse_quantizer,
             qjl_quantizer,
@@ -44,28 +49,26 @@ impl ProdQuantizer {
     }
 
     /// O(d log d) fast-path: uses SRHT for both rotation and projection.
-    /// Statistically equivalent to `new` for d ≥ 512; ~O(d log d) vs O(d²) per vector.
     pub fn new_srht(d: usize, b: usize, seed: u64) -> Self {
-        assert!(b >= 2, "ProdQuantizer requires at least b=2");
+        let mse_quantizer = MseQuantizer::new(d, b - 1, seed);
+        let qjl_quantizer = QjlQuantizer::new(d, seed ^ 0xdeadbeef);
+        let n = d.next_power_of_two();
 
-        let mse_quantizer = MseQuantizer::new_srht(d, b - 1, seed);
-        let qjl_quantizer = QjlQuantizer::new_srht(d, seed ^ 0xdeadbeef);
-
-        Self { d, b, mse_quantizer, qjl_quantizer }
+        Self { d, n, b, mse_quantizer, qjl_quantizer }
     }
 
     pub fn prepare_ip_query(&self, query: &Array1<f64>) -> PreparedIpQuery {
         assert_eq!(query.len(), self.d);
 
         let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
-        let mut y = vec![0.0f32; self.d];
+        let mut y = vec![0.0f32; self.n];
         self.mse_quantizer.apply_rotation(&query_f32, &mut y);
 
         // Precompute MSE lookup scores for each dimension/code.
         let centroids = &self.mse_quantizer.centroids;
         let lut_w = centroids.len();
-        let mut mse_lut = vec![0.0f32; self.d * lut_w];
-        for i in 0..self.d {
+        let mut mse_lut = vec![0.0f32; self.n * lut_w];
+        for i in 0..self.n {
             let yi = y[i];
             let row_off = i * lut_w;
             for (k, &c) in centroids.iter().enumerate() {
@@ -73,14 +76,14 @@ impl ProdQuantizer {
             }
         }
 
-        let mut sq = vec![0.0f32; self.d];
+        let mut sq = vec![0.0f32; self.n];
         self.qjl_quantizer.apply_projection(&query_f32, &mut sq);
 
         PreparedIpQuery {
             mse_lut,
             mse_lut_width: lut_w,
             sq,
-            qjl_scale: (PI / 2.0).sqrt() / self.d as f32,
+            qjl_scale: (PI / 2.0).sqrt() / self.n as f32,
         }
     }
 
@@ -88,16 +91,16 @@ impl ProdQuantizer {
         assert_eq!(query.len(), self.d);
 
         let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
-        let mut y = vec![0.0f32; self.d];
+        let mut y = vec![0.0f32; self.n];
         self.mse_quantizer.apply_rotation(&query_f32, &mut y);
 
-        let mut sq = vec![0.0f32; self.d];
+        let mut sq = vec![0.0f32; self.n];
         self.qjl_quantizer.apply_projection(&query_f32, &mut sq);
 
         PreparedIpQueryLite {
             y,
             sq,
-            qjl_scale: (PI / 2.0).sqrt() / self.d as f32,
+            qjl_scale: (PI / 2.0).sqrt() / self.n as f32,
         }
     }
 
@@ -112,7 +115,7 @@ impl ProdQuantizer {
         let centroids = &self.mse_quantizer.centroids;
         let prep_y = &prep.y;
 
-        for i in 0..self.d {
+        for i in 0..self.n {
             let c = unsafe { *centroids.get_unchecked(idx[i] as usize) };
             mse_score += c * unsafe { *prep_y.get_unchecked(i) };
         }
@@ -127,7 +130,7 @@ impl ProdQuantizer {
 
             for bit_idx in 0..8 {
                 let i = base_i + bit_idx;
-                if i >= self.d {
+                if i >= self.n {
                     break;
                 }
                 let bit_set = ((byte >> bit_idx) & 1u8) == 1u8;
@@ -167,7 +170,7 @@ impl ProdQuantizer {
         let lut = &prep.mse_lut;
 
         let mut row_off = 0;
-        for i in 0..self.d {
+        for i in 0..self.n {
             let val = unsafe { *lut.get_unchecked(row_off + idx[i] as usize) };
             mse_score += val;
             row_off += lut_width;
@@ -183,7 +186,7 @@ impl ProdQuantizer {
 
             for bit_idx in 0..8 {
                 let i = base_i + bit_idx;
-                if i >= self.d {
+                if i >= self.n {
                     break;
                 }
                 let bit_set = ((byte >> bit_idx) & 1u8) == 1u8;
@@ -212,7 +215,7 @@ impl ProdQuantizer {
         let lut_width = prep.mse_lut_width;
 
         let mut i = 0;
-        while i + 7 < self.d {
+        while i + 7 < self.n {
             let mut vals = [0.0f32; 8];
             for j in 0..8 {
                 let row = i + j;
@@ -231,7 +234,7 @@ impl ProdQuantizer {
         for val in res {
             mse_sum += val;
         }
-        while i < self.d {
+        while i < self.n {
             unsafe {
                 mse_sum += *lut.add(i * lut_width + idx[i] as usize);
             }
@@ -247,7 +250,7 @@ impl ProdQuantizer {
         while b < qjl_len {
             let byte = unsafe { *qjl_ptr.add(b) as i32 };
             let base_i = b << 3;
-            if base_i + 7 < self.d {
+            if base_i + 7 < self.n {
                 let s_vec = _mm256_loadu_ps(unsafe { sq.add(base_i) });
                 let mut signs = [0.0f32; 8];
                 for bit in 0..8 {
@@ -259,7 +262,7 @@ impl ProdQuantizer {
                 let mut qs = 0.0f32;
                 for bit in 0..8 {
                     let idx = base_i + bit;
-                    if idx >= self.d {
+                    if idx >= self.n {
                         break;
                     }
                     let s = unsafe { *sq.add(idx) };
@@ -280,7 +283,7 @@ impl ProdQuantizer {
     }
 
     pub fn quantize(&self, x: &Array1<f64>) -> (Vec<CodeIndex>, Vec<u8>, f64) {
-        let (idx, qjl, gamma) = (self.mse_quantizer.quantize(x), Vec::<u8>::new(), 0.0);
+        let idx = self.mse_quantizer.quantize(x);
 
         let x_tilde_mse = self.mse_quantizer.dequantize(&idx);
         let mut residual = Array1::zeros(self.d);
@@ -306,6 +309,18 @@ impl ProdQuantizer {
         x_mse + x_qjl
     }
 
+    /// Rotate a d-dimensional query into the n-dimensional SRHT space used
+    /// by dequantize().  Inner products and L2 distances are preserved by the
+    /// orthogonal SRHT, so scoring rotate_query_for_reranking(q) against
+    /// dequantize(codes) gives the same result as scoring q against the
+    /// original vector — without needing live_vectors.bin.
+    pub fn rotate_query_for_reranking(&self, query: &Array1<f64>) -> Array1<f64> {
+        let x_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
+        let mut y = vec![0.0f32; self.n];
+        self.mse_quantizer.apply_rotation(&x_f32, &mut y);
+        Array1::from_iter(y.iter().map(|&v| v as f64))
+    }
+
     pub fn dequantize_single_no_parallel(
         &self,
         idx: &[CodeIndex],
@@ -328,10 +343,10 @@ impl ProdQuantizer {
             return indices.iter().map(|v| *v as u8).collect();
         }
 
-        let total_bits = self.d * bits_per_idx;
+        let total_bits = self.n * bits_per_idx;
         let mut packed = vec![0u8; total_bits.div_ceil(8)];
 
-        for i in 0..self.d {
+        for i in 0..self.n {
             let val = indices[i] as u32;
             let bit_start = i * bits_per_idx;
             for b in 0..bits_per_idx {
@@ -354,7 +369,7 @@ impl ProdQuantizer {
         }
         let mask = (1u32 << bits_per_idx) - 1;
         let mut bit_pos = 0usize;
-        for i in 0..self.d {
+        for i in 0..self.n {
             let byte_idx = bit_pos >> 3;
             let bit_off = bit_pos & 7;
             let mut val = (packed[byte_idx] as u32) >> bit_off;
