@@ -478,30 +478,60 @@ impl TurboQuantEngine {
         let metric = self.metric.clone();
         let quantizer = self.quantizer.clone();
         let slots_ref = indexed_slots.clone();
-        let engine_rerank_enabled = self.rerank_enabled;
-        // Share live_vraw reference safely with the closure
+        let has_vraw = self.live_vraw.is_some();
+        // Share live_vraw reference safely with the closure.
         let vraw_ref = self.live_vraw.as_ref();
+
+        // For L2/other metrics without raw vectors: pre-compute all dequantized vectors in
+        // parallel before the build loop so each `to` node is dequantized at most once instead
+        // of once per candidate evaluation (O(n × ef_construction) without this).
+        let precomputed_l2: Vec<Array1<f64>> =
+            if !matches!(self.metric, DistanceMetric::Ip | DistanceMetric::Cosine)
+                && !has_vraw
+            {
+                let codes_bytes = live_codes.as_bytes();
+                let stride = self.live_stride();
+                let q = &self.quantizer;
+                indexed_slots
+                    .par_iter()
+                    .map(|&slot| {
+                        let rec = &codes_bytes
+                            [slot as usize * stride..(slot as usize + 1) * stride];
+                        let mut idx = vec![0u16; q.n];
+                        q.unpack_mse_indices(&rec[..mse_len], &mut idx);
+                        let gamma = f32::from_le_bytes(
+                            rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        q.dequantize(&idx, &rec[mse_len..mse_len + qjl_len], gamma as f64)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         let build_scorer = move |from: u32, candidates: &[u32]| -> Vec<(u32, f64)> {
             let from_slot = slots_ref[from as usize] as usize;
-            
-            // Use original vector for build if available (perfect graph)
-            let from_vec = if engine_rerank_enabled && vraw_ref.is_some() {
-                let vraw = vraw_ref.unwrap();
-                let rec = vraw.get_slot(from_slot);
-                let mut out = Array1::zeros(d);
-                for i in 0..d {
-                    let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
-                    out[i] = f32::from_le_bytes(bytes) as f64;
-                }
-                out
-            } else {
-                let (from_i, from_q, from_g, _) = live_codes_at_slot_raw(live_codes, d, mse_len, qjl_len, from_slot, &quantizer);
-                quantizer.dequantize_single_no_parallel(&from_i, from_q, from_g as f64)
-            };
 
             if matches!(metric, DistanceMetric::Ip) {
-                let prep = quantizer.prepare_ip_query_lite(&from_vec);
+                // For IP: prepare from-query via O(n) centroid lookup (no SRHT) when raw
+                // vectors are unavailable. When vraw is present, use exact rotation.
+                let prep = if has_vraw {
+                    let rec = vraw_ref.unwrap().get_slot(from_slot);
+                    let mut out = Array1::<f64>::zeros(d);
+                    for i in 0..d {
+                        let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                        out[i] = f32::from_le_bytes(bytes) as f64;
+                    }
+                    quantizer.prepare_ip_query_lite(&out)
+                } else {
+                    let (from_i, _, _, _) = live_codes_at_slot_raw(
+                        live_codes, d, mse_len, qjl_len, from_slot, &quantizer,
+                    );
+                    // O(n) centroid lookup — skips 3 SRHT ops vs dequantize+rotate path.
+                    quantizer.prepare_ip_query_from_codes(&from_i)
+                };
                 candidates
                     .iter()
                     .map(|&to| {
@@ -509,15 +539,26 @@ impl TurboQuantEngine {
                         let (to_i, to_q, to_g, _) = live_codes_at_slot_raw(
                             live_codes, d, mse_len, qjl_len, to_slot, &quantizer,
                         );
-                        (
-                            to,
-                            quantizer.score_ip_encoded_lite(&prep, &to_i, to_q, to_g as f64),
-                        )
+                        (to, quantizer.score_ip_encoded_lite(&prep, &to_i, to_q, to_g as f64))
                     })
                     .collect()
             } else if matches!(metric, DistanceMetric::Cosine) {
-                let prep = quantizer.prepare_ip_query_lite(&from_vec);
-                let from_norm = from_vec.iter().map(|x| x * x).sum::<f64>().sqrt();
+                let (prep, from_norm) = if has_vraw {
+                    let rec = vraw_ref.unwrap().get_slot(from_slot);
+                    let mut out = Array1::<f64>::zeros(d);
+                    for i in 0..d {
+                        let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                        out[i] = f32::from_le_bytes(bytes) as f64;
+                    }
+                    let norm = out.iter().map(|x| x * x).sum::<f64>().sqrt();
+                    (quantizer.prepare_ip_query_lite(&out), norm)
+                } else {
+                    // Use stored norm + centroid lookup — no SRHT needed.
+                    let (from_i, _, _, from_n) = live_codes_at_slot_raw(
+                        live_codes, d, mse_len, qjl_len, from_slot, &quantizer,
+                    );
+                    (quantizer.prepare_ip_query_from_codes(&from_i), from_n as f64)
+                };
                 candidates
                     .iter()
                     .map(|&to| {
@@ -525,25 +566,46 @@ impl TurboQuantEngine {
                         let (to_i, to_q, to_g, to_n) = live_codes_at_slot_raw(
                             live_codes, d, mse_len, qjl_len, to_slot, &quantizer,
                         );
-                        let ip = quantizer.score_ip_encoded_lite(&prep, &to_i, to_q, to_g as f64);
+                        let ip =
+                            quantizer.score_ip_encoded_lite(&prep, &to_i, to_q, to_g as f64);
                         let score = if from_norm > 0.0 && to_n > 0.0 {
-                            ip / (from_norm as f64 * to_n as f64)
+                            ip / (from_norm * to_n as f64)
                         } else {
                             0.0
                         };
                         (to, score)
                     })
                     .collect()
+            } else if !precomputed_l2.is_empty() {
+                // L2 without raw vecs: use pre-computed dequantized vectors (no per-call
+                // SRHT — each vector was dequantized exactly once in parallel above).
+                let from_vec = &precomputed_l2[from as usize];
+                candidates
+                    .iter()
+                    .map(|&to| {
+                        let to_vec = &precomputed_l2[to as usize];
+                        (to, score_vectors_with_metric(&metric, from_vec, to_vec))
+                    })
+                    .collect()
             } else {
+                // L2 with raw vecs: read from vraw directly.
+                let vraw = vraw_ref.unwrap();
+                let rec = vraw.get_slot(from_slot);
+                let mut from_vec = Array1::<f64>::zeros(d);
+                for i in 0..d {
+                    let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                    from_vec[i] = f32::from_le_bytes(bytes) as f64;
+                }
                 candidates
                     .iter()
                     .map(|&to| {
                         let to_slot = slots_ref[to as usize] as usize;
-                        let (to_i, to_q, to_g, _) = live_codes_at_slot_raw(
-                            live_codes, d, mse_len, qjl_len, to_slot, &quantizer,
-                        );
-                        let to_vec =
-                            quantizer.dequantize_single_no_parallel(&to_i, to_q, to_g as f64);
+                        let rec = vraw.get_slot(to_slot);
+                        let mut to_vec = Array1::<f64>::zeros(d);
+                        for i in 0..d {
+                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                            to_vec[i] = f32::from_le_bytes(bytes) as f64;
+                        }
                         (to, score_vectors_with_metric(&metric, &from_vec, &to_vec))
                     })
                     .collect()
@@ -708,7 +770,23 @@ impl TurboQuantEngine {
                 .collect();
             let meta_map = self.metadata.get_many(&slots)?;
             let mut out = Vec::with_capacity(ann.len());
-            for (node, approx_score) in ann {
+
+            // Batch-dequantize all candidates in parallel when reranking without raw vecs.
+            let deq_vecs: Vec<Array1<f64>> =
+                if self.rerank_enabled && self.live_vraw.is_none() {
+                    let encoded: Vec<(Vec<CodeIndex>, Vec<u8>, f64)> = slots
+                        .iter()
+                        .map(|&slot| {
+                            let (idx, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
+                            (idx, qjl.to_vec(), gamma as f64)
+                        })
+                        .collect();
+                    self.quantizer.dequantize_batch(&encoded)
+                } else {
+                    Vec::new()
+                };
+
+            for (i, (node, approx_score)) in ann.into_iter().enumerate() {
                 let slot = self.index_ids[node as usize];
                 let id = self.id_pool.get_str(slot).unwrap_or_default().to_string();
                 let meta = meta_map.get(&slot).cloned().unwrap_or_default();
@@ -718,11 +796,7 @@ impl TurboQuantEngine {
                         let raw_vec = self.live_raw_vector_at_slot(slot as usize);
                         score_vectors_with_metric(&self.metric, query, &raw_vec)
                     } else {
-                        // dequantize() applies inverse SRHT → d-dim original space.
-                        // query is also d-dim, so no rotation needed.
-                        let (indices, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
-                        let deq = self.quantizer.dequantize_single_no_parallel(&indices, qjl, gamma as f64);
-                        score_vectors_with_metric(&self.metric, query, &deq)
+                        score_vectors_with_metric(&self.metric, query, &deq_vecs[i])
                     }
                 } else {
                     approx_score
@@ -902,10 +976,30 @@ impl TurboQuantEngine {
             }
         }
 
-        let slots: Vec<u32> = results.iter().map(|OrderingWrapper(c)| c.id).collect();
+        // Drain to Vec for deterministic indexing (BinaryHeap iter/into_iter order
+        // is unspecified and may differ — Vec guarantees consistent order for the
+        // batch-dequantize index alignment below).
+        let candidates: Vec<OrderingWrapper> = results.into_iter().collect();
+        let slots: Vec<u32> = candidates.iter().map(|OrderingWrapper(c)| c.id).collect();
         let meta_map = self.metadata.get_many(&slots)?;
-        let mut out = Vec::with_capacity(results.len());
-        for OrderingWrapper(cand) in results {
+        let mut out = Vec::with_capacity(candidates.len());
+
+        // Batch-dequantize all rerank candidates in parallel when raw vecs unavailable.
+        let deq_vecs: Vec<Array1<f64>> =
+            if self.rerank_enabled && self.live_vraw.is_none() {
+                let encoded: Vec<(Vec<CodeIndex>, Vec<u8>, f64)> = slots
+                    .iter()
+                    .map(|&slot| {
+                        let (idx, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
+                        (idx, qjl.to_vec(), gamma as f64)
+                    })
+                    .collect();
+                self.quantizer.dequantize_batch(&encoded)
+            } else {
+                Vec::new()
+            };
+
+        for (i, OrderingWrapper(cand)) in candidates.into_iter().enumerate() {
             let id = self
                 .id_pool
                 .get_str(cand.id)
@@ -918,10 +1012,7 @@ impl TurboQuantEngine {
                     let raw_vec = self.live_raw_vector_at_slot(cand.id as usize);
                     score_vectors_with_metric(&self.metric, query, &raw_vec)
                 } else {
-                    // dequantize() applies inverse SRHT → d-dim original space.
-                    let (indices, qjl, gamma, _) = self.live_codes_at_slot(cand.id as usize);
-                    let deq = self.quantizer.dequantize_single_no_parallel(&indices, qjl, gamma as f64);
-                    score_vectors_with_metric(&self.metric, query, &deq)
+                    score_vectors_with_metric(&self.metric, query, &deq_vecs[i])
                 }
             } else {
                 cand.score
