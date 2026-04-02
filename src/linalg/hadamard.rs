@@ -139,14 +139,24 @@ pub fn inverse_srht(y: &[f32], signs: &[f32], out: &mut [f32]) {
     let n = d.next_power_of_two();
     assert_eq!(y.len(), n);
     assert!(signs.len() >= n);
-    
-    let mut temp = y.to_vec();
-    fwht(&mut temp);
-    
-    let norm = 1.0 / (n as f32).sqrt();
-    for i in 0..d {
-        out[i] = temp[i] * norm * signs[i];
+
+    // Thread-local temp buffer: avoids one heap allocation per dequantized vector,
+    // which matters when dequantize_batch is called for reranking candidates.
+    std::thread_local! {
+        static SRHT_TEMP: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
     }
+    SRHT_TEMP.with(|cell| {
+        let mut temp = cell.borrow_mut();
+        if temp.len() < n {
+            temp.resize(n, 0.0);
+        }
+        temp[..n].copy_from_slice(y);
+        fwht(&mut temp[..n]);
+        let norm = 1.0 / (n as f32).sqrt();
+        for i in 0..d {
+            out[i] = temp[i] * norm * signs[i];
+        }
+    });
 }
 
 #[cfg(test)]

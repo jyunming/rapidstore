@@ -742,6 +742,17 @@ impl TurboQuantEngine {
             } else {
                 top_k
             };
+
+            // Shared references captured by search closures. Using RefCell<Vec<u16>> for
+            // idx_buf lets the Fn closure reuse a single allocation across all candidate
+            // scorings instead of allocating a new Vec<CodeIndex> per call.
+            let mse_len = self.live_mse_len();
+            let qjl_len = self.live_qjl_len();
+            let qn = self.quantizer.n;
+            let live_codes_r = &self.live_codes;
+            let quantizer_r = &self.quantizer;
+            let idx_buf = std::cell::RefCell::new(vec![0u16; qn]);
+
             let ann = if matches!(self.metric, DistanceMetric::Ip) {
                 let prep = self.quantizer.prepare_ip_query(query);
                 let index_ids = &self.index_ids;
@@ -754,9 +765,14 @@ impl TurboQuantEngine {
                     sls.max(internal_k),
                     |node| {
                         let slot = index_ids[node as usize];
-                        let (indices, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
-                        self.quantizer
-                            .score_ip_encoded(&prep, &indices, qjl, gamma as f64)
+                        let rec = live_codes_r.get_slot(slot as usize);
+                        let qjl = &rec[mse_len..mse_len + qjl_len];
+                        let gamma = f32::from_le_bytes(
+                            rec[mse_len + qjl_len..mse_len + qjl_len + 4].try_into().unwrap(),
+                        );
+                        let mut buf = idx_buf.borrow_mut();
+                        quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut buf);
+                        quantizer_r.score_ip_encoded(&prep, &buf, qjl, gamma as f64)
                     },
                     slot_set
                         .map(|ss| move |node_idx: u32| ss.contains(&index_ids[node_idx as usize])),
@@ -774,11 +790,17 @@ impl TurboQuantEngine {
                     sls.max(internal_k),
                     |node| {
                         let slot = index_ids[node as usize];
-                        let (indices, qjl, gamma, doc_norm) =
-                            self.live_codes_at_slot(slot as usize);
-                        let ip =
-                            self.quantizer
-                                .score_ip_encoded(&prep, &indices, qjl, gamma as f64);
+                        let rec = live_codes_r.get_slot(slot as usize);
+                        let qjl = &rec[mse_len..mse_len + qjl_len];
+                        let gamma = f32::from_le_bytes(
+                            rec[mse_len + qjl_len..mse_len + qjl_len + 4].try_into().unwrap(),
+                        );
+                        let doc_norm = f32::from_le_bytes(
+                            rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].try_into().unwrap(),
+                        );
+                        let mut buf = idx_buf.borrow_mut();
+                        quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut buf);
+                        let ip = quantizer_r.score_ip_encoded(&prep, &buf, qjl, gamma as f64);
                         if query_norm > 0.0 && doc_norm > 0.0 {
                             ip / (query_norm * doc_norm as f64)
                         } else {
@@ -790,6 +812,7 @@ impl TurboQuantEngine {
                 )?
             } else {
                 let index_ids = &self.index_ids;
+                let metric_r = &self.metric;
                 let slot_set: Option<std::collections::HashSet<u32>> =
                     filter_slots.map(|s| s.into_iter().collect());
 
@@ -799,9 +822,17 @@ impl TurboQuantEngine {
                     sls.max(internal_k),
                     |node| {
                         let slot = index_ids[node as usize];
-                        let (indices, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
-                        let v = self.quantizer.dequantize(&indices, qjl, gamma as f64);
-                        score_vectors_with_metric(&self.metric, query, &v)
+                        let rec = live_codes_r.get_slot(slot as usize);
+                        let qjl = &rec[mse_len..mse_len + qjl_len];
+                        let gamma = f32::from_le_bytes(
+                            rec[mse_len + qjl_len..mse_len + qjl_len + 4].try_into().unwrap(),
+                        );
+                        let v = {
+                            let mut buf = idx_buf.borrow_mut();
+                            quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut buf);
+                            quantizer_r.dequantize(&buf, qjl, gamma as f64)
+                        };
+                        score_vectors_with_metric(metric_r, query, &v)
                     },
                     slot_set
                         .map(|ss| move |node_idx: u32| ss.contains(&index_ids[node_idx as usize])),
