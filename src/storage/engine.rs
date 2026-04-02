@@ -26,6 +26,25 @@ const LIVE_GAMMA_BYTES: usize = 4;
 const LIVE_NORM_BYTES: usize = 4;
 const LIVE_DELETED_BYTES: usize = 1;
 
+/// Controls whether `live_vectors.bin` is written for raw-vector reranking.
+///
+/// - `Disabled` (default): no file written; reranking uses dequantization (low RAM/disk).
+/// - `F32`: write raw f32 vectors; exact reranking, highest precision, +n×d×4 bytes.
+/// - `F16`: write raw f16 vectors; exact reranking, half of f32 RAM/disk.
+///
+/// Old databases without this field in manifest.json → serde default = `Disabled`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RerankPrecision {
+    /// No live_vectors.bin; reranking uses dequantization (low RAM/disk, current default).
+    #[default]
+    Disabled,
+    /// Write raw f32 vectors to live_vectors.bin (legacy/backward-compat option).
+    F32,
+    /// Write raw f16 vectors (~50% RAM/disk vs f32, <0.05% inner-product error at any dim).
+    F16,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DistanceMetric {
@@ -58,6 +77,10 @@ pub struct Manifest {
     pub fast_mode: bool,
     #[serde(default = "default_rerank_enabled")]
     pub rerank_enabled: bool,
+    /// Controls raw-vector rerank storage. Absent in old manifests → serde default = `Disabled`.
+    /// `F16`/`F32` create `live_vectors.bin` on new DBs for exact fast reranking.
+    #[serde(default)]
+    pub rerank_precision: RerankPrecision,
 }
 
 fn default_rerank_enabled() -> bool {
@@ -216,6 +239,20 @@ impl TurboQuantEngine {
         rerank: bool,
         fast_mode: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::open_with_options(uri, local_dir, d, b, seed, metric, rerank, fast_mode, RerankPrecision::F32)
+    }
+
+    pub fn open_with_options(
+        uri: &str,
+        local_dir: &str,
+        d: usize,
+        b: usize,
+        seed: u64,
+        metric: DistanceMetric,
+        rerank: bool,
+        fast_mode: bool,
+        rerank_precision: RerankPrecision,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(local_dir)?;
         let manifest_path = format!("{}/manifest.json", local_dir);
         let wal_path = format!("{}/wal.log", local_dir);
@@ -249,10 +286,19 @@ impl TurboQuantEngine {
                 index_state: None,
                 rerank_enabled: rerank,
                 fast_mode,
+                rerank_precision,
             };
             save_quantizer_state(local_dir, &backend, &q)?;
             m.save(&manifest_path)?;
             backend.write("manifest.json", &serde_json::to_vec_pretty(&m)?)?;
+            // Create an empty live_vectors.bin so that insert_batch can write raw vectors
+            // immediately. Only when the user explicitly opts into exact reranking.
+            if matches!(rerank_precision, RerankPrecision::F16 | RerankPrecision::F32) {
+                let vraw_path = Path::new(local_dir).join("live_vectors.bin");
+                if !vraw_path.exists() {
+                    std::fs::File::create(&vraw_path)?;
+                }
+            }
             (m, q)
         };
 
@@ -268,8 +314,15 @@ impl TurboQuantEngine {
         let stride = mse_len + qjl_len + LIVE_GAMMA_BYTES + LIVE_NORM_BYTES + LIVE_DELETED_BYTES;
         let live_codes = LiveCodesFile::open(Path::new(local_dir).join("live_codes.bin"), stride)?;
         let live_vraw_path = Path::new(local_dir).join("live_vectors.bin");
-        let live_vraw = if manifest.rerank_enabled && live_vraw_path.exists() {
-            Some(LiveCodesFile::open(live_vraw_path, manifest.d * 4)?)
+        let live_vraw = if manifest.rerank_enabled && live_vraw_path.exists() && !matches!(manifest.rerank_precision, RerankPrecision::Disabled) {
+            let vstride = match manifest.rerank_precision {
+                RerankPrecision::F16 => manifest.d * 2,
+                _ => manifest.d * 4,
+            };
+            let vraw = LiveCodesFile::open(live_vraw_path, vstride)?;
+            // Random-access pattern (ANN rerank reads scattered slots); hint to OS.
+            vraw.advise_random();
+            Some(vraw)
         } else {
             None
         };
@@ -483,6 +536,7 @@ impl TurboQuantEngine {
         let has_vraw = self.live_vraw.is_some();
         // Share live_vraw reference safely with the closure.
         let vraw_ref = self.live_vraw.as_ref();
+        let vraw_precision = self.manifest.rerank_precision;
 
         let qn = quantizer.n;
 
@@ -566,9 +620,16 @@ impl TurboQuantEngine {
                 let prep = if has_vraw {
                     let rec = vraw_ref.unwrap().get_slot(from_slot);
                     let mut out = Array1::<f64>::zeros(d);
-                    for i in 0..d {
-                        let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
-                        out[i] = f32::from_le_bytes(bytes) as f64;
+                    if matches!(vraw_precision, RerankPrecision::F16) {
+                        for i in 0..d {
+                            let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2].try_into().unwrap();
+                            out[i] = half::f16::from_le_bytes(bytes).to_f64();
+                        }
+                    } else {
+                        for i in 0..d {
+                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                            out[i] = f32::from_le_bytes(bytes) as f64;
+                        }
                     }
                     quantizer.prepare_ip_query_lite(&out)
                 } else {
@@ -594,9 +655,16 @@ impl TurboQuantEngine {
                 let (prep, from_norm) = if has_vraw {
                     let rec = vraw_ref.unwrap().get_slot(from_slot);
                     let mut out = Array1::<f64>::zeros(d);
-                    for i in 0..d {
-                        let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
-                        out[i] = f32::from_le_bytes(bytes) as f64;
+                    if matches!(vraw_precision, RerankPrecision::F16) {
+                        for i in 0..d {
+                            let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2].try_into().unwrap();
+                            out[i] = half::f16::from_le_bytes(bytes).to_f64();
+                        }
+                    } else {
+                        for i in 0..d {
+                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                            out[i] = f32::from_le_bytes(bytes) as f64;
+                        }
                     }
                     let norm = out.iter().map(|x| x * x).sum::<f64>().sqrt();
                     (quantizer.prepare_ip_query_lite(&out), norm)
@@ -1169,7 +1237,7 @@ impl TurboQuantEngine {
 
         self.live_codes = LiveCodesFile::open(live_codes_path, self.live_stride())?;
         if had_vraw {
-            self.live_vraw = Some(LiveCodesFile::open(live_vraw_path, self.d * 4)?);
+            self.live_vraw = Some(LiveCodesFile::open(live_vraw_path, self.live_vraw_stride())?);
         }
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_active_count() as u64;
@@ -1224,6 +1292,13 @@ impl TurboQuantEngine {
             + LIVE_NORM_BYTES
             + LIVE_DELETED_BYTES
     }
+    /// Bytes per slot in live_vectors.bin (raw rerank buffer).
+    fn live_vraw_stride(&self) -> usize {
+        match self.manifest.rerank_precision {
+            RerankPrecision::F16 => self.d * 2,
+            RerankPrecision::Disabled | RerankPrecision::F32 => self.d * 4,
+        }
+    }
     fn live_active_count(&self) -> usize {
         self.id_pool.active_count()
     }
@@ -1255,9 +1330,19 @@ impl TurboQuantEngine {
         };
         let rec = vraw.get_slot(slot);
         let mut out = Array1::zeros(self.d);
-        for i in 0..self.d {
-            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
-            out[i] = f32::from_le_bytes(bytes) as f64;
+        match self.manifest.rerank_precision {
+            RerankPrecision::F16 => {
+                for i in 0..self.d {
+                    let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2].try_into().unwrap();
+                    out[i] = half::f16::from_le_bytes(bytes).to_f64();
+                }
+            }
+            RerankPrecision::F32 | RerankPrecision::Disabled => {
+                for i in 0..self.d {
+                    let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                    out[i] = f32::from_le_bytes(bytes) as f64;
+                }
+            }
         }
         out
     }
@@ -1267,8 +1352,18 @@ impl TurboQuantEngine {
             return;
         };
         let rec = vraw.get_slot_mut(slot as usize);
-        for (i, &val) in vector.iter().enumerate() {
-            rec[i * 4..(i + 1) * 4].copy_from_slice(&val.to_le_bytes());
+        match self.manifest.rerank_precision {
+            RerankPrecision::F16 => {
+                for (i, &val) in vector.iter().enumerate() {
+                    let h = half::f16::from_f32(val);
+                    rec[i * 2..(i + 1) * 2].copy_from_slice(&h.to_le_bytes());
+                }
+            }
+            RerankPrecision::F32 | RerankPrecision::Disabled => {
+                for (i, &val) in vector.iter().enumerate() {
+                    rec[i * 4..(i + 1) * 4].copy_from_slice(&val.to_le_bytes());
+                }
+            }
         }
     }
 
@@ -1335,7 +1430,7 @@ impl TurboQuantEngine {
 
     fn live_compact_slab(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let stride = self.live_stride();
-        let vstride = self.d * 4;
+        let vstride = self.live_vraw_stride();
         let temp_path = Path::new(&self.local_dir).join("live_codes.bin.tmp");
         let vtemp_path = Path::new(&self.local_dir).join("live_vectors.bin.tmp");
 

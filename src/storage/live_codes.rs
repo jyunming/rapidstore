@@ -99,6 +99,17 @@ impl LiveCodesFile {
         self.mmap = None; // needed on Windows before replacing the underlying file
     }
 
+    /// Hint the OS that this mmap will be accessed randomly (not sequentially).
+    /// Disables read-ahead on Linux, reducing page-cache pressure for sparse ANN lookups.
+    /// No-op on platforms that don't support madvise.
+    #[allow(unused_variables)]
+    pub fn advise_random(&self) {
+        #[cfg(unix)]
+        if let Some(mmap) = &self.mmap {
+            let _ = mmap.advise(memmap2::Advice::Random);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::storage::engine::{
-    BatchWriteItem, BatchWriteMode, DistanceMetric, GetResult, TurboQuantEngine,
+    BatchWriteItem, BatchWriteMode, DistanceMetric, GetResult, RerankPrecision, TurboQuantEngine,
 };
 
 #[pyclass]
@@ -18,7 +18,7 @@ pub struct Database {
 #[pymethods]
 impl Database {
     #[staticmethod]
-    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false))]
+    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None))]
     fn open(
         path: String,
         dimension: usize,
@@ -27,6 +27,7 @@ impl Database {
         metric: &str,
         rerank: bool,
         fast_mode: bool,
+        rerank_precision: Option<&str>,
     ) -> PyResult<Self> {
         let dist_metric = match metric.to_lowercase().as_str() {
             "ip" => DistanceMetric::Ip,
@@ -40,7 +41,20 @@ impl Database {
             }
         };
 
-        let engine = TurboQuantEngine::open_with_metric_and_rerank(
+        let precision = match rerank_precision.map(|s| s.to_lowercase()) {
+            None => RerankPrecision::Disabled,
+            Some(ref s) if s == "none" || s == "disabled" || s == "dequant" => RerankPrecision::Disabled,
+            Some(ref s) if s == "f16" || s == "half" => RerankPrecision::F16,
+            Some(ref s) if s == "f32" || s == "float" || s == "full" => RerankPrecision::F32,
+            Some(ref s) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid rerank_precision: '{}'. Use 'f16', 'f32', or None (dequant reranking).",
+                    s
+                )));
+            }
+        };
+
+        let engine = TurboQuantEngine::open_with_options(
             &path,
             &path,
             dimension,
@@ -49,6 +63,7 @@ impl Database {
             dist_metric,
             rerank,
             fast_mode,
+            precision,
         )
         .map_err(to_py_runtime)?;
         Ok(Self {

@@ -21,6 +21,7 @@ bincode = "1.3.3"
 
 # --- Storage Layer ---
 memmap2 = "0.9"
+half = { version = "2", features = ["bytemuck"] }
 redb = "2.0"
 ulid = { version = "1.1", features = ["serde"] }
 url = "2.5"
