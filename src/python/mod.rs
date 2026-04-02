@@ -113,7 +113,7 @@ impl Database {
                 for j in i..end {
                     chunk_items.push(BatchWriteItem {
                         id: ids[j].clone(),
-                        vector: matrix.row(j).mapv(|x| x as f64),
+                        vector: matrix.row(j).to_vec(),
                         metadata: metas[j].clone(),
                         document: docs[j].clone(),
                     });
@@ -141,7 +141,7 @@ impl Database {
                 for j in i..end {
                     chunk_items.push(BatchWriteItem {
                         id: ids[j].clone(),
-                        vector: matrix.row(j).to_owned(),
+                        vector: matrix.row(j).iter().map(|&x| x as f32).collect(),
                         metadata: metas[j].clone(),
                         document: docs[j].clone(),
                     });

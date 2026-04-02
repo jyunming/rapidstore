@@ -1,12 +1,25 @@
 use serde::{Deserialize, Serialize};
 
 use crate::quantizer::CodeIndex;
+use crate::quantizer::prod::ProdQuantizer;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const WAL_MAGIC: &[u8; 4] = b"TQWV";
-const WAL_VERSION: u32 = 2;
+const WAL_VERSION: u32 = 3;
+
+/// On-disk V3 entry — MSE indices stored as bit-packed bytes.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct WalEntryPacked {
+    pub id: String,
+    pub packed_mse: Vec<u8>,
+    pub qjl_bits: Vec<u8>,
+    pub gamma: f32,
+    pub metadata_json: String,
+    #[serde(default)]
+    pub is_deleted: bool,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WalEntry {
@@ -37,6 +50,7 @@ pub struct Wal {
     path: PathBuf,
     writer: BufWriter<File>,
     entry_count: u64,
+    quantizer: Option<std::sync::Arc<ProdQuantizer>>,
 }
 
 impl Wal {
@@ -54,7 +68,13 @@ impl Wal {
             path,
             writer: BufWriter::new(file),
             entry_count: 0,
+            quantizer: None,
         })
+    }
+
+    /// Set the quantizer used for packing/unpacking indices (V3 format).
+    pub fn set_quantizer(&mut self, q: std::sync::Arc<ProdQuantizer>) {
+        self.quantizer = Some(q);
     }
 
     pub fn append(
@@ -77,7 +97,19 @@ impl Wal {
             return Ok(());
         }
         for entry in entries {
-            let encoded = bincode::serialize(entry)?;
+            let encoded = if let Some(q) = &self.quantizer {
+                let packed = WalEntryPacked {
+                    id: entry.id.clone(),
+                    packed_mse: q.pack_mse_indices(&entry.quantized_indices),
+                    qjl_bits: entry.qjl_bits.clone(),
+                    gamma: entry.gamma,
+                    metadata_json: entry.metadata_json.clone(),
+                    is_deleted: entry.is_deleted,
+                };
+                bincode::serialize(&packed)?
+            } else {
+                bincode::serialize(entry)?
+            };
             let len = encoded.len() as u64;
             self.writer.write_all(&len.to_le_bytes())?;
             self.writer.write_all(&encoded)?;
@@ -98,6 +130,7 @@ impl Wal {
 
     pub fn replay<P: AsRef<Path>>(
         path: P,
+        quantizer: Option<&ProdQuantizer>,
     ) -> Result<Vec<WalEntry>, Box<dyn std::error::Error + Send + Sync>> {
         let path = path.as_ref();
         if !path.exists() {
@@ -133,7 +166,27 @@ impl Wal {
                 Err(_) => break,
             }
 
-            if has_header && version == 2 {
+            if has_header && version == 3 {
+                // V3: packed MSE indices
+                if let Ok(packed) = bincode::deserialize::<WalEntryPacked>(&payload) {
+                    let quantized_indices = if let Some(q) = quantizer {
+                        let mut idx = vec![0 as CodeIndex; q.n];
+                        q.unpack_mse_indices(&packed.packed_mse, &mut idx);
+                        idx
+                    } else {
+                        // No quantizer: store raw packed bytes as zero-length (shouldn't happen)
+                        Vec::new()
+                    };
+                    entries.push(WalEntry {
+                        id: packed.id,
+                        quantized_indices,
+                        qjl_bits: packed.qjl_bits,
+                        gamma: packed.gamma,
+                        metadata_json: packed.metadata_json,
+                        is_deleted: packed.is_deleted,
+                    });
+                }
+            } else if has_header && version == 2 {
                 if let Ok(entry) = bincode::deserialize::<WalEntry>(&payload) {
                     entries.push(entry);
                 }
@@ -165,3 +218,6 @@ impl Wal {
         self.entry_count
     }
 }
+
+
+

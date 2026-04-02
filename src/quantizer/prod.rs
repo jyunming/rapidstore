@@ -1,4 +1,3 @@
-use nalgebra::DMatrix;
 use ndarray::Array1;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -299,7 +298,7 @@ impl ProdQuantizer {
         (mse_sum + (gamma as f32) * prep.qjl_scale * qjl_sum) as f64
     }
 
-    pub fn quantize(&self, x: &Array1<f64>) -> (Vec<CodeIndex>, Vec<u8>, f64) {
+    pub fn quantize(&self, x: &[f32]) -> (Vec<CodeIndex>, Vec<u8>, f64) {
         let idx = self.mse_quantizer.quantize(x);
 
         if self.fast_mode {
@@ -312,7 +311,7 @@ impl ProdQuantizer {
         let mut residual = Array1::zeros(self.d);
         let mut gamma_sq = 0.0f64;
         for i in 0..self.d {
-            let rv = x[i] - x_tilde_mse[i];
+            let rv = x[i] as f64 - x_tilde_mse[i];
             residual[i] = rv;
             gamma_sq += rv * rv;
         }
@@ -322,7 +321,7 @@ impl ProdQuantizer {
         (idx, qjl, gamma)
     }
 
-    pub fn quantize_batch(&self, xs: &[Array1<f64>]) -> Vec<(Vec<CodeIndex>, Vec<u8>, f64)> {
+    pub fn quantize_batch(&self, xs: &[&[f32]]) -> Vec<(Vec<CodeIndex>, Vec<u8>, f64)> {
         xs.par_iter().map(|x| self.quantize(x)).collect()
     }
 

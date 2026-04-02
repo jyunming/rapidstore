@@ -53,11 +53,10 @@ impl MseQuantizer {
         inverse_srht(y, &self.rotation_signs, out);
     }
 
-    pub fn quantize(&self, x: &Array1<f64>) -> Vec<CodeIndex> {
+    pub fn quantize(&self, x: &[f32]) -> Vec<CodeIndex> {
         assert_eq!(x.len(), self.d);
-        let x_f32: Vec<f32> = x.iter().map(|&v| v as f32).collect();
         let mut y = vec![0.0f32; self.n];
-        self.apply_rotation(&x_f32, &mut y);
+        self.apply_rotation(x, &mut y);
 
         let mut indices = vec![0 as CodeIndex; self.n];
         for i in 0..self.n {

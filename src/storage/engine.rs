@@ -99,7 +99,7 @@ impl Manifest {
 #[derive(Debug, Clone)]
 pub struct BatchWriteItem {
     pub id: String,
-    pub vector: Array1<f64>,
+    pub vector: Vec<f32>,
     pub metadata: HashMap<String, JsonValue>,
     pub document: Option<String>,
 }
@@ -256,7 +256,8 @@ impl TurboQuantEngine {
             (m, q)
         };
 
-        let wal = Wal::open(&wal_path)?;
+        let mut wal = Wal::open(&wal_path)?;
+        wal.set_quantizer(std::sync::Arc::new(quantizer.clone()));
         let segments = SegmentManager::open(backend.clone())?;
         let metadata = MetadataStore::open(&metadata_path)?;
         let graph = GraphManager::open(backend.clone(), local_dir)?;
@@ -304,7 +305,7 @@ impl TurboQuantEngine {
             );
         }
 
-        let pending = Wal::replay(&wal_path)?;
+        let pending = Wal::replay(&wal_path, Some(&engine.quantizer))?;
         if !pending.is_empty() {
             engine.wal_buffer.extend(pending);
             engine.flush_wal_to_segment()?;
@@ -1173,14 +1174,13 @@ impl TurboQuantEngine {
         out
     }
 
-    fn live_save_raw_vector(&mut self, slot: u32, vector: &Array1<f64>) {
+    fn live_save_raw_vector(&mut self, slot: u32, vector: &[f32]) {
         let Some(vraw) = &mut self.live_vraw else {
             return;
         };
         let rec = vraw.get_slot_mut(slot as usize);
         for (i, &val) in vector.iter().enumerate() {
-            let bytes = (val as f32).to_le_bytes();
-            rec[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
+            rec[i * 4..(i + 1) * 4].copy_from_slice(&val.to_le_bytes());
         }
     }
 
@@ -1401,8 +1401,9 @@ impl TurboQuantEngine {
         document: Option<String>,
         is_deleted: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let (indices, qjl, gamma) = self.quantizer.quantize(vector);
-        let norm = vector.iter().map(|x| x * x).sum::<f64>().sqrt() as f32;
+        let vec_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
+        let (indices, qjl, gamma) = self.quantizer.quantize(&vec_f32);
+        let norm = vec_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
         let meta = VectorMetadata {
             properties: metadata,
             document,
@@ -1425,7 +1426,7 @@ impl TurboQuantEngine {
                 entry.gamma,
                 norm,
             );
-            self.live_save_raw_vector(slot, vector);
+            self.live_save_raw_vector(slot, &vec_f32);
             self.metadata.put(slot, &meta)?;
         }
         self.invalidate_index_state()?;
@@ -1445,10 +1446,10 @@ impl TurboQuantEngine {
         for chunk in items.chunks(5000) {
             let mut wal_entries = Vec::with_capacity(chunk.len());
             let mut metadata_entries: Vec<(u32, VectorMetadata)> = Vec::with_capacity(chunk.len());
-            let vectors: Vec<_> = chunk.iter().map(|i| i.vector.clone()).collect();
-            let quantized = self.quantizer.quantize_batch(&vectors);
+            let vec_refs: Vec<&[f32]> = chunk.iter().map(|i| i.vector.as_slice()).collect();
+            let quantized = self.quantizer.quantize_batch(&vec_refs);
 
-            for (i, (item, (indices, qjl, gamma))) in chunk.iter().zip(quantized).enumerate() {
+            for (_i, (item, (indices, qjl, gamma))) in chunk.iter().zip(quantized).enumerate() {
                 match mode {
                     BatchWriteMode::Insert if self.id_pool.contains(&item.id) => {
                         return Err(format!("ID '{}' already exists", item.id).into());
@@ -1458,7 +1459,7 @@ impl TurboQuantEngine {
                     }
                     _ => {}
                 }
-                let norm = vectors[i].iter().map(|x| x * x).sum::<f64>().sqrt() as f32;
+                let norm = item.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
                 let meta = VectorMetadata {
                     properties: item.metadata.clone(),
                     document: item.document.clone(),
@@ -1478,7 +1479,7 @@ impl TurboQuantEngine {
                     entry.gamma,
                     norm,
                 );
-                self.live_save_raw_vector(slot, &vectors[i]);
+                self.live_save_raw_vector(slot, &item.vector);
                 metadata_entries.push((slot, meta));
                 wal_entries.push(entry);
             }
