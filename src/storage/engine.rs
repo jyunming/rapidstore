@@ -464,6 +464,7 @@ impl TurboQuantEngine {
         ef_construction: usize,
         search_list_size: usize,
         alpha: f64,
+        n_refinements: usize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.flush_wal_to_segment()?;
         let mut id_slot_pairs = self.live_iter_id_slots();
@@ -482,6 +483,42 @@ impl TurboQuantEngine {
         let has_vraw = self.live_vraw.is_some();
         // Share live_vraw reference safely with the closure.
         let vraw_ref = self.live_vraw.as_ref();
+
+        let qn = quantizer.n;
+
+        // Pre-cache all encoded vectors for IP/Cosine metrics into flat contiguous arrays.
+        // Avoids O(n × candidates × refinements) heap allocations and random slab reads
+        // that live_codes_at_slot_raw() would otherwise incur per scoring call.
+        let (all_mse, all_qjl_flat, all_gamma, all_norm) =
+            if matches!(self.metric, DistanceMetric::Ip | DistanceMetric::Cosine) {
+                let n_indexed = indexed_slots.len();
+                let mut mse_buf = vec![0u16; n_indexed * qn];
+                let mut qjl_buf = vec![0u8; n_indexed * qjl_len];
+                let mut gamma_buf = vec![0.0f32; n_indexed];
+                let mut norm_buf = vec![0.0f32; n_indexed];
+                for (i, &slot) in indexed_slots.iter().enumerate() {
+                    let rec = live_codes.get_slot(slot as usize);
+                    quantizer
+                        .unpack_mse_indices(&rec[..mse_len], &mut mse_buf[i * qn..(i + 1) * qn]);
+                    if qjl_len > 0 {
+                        qjl_buf[i * qjl_len..(i + 1) * qjl_len]
+                            .copy_from_slice(&rec[mse_len..mse_len + qjl_len]);
+                    }
+                    gamma_buf[i] = f32::from_le_bytes(
+                        rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    norm_buf[i] = f32::from_le_bytes(
+                        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                            .try_into()
+                            .unwrap(),
+                    );
+                }
+                (mse_buf, qjl_buf, gamma_buf, norm_buf)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            };
 
         // For L2/other metrics without raw vectors: pre-compute all dequantized vectors in
         // parallel before the build loop so each `to` node is dequantized at most once instead
@@ -513,11 +550,13 @@ impl TurboQuantEngine {
             };
 
         let build_scorer = move |from: u32, candidates: &[u32]| -> Vec<(u32, f64)> {
-            let from_slot = slots_ref[from as usize] as usize;
+            let from_idx = from as usize;
+            let from_slot = slots_ref[from_idx] as usize;
 
             if matches!(metric, DistanceMetric::Ip) {
                 // For IP: prepare from-query via O(n) centroid lookup (no SRHT) when raw
                 // vectors are unavailable. When vraw is present, use exact rotation.
+                // In both cases, `to` candidates use pre-cached encoded data.
                 let prep = if has_vraw {
                     let rec = vraw_ref.unwrap().get_slot(from_slot);
                     let mut out = Array1::<f64>::zeros(d);
@@ -527,20 +566,18 @@ impl TurboQuantEngine {
                     }
                     quantizer.prepare_ip_query_lite(&out)
                 } else {
-                    let (from_i, _, _, _) = live_codes_at_slot_raw(
-                        live_codes, d, mse_len, qjl_len, from_slot, &quantizer,
-                    );
-                    // O(n) centroid lookup — skips 3 SRHT ops vs dequantize+rotate path.
-                    quantizer.prepare_ip_query_from_codes(&from_i)
+                    // O(n) centroid lookup from pre-cached MSE indices.
+                    let from_i = &all_mse[from_idx * qn..(from_idx + 1) * qn];
+                    quantizer.prepare_ip_query_from_codes(from_i)
                 };
                 candidates
                     .iter()
                     .map(|&to| {
-                        let to_slot = slots_ref[to as usize] as usize;
-                        let (to_i, to_q, to_g, _) = live_codes_at_slot_raw(
-                            live_codes, d, mse_len, qjl_len, to_slot, &quantizer,
-                        );
-                        (to, quantizer.score_ip_encoded_lite(&prep, &to_i, to_q, to_g as f64))
+                        let to_idx = to as usize;
+                        let to_i = &all_mse[to_idx * qn..(to_idx + 1) * qn];
+                        let to_q = &all_qjl_flat[to_idx * qjl_len..(to_idx + 1) * qjl_len];
+                        let to_g = all_gamma[to_idx];
+                        (to, quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64))
                     })
                     .collect()
             } else if matches!(metric, DistanceMetric::Cosine) {
@@ -554,21 +591,21 @@ impl TurboQuantEngine {
                     let norm = out.iter().map(|x| x * x).sum::<f64>().sqrt();
                     (quantizer.prepare_ip_query_lite(&out), norm)
                 } else {
-                    // Use stored norm + centroid lookup — no SRHT needed.
-                    let (from_i, _, _, from_n) = live_codes_at_slot_raw(
-                        live_codes, d, mse_len, qjl_len, from_slot, &quantizer,
-                    );
-                    (quantizer.prepare_ip_query_from_codes(&from_i), from_n as f64)
+                    // Use stored norm + centroid lookup from pre-cached data.
+                    let from_i = &all_mse[from_idx * qn..(from_idx + 1) * qn];
+                    let from_norm = all_norm[from_idx] as f64;
+                    (quantizer.prepare_ip_query_from_codes(from_i), from_norm)
                 };
                 candidates
                     .iter()
                     .map(|&to| {
-                        let to_slot = slots_ref[to as usize] as usize;
-                        let (to_i, to_q, to_g, to_n) = live_codes_at_slot_raw(
-                            live_codes, d, mse_len, qjl_len, to_slot, &quantizer,
-                        );
+                        let to_idx = to as usize;
+                        let to_i = &all_mse[to_idx * qn..(to_idx + 1) * qn];
+                        let to_q = &all_qjl_flat[to_idx * qjl_len..(to_idx + 1) * qjl_len];
+                        let to_g = all_gamma[to_idx];
+                        let to_n = all_norm[to_idx];
                         let ip =
-                            quantizer.score_ip_encoded_lite(&prep, &to_i, to_q, to_g as f64);
+                            quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64);
                         let score = if from_norm > 0.0 && to_n > 0.0 {
                             ip / (from_norm * to_n as f64)
                         } else {
@@ -580,7 +617,7 @@ impl TurboQuantEngine {
             } else if !precomputed_l2.is_empty() {
                 // L2 without raw vecs: use pre-computed dequantized vectors (no per-call
                 // SRHT — each vector was dequantized exactly once in parallel above).
-                let from_vec = &precomputed_l2[from as usize];
+                let from_vec = &precomputed_l2[from_idx];
                 candidates
                     .iter()
                     .map(|&to| {
@@ -613,8 +650,14 @@ impl TurboQuantEngine {
             }
         };
 
-        self.graph
-            .build(indexed_slots.len(), max_degree, ef_construction, alpha, build_scorer)?;
+        self.graph.build(
+            indexed_slots.len(),
+            max_degree,
+            ef_construction,
+            n_refinements,
+            alpha,
+            build_scorer,
+        )?;
         self.index_ids = indexed_slots;
         self.index_ids_dirty = true;
         self.manifest.index_state = Some(IndexState {
@@ -1576,30 +1619,6 @@ fn load_index_ids(local_dir: &str) -> Result<Vec<u32>, Box<dyn std::error::Error
         return Ok(serde_json::from_slice(&std::fs::read(&local)?)?);
     }
     Ok(Vec::new())
-}
-
-fn live_codes_at_slot_raw<'a>(
-    live_codes: &'a LiveCodesFile,
-    _d_unused: usize,
-    mse_len: usize,
-    qjl_len: usize,
-    slot: usize,
-    quantizer: &ProdQuantizer,
-) -> (Vec<CodeIndex>, &'a [u8], f32, f32) {
-    let rec = live_codes.get_slot(slot);
-    let mut indices = vec![0 as CodeIndex; quantizer.n];
-    quantizer.unpack_mse_indices(&rec[0..mse_len], &mut indices);
-    let gamma = f32::from_le_bytes(
-        rec[mse_len + qjl_len..mse_len + qjl_len + 4]
-            .try_into()
-            .unwrap(),
-    );
-    let norm = f32::from_le_bytes(
-        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-            .try_into()
-            .unwrap(),
-    );
-    (indices, &rec[mse_len..mse_len + qjl_len], gamma, norm)
 }
 
 fn metadata_matches_filter(

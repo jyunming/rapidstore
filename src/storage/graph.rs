@@ -269,6 +269,7 @@ impl GraphManager {
         n: usize,
         max_degree: usize,
         ef_construction: usize,
+        n_refinements: usize,
         _alpha: f64,
         build_scorer: impl Fn(u32, &[u32]) -> Vec<(u32, f64)> + Sync,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -278,7 +279,7 @@ impl GraphManager {
         let m = (max_degree / 2).max(4);
         let m0 = max_degree.min(MAX_DEGREE);
         let level_mult = 1.0 / (m as f64).ln();
-        let cand_pool = ef_construction.max(512); 
+        let cand_pool = ef_construction;
 
         let mut node_levels = vec![0u32; n];
         let mut max_l = 0u32;
@@ -324,8 +325,8 @@ impl GraphManager {
                 adjacency[i as usize][l as usize] = level_adj[idx].clone();
             }
             
-            // Multiple refinement iterations
-            for _ in 0..8 {
+            // Multiple refinement iterations (nn-descent style)
+            for _ in 0..n_refinements {
                 let next_level_adj: Vec<Vec<u32>> = level_nodes.par_iter().map(|&i| {
                     let mut candidates = HashSet::new();
                     for &nb in &adjacency[i as usize][l as usize] {

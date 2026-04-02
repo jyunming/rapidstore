@@ -295,7 +295,7 @@ impl Database {
         Ok(py_list.into())
     }
 
-    #[pyo3(signature = (max_degree=None, ef_construction=None, search_list_size=None, alpha=None))]
+    #[pyo3(signature = (max_degree=None, ef_construction=None, search_list_size=None, alpha=None, n_refinements=None))]
     fn create_index(
         &self,
         py: Python<'_>,
@@ -303,6 +303,7 @@ impl Database {
         ef_construction: Option<usize>,
         search_list_size: Option<usize>,
         alpha: Option<f64>,
+        n_refinements: Option<usize>,
     ) -> PyResult<()> {
         py.allow_threads(|| {
             let mut engine = self.engine.write().unwrap();
@@ -312,6 +313,7 @@ impl Database {
                     ef_construction.unwrap_or(200),
                     search_list_size.unwrap_or(128),
                     alpha.unwrap_or(1.2),
+                    n_refinements.unwrap_or(5),
                 )
                 .map_err(to_py_runtime)
         })
