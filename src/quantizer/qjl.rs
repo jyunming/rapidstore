@@ -9,6 +9,28 @@ use std::f32::consts::PI;
 
 use crate::linalg::hadamard::srht;
 
+/// QJL (Quantized Johnson-Lindenstrauss) residual quantizer.
+///
+/// Captures the MSE residual using a single-bit random projection.
+///
+/// ## Algorithm
+///
+/// Given residual `r = x - dequant(mse(x))`:
+///
+/// 1. Apply SRHT: `s = H * D * (r, 0)` (pad to next power of two)
+/// 2. Store `sign(s[i])` as a 1-bit value, bit-packed into `ceil(n/8)` bytes
+/// 3. A scaling factor `gamma = sqrt(n / d) * ||x||₂` (stored as f32) unbiases the
+///    inner-product estimate during scoring
+///
+/// ## Scoring
+///
+/// For query `q` and encoded vector `z`, the inner product estimate is:
+/// ```text
+/// <x, q> ≈ mse_score(mse(x), mse(q)) + gamma * qjl_score(z, qjl(q))
+/// ```
+/// where `qjl_score` is the normalized Hamming distance scaled by `1/sqrt(n)`.
+///
+/// See the TurboQuant paper (arXiv:2504.19874, Section 3) for the unbiasedness proof.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct QjlQuantizer {
     pub d: usize,

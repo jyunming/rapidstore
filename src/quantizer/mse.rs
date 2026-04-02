@@ -10,6 +10,23 @@ use super::CodeIndex;
 use super::codebook::lloyd_max;
 use crate::linalg::hadamard::{srht, inverse_srht};
 
+/// MSE (Mean Squared Error) scalar quantizer using SRHT rotation + Lloyd-Max codebook.
+///
+/// ## Algorithm
+///
+/// 1. **SRHT rotation**: apply `H * D * (x, 0)` where `H` is the Walsh-Hadamard matrix
+///    and `D` is a seeded random diagonal ±1 matrix. This decorrelates the input and
+///    makes the per-dimension variance uniform — a prerequisite for scalar quantization.
+///
+/// 2. **Lloyd-Max encoding**: each rotated dimension is quantized independently using
+///    a precomputed optimal scalar codebook (1D centroids). For `b` bits of MSE budget,
+///    each dimension gets `b-1` bits → `2^(b-1)` centroids.
+///
+/// 3. **Dequantization**: reverse by looking up centroids + inverse SRHT to recover
+///    an approximation of the original vector in the original space.
+///
+/// The codebook is **data-oblivious**: generated once from a Gaussian prior using the
+/// `lloyd_max` function, seeded deterministically. No training data required.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MseQuantizer {
     pub d: usize,

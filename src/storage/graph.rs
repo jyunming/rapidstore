@@ -8,6 +8,28 @@ use std::sync::Arc;
 
 use super::backend::StorageBackend;
 
+/// HNSW (Hierarchical Navigable Small World) graph index for approximate nearest-neighbour search.
+///
+/// ## Format
+///
+/// The graph is stored in `graph.bin` with a V3 binary format (magic `TQG3`):
+/// - 4-byte magic + header (entry point, max level, node count, max degree)
+/// - Per-node adjacency lists: `[count: u8, neighbors: [u32; count]]`
+///
+/// Offsets into the file are precomputed at open time for O(1) node lookup.
+///
+/// ## Construction
+///
+/// Built via `GraphManager::build_index()` using a greedy beam-search algorithm:
+/// for each new node, find the `search_list_size` nearest existing nodes, then
+/// connect it to the `max_degree` best ones and optionally run `n_refinements`
+/// passes to improve graph connectivity.
+///
+/// ## Search
+///
+/// `beam_search()` performs greedy traversal from the entry point, maintaining a
+/// priority queue of candidates and a visited set. Returns a sorted list of
+/// `SearchCandidate` structs (slot id + score).
 pub const MAX_DEGREE: usize = 127;
 const GRAPH_V3_MAGIC: &[u8; 4] = b"TQG3";
 

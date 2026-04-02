@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::backend::StorageBackend;
+use super::compaction::Compactor;
 use super::graph::{GraphManager, OrderingWrapper, SearchCandidate};
 use super::id_pool::IdPool;
 use super::live_codes::LiveCodesFile;
@@ -239,7 +240,8 @@ impl TurboQuantEngine {
         rerank: bool,
         fast_mode: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::open_with_options(uri, local_dir, d, b, seed, metric, rerank, fast_mode, RerankPrecision::F32)
+        let precision = if rerank { RerankPrecision::F32 } else { RerankPrecision::Disabled };
+        Self::open_with_options(uri, local_dir, d, b, seed, metric, rerank, fast_mode, precision)
     }
 
     pub fn open_with_options(
@@ -262,10 +264,28 @@ impl TurboQuantEngine {
 
         let (manifest, quantizer) = if Path::new(&manifest_path).exists() {
             let m = Manifest::load(&manifest_path)?;
+            if m.d != d {
+                return Err(format!("dimension mismatch: manifest has d={}, requested d={}", m.d, d).into());
+            }
+            if m.b != b {
+                return Err(format!("bits mismatch: manifest has b={}, requested b={}", m.b, b).into());
+            }
+            if m.metric != metric {
+                return Err(format!("metric mismatch: manifest has {:?}, requested {:?}", m.metric, metric).into());
+            }
             let q = load_quantizer_state(local_dir, &backend)?;
             (m, q)
         } else if let Ok(data) = backend.read("manifest.json") {
             let m: Manifest = serde_json::from_slice(&data)?;
+            if m.d != d {
+                return Err(format!("dimension mismatch: manifest has d={}, requested d={}", m.d, d).into());
+            }
+            if m.b != b {
+                return Err(format!("bits mismatch: manifest has b={}, requested b={}", m.b, b).into());
+            }
+            if m.metric != metric {
+                return Err(format!("metric mismatch: manifest has {:?}, requested {:?}", m.metric, metric).into());
+            }
             let q = load_quantizer_state(local_dir, &backend)?;
             (m, q)
         } else {
@@ -304,6 +324,8 @@ impl TurboQuantEngine {
 
         let mut wal = Wal::open(&wal_path)?;
         wal.set_quantizer(std::sync::Arc::new(quantizer.clone()));
+        // Recover from any interrupted compaction before loading segments.
+        Compactor::new(backend.clone()).recover_if_needed()?;
         let segments = SegmentManager::open(backend.clone())?;
         let metadata = MetadataStore::open(&metadata_path)?;
         let graph = GraphManager::open(backend.clone(), local_dir)?;
@@ -350,21 +372,69 @@ impl TurboQuantEngine {
             rerank_enabled: manifest.rerank_enabled,
         };
 
-        if let Ok(id_pool) = load_id_pool(local_dir, &engine.backend) {
-            engine.id_pool = id_pool;
-        } else if engine.live_codes.len() > 0 {
-            return Err(
-                "live_ids.bin missing; cannot rebuild id_pool without legacy segment data".into(),
-            );
-        }
+        let id_pool_loaded = if let Ok(ip) = load_id_pool(local_dir, &engine.backend) {
+            engine.id_pool = ip;
+            true
+        } else {
+            false
+        };
 
         let pending = Wal::replay(&wal_path, Some(&engine.quantizer))?;
         if !pending.is_empty() {
+            if !id_pool_loaded {
+                // live_ids.bin is missing (unclean shutdown). Rebuild live_codes and
+                // id_pool entirely from the WAL entries so we have a consistent base
+                // before flush_wal_to_segment compacts and persists everything.
+                engine.live_codes.clear()?;
+                if let Some(vraw) = &mut engine.live_vraw {
+                    vraw.clear()?;
+                }
+                engine.id_pool = IdPool::new();
+                let mse_len = engine.live_mse_len();
+                let qjl_len = engine.live_qjl_len();
+                for entry in &pending {
+                    if entry.is_deleted || entry.quantized_indices.is_empty() {
+                        continue; // deletions handled by flush_wal_to_segment
+                    }
+                    let packed_mse = engine.quantizer.pack_mse_indices(&entry.quantized_indices);
+                    let slot = if let Some(s) = engine.id_pool.get_slot(&entry.id) {
+                        // upsert: overwrite existing slot
+                        let rec = engine.live_codes.get_slot_mut(s as usize);
+                        rec[0..mse_len].copy_from_slice(&packed_mse);
+                        rec[mse_len..mse_len + qjl_len].copy_from_slice(&entry.qjl_bits);
+                        rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                            .copy_from_slice(&entry.gamma.to_le_bytes());
+                        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                            .copy_from_slice(&0.0_f32.to_le_bytes()); // norm not in WAL
+                        rec[mse_len + qjl_len + 8] = 0u8;
+                        s
+                    } else {
+                        // insert: alloc new slot
+                        let s = engine.id_pool.insert(&entry.id);
+                        let new_slot = engine.live_codes.alloc_slot()?;
+                        debug_assert_eq!(s as usize, new_slot);
+                        let rec = engine.live_codes.get_slot_mut(new_slot);
+                        rec[0..mse_len].copy_from_slice(&packed_mse);
+                        rec[mse_len..mse_len + qjl_len].copy_from_slice(&entry.qjl_bits);
+                        rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                            .copy_from_slice(&entry.gamma.to_le_bytes());
+                        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                            .copy_from_slice(&0.0_f32.to_le_bytes()); // norm not in WAL
+                        rec[mse_len + qjl_len + 8] = 0u8;
+                        s
+                    };
+                    if let Ok(meta) =
+                        serde_json::from_str::<VectorMetadata>(&entry.metadata_json)
+                    {
+                        let _ = engine.metadata.put(slot, &meta);
+                    }
+                }
+            }
             engine.wal_buffer.extend(pending);
             engine.flush_wal_to_segment()?;
-        } else if engine.id_pool.active_count() == 0 && engine.live_codes.len() > 0 {
+        } else if !id_pool_loaded && engine.live_codes.len() > 0 {
             return Err(
-                "live_ids.bin missing; cannot rebuild id_pool without legacy segment data".into(),
+                "live_ids.bin missing and WAL is empty; database state appears corrupt".into(),
             );
         }
         Ok(engine)
@@ -1498,10 +1568,6 @@ impl TurboQuantEngine {
         Ok(())
     }
 
-    fn rebuild_live_codes_cache(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Err("rebuild_live_codes_cache is disabled; live_ids.bin is required for recovery".into())
-    }
-
     fn persist_id_pool(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         save_id_pool(&self.local_dir, &self.backend, &self.id_pool)
     }
@@ -1765,9 +1831,121 @@ fn metadata_matches_filter(
     meta: &HashMap<String, JsonValue>,
     filter: &HashMap<String, JsonValue>,
 ) -> bool {
-    filter
-        .iter()
-        .all(|(k, v)| meta.get(k).is_some_and(|mv| mv == v))
+    filter.iter().all(|(k, v)| match k.as_str() {
+        "$and" => {
+            if let JsonValue::Array(conditions) = v {
+                conditions.iter().all(|cond| {
+                    if let JsonValue::Object(map) = cond {
+                        let as_hm: HashMap<String, JsonValue> =
+                            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                        metadata_matches_filter(meta, &as_hm)
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }
+        }
+        "$or" => {
+            if let JsonValue::Array(conditions) = v {
+                conditions.iter().any(|cond| {
+                    if let JsonValue::Object(map) = cond {
+                        let as_hm: HashMap<String, JsonValue> =
+                            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                        metadata_matches_filter(meta, &as_hm)
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }
+        }
+        field => {
+            let field_val = get_nested_field(meta, field);
+            match v {
+                JsonValue::Object(op_map) => {
+                    op_map.iter().all(|(op, op_val)| {
+                        apply_comparison_op(field_val, op.as_str(), op_val)
+                    })
+                }
+                // Simple equality: {"field": value}
+                _ => field_val.is_some_and(|fv| fv == v),
+            }
+        }
+    })
+}
+
+/// Resolve a potentially dotted path like "profile.region" into a value from metadata.
+fn get_nested_field<'a>(meta: &'a HashMap<String, JsonValue>, path: &str) -> Option<&'a JsonValue> {
+    let mut parts = path.splitn(2, '.');
+    let head = parts.next()?;
+    let val = meta.get(head)?;
+    if let Some(rest) = parts.next() {
+        if let JsonValue::Object(obj) = val {
+            // Recurse into nested object via the remaining path
+            get_nested_json_field(obj, rest)
+        } else {
+            None
+        }
+    } else {
+        Some(val)
+    }
+}
+
+fn get_nested_json_field<'a>(
+    obj: &'a serde_json::Map<String, JsonValue>,
+    path: &str,
+) -> Option<&'a JsonValue> {
+    let mut parts = path.splitn(2, '.');
+    let head = parts.next()?;
+    let val = obj.get(head)?;
+    if let Some(rest) = parts.next() {
+        if let JsonValue::Object(nested) = val {
+            get_nested_json_field(nested, rest)
+        } else {
+            None
+        }
+    } else {
+        Some(val)
+    }
+}
+
+fn apply_comparison_op(field: Option<&JsonValue>, op: &str, op_val: &JsonValue) -> bool {
+    match op {
+        "$eq" => field.is_some_and(|f| f == op_val),
+        "$ne" => {
+            // $ne matches missing fields too (missing ≠ value)
+            field.map_or(true, |f| f != op_val)
+        }
+        "$gt" | "$gte" | "$lt" | "$lte" => {
+            // Comparisons do not match missing fields
+            let Some(f) = field else { return false };
+            match (f, op_val) {
+                (JsonValue::Number(a), JsonValue::Number(b)) => {
+                    let av = a.as_f64().unwrap_or(f64::NAN);
+                    let bv = b.as_f64().unwrap_or(f64::NAN);
+                    match op {
+                        "$gt" => av > bv,
+                        "$gte" => av >= bv,
+                        "$lt" => av < bv,
+                        "$lte" => av <= bv,
+                        _ => false,
+                    }
+                }
+                (JsonValue::String(a), JsonValue::String(b)) => match op {
+                    "$gt" => a > b,
+                    "$gte" => a >= b,
+                    "$lt" => a < b,
+                    "$lte" => a <= b,
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        _ => false, // unknown operator: never matches
+    }
 }
 
 fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array1<f64>) -> f64 {

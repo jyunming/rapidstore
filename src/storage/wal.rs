@@ -98,9 +98,15 @@ impl Wal {
         }
         for entry in entries {
             let encoded = if let Some(q) = &self.quantizer {
+                // Delete tombstones carry empty quantized_indices; skip packing for them.
+                let packed_mse = if entry.is_deleted {
+                    Vec::new()
+                } else {
+                    q.pack_mse_indices(&entry.quantized_indices)
+                };
                 let packed = WalEntryPacked {
                     id: entry.id.clone(),
-                    packed_mse: q.pack_mse_indices(&entry.quantized_indices),
+                    packed_mse,
                     qjl_bits: entry.qjl_bits.clone(),
                     gamma: entry.gamma,
                     metadata_json: entry.metadata_json.clone(),

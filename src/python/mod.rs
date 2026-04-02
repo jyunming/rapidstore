@@ -10,6 +10,13 @@ use crate::storage::engine::{
     BatchWriteItem, BatchWriteMode, DistanceMetric, GetResult, RerankPrecision, TurboQuantEngine,
 };
 
+/// Thread-safe handle to a TurboQuantDB database.
+///
+/// All operations are safe to call from multiple Python threads simultaneously.
+/// Reads are concurrent; writes (insert/delete/index) are serialised by an internal
+/// `RwLock`.
+///
+/// Open or create a database with :meth:`Database.open`.
 #[pyclass]
 pub struct Database {
     engine: Arc<RwLock<TurboQuantEngine>>,
@@ -17,6 +24,30 @@ pub struct Database {
 
 #[pymethods]
 impl Database {
+    /// Open (or create) a TurboQuantDB database at the given directory path.
+    ///
+    /// Args:
+    ///     path: Directory where database files are stored.
+    ///     dimension: Vector dimensionality. Must match on reopen.
+    ///     bits: Quantization bits per coordinate — ``4`` (8× compression, good recall)
+    ///           or ``8`` (4× compression, better recall). Default ``4``.
+    ///     seed: Random seed for the quantizer. Must match on reopen. Default ``42``.
+    ///     metric: Distance metric — ``"ip"`` (inner product), ``"cosine"``,
+    ///             or ``"l2"`` (Euclidean). Fixed at creation. Default ``"ip"``.
+    ///     rerank: Enable reranking of HNSW candidates. Default ``True``.
+    ///     fast_mode: Skip QJL residual quantization (~30 % faster ingest, slightly
+    ///                lower recall). Default ``False``.
+    ///     rerank_precision: Raw-vector reranking precision:
+    ///         - ``None`` (default): dequantization reranking — no extra disk/RAM.
+    ///         - ``"f16"``: store raw vectors as float16 (+n×d×2 bytes), exact reranking.
+    ///         - ``"f32"``: store raw vectors as float32 (+n×d×4 bytes), maximum precision.
+    ///
+    /// Returns:
+    ///     An open :class:`Database` instance.
+    ///
+    /// Example::
+    ///
+    ///     db = Database.open("mydb", dimension=1536, bits=4, metric="cosine")
     #[staticmethod]
     #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None))]
     fn open(

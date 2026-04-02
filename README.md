@@ -247,6 +247,55 @@ The combination gives unbiased inner product estimates with provably near-optima
 
 ---
 
+## Benchmarks
+
+Full results across Windows / WSL2 / Linux (50k vectors, dim=1536, cosine): see **[BENCHMARKS.md](BENCHMARKS.md)**.
+
+**Linux native highlights (50k × 1536, top_k=10):**
+
+| Engine | Ingest | Disk | RAM | p50 | Recall@10 |
+|--------|--------|------|-----|-----|----------|
+| FAISS HNSW *(ceiling)* | 15.1s | 306 MB | 698 MB | 0.96ms | 99.75% |
+| ChromaDB | 33.5s | 398 MB | 924 MB | 2.41ms | 99.75% |
+| **TQDB b=4 FastBuild** | **22.7s** | **70 MB** | **506 MB** | **4.00ms** | **83.1%** |
+| **TQDB b=4 Balanced** | 26.0s | 70 MB | 507 MB | 7.46ms | 88.7% |
+| **TQDB b=8 HQ** | 38.0s | 119 MB | 554 MB | 8.73ms | 97.9% |
+| LanceDB | 89.8s | 318 MB | 1,722 MB | 8.10ms | 79.9% |
+
+TQDB b=4 stores each vector in **1,466 bytes** vs float32's 6,144 bytes — **4.2× compression** with no training.
+
+---
+
+## Performance Roadmap
+
+### Current bottlenecks (profiled at n=50k, dim=1536)
+
+| Phase | Dominant cost | Parallelism |
+|-------|--------------|-------------|
+| Ingest: SRHT rotation | 2 × d×d matmul (MSE + QJL) | Rayon per-batch |
+| Ingest: WAL write | Sequential I/O (fsync avoided) | — |
+| Search: brute-force scan | `n × score_ip_encoded_lite` | Rayon par_chunks |
+| Search: HNSW beam | Sequential graph traversal | — |
+
+### Near-term (CPU)
+
+- **AVX-512 codebook scan** — widen the inner-product accumulator from 256-bit to 512-bit (2× throughput on supported CPUs)
+- **Cached rotation matrices** — precompute MSE/QJL rotation as a contiguous f32 slab to improve BLAS locality
+- **HNSW parallel construction** — build candidate lists concurrently (requires slot-level locking)
+
+### Long-term (GPU)
+
+GPU acceleration is technically viable **only for batch ingest** where the two d×d SRHT matrix multiplies dominate:
+
+| Scenario | CPU (16 cores) | GPU (RTX class) | Whole-system gain | Effort |
+|----------|---------------|----------------|------------------|--------|
+| Ingest matmul (n=50k, d=1536) | ~26–38s | ~0.05s (cuBLAS) | ~3–5× end-to-end | 6–8 weeks |
+| Search / HNSW beam | ~4–11ms | worse (kernel launch overhead) | N/A | — |
+
+**Why not now:** current CPU ingest (22–38s at 50k/1536) is already faster than ChromaDB; the search path does not benefit from GPU; and the embedded in-process design means GPU memory must be explicitly managed. A `gpu` feature flag is reserved for future work.
+
+---
+
 ## Reference
 
 TurboQuant algorithm: [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) — *TurboQuant: Near-Optimal Data-Oblivious Vector Quantization*
