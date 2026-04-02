@@ -19,36 +19,39 @@ pub fn fwht(a: &mut [f32]) {
 }
 
 /// SRHT (Structured Random Hadamard Transform)
-/// Forward: H * D * x
+/// Forward: H * D * (x, 0)
+/// out must be length n = next_power_of_two(x.len())
 pub fn srht(x: &[f32], signs: &[f32], out: &mut [f32]) {
     let d = x.len();
     let n = d.next_power_of_two();
+    assert_eq!(out.len(), n);
+    assert!(signs.len() >= n);
     
-    let mut temp = vec![0.0f32; n];
     for i in 0..d {
-        temp[i] = x[i] * signs[i];
+        out[i] = x[i] * signs[i];
+    }
+    for i in d..n {
+        out[i] = 0.0;
     }
     
-    fwht(&mut temp);
+    fwht(out);
     
     let norm = 1.0 / (n as f32).sqrt();
-    for i in 0..d {
-        out[i] = temp[i] * norm;
+    for i in 0..n {
+        out[i] *= norm;
     }
 }
 
-/// Inverse SRHT — exact when `d` is a power of 2 (`d == d.next_power_of_two()`).
-/// For non-power-of-2 `d`, the forward SRHT takes only d of n Hadamard rows,
-/// making the map non-orthogonal; this function gives only an approximation in that case.
+/// Inverse SRHT
+/// Inverse of (H * D): D * H
+/// out must be length d, y must be length n = next_power_of_two(d)
 pub fn inverse_srht(y: &[f32], signs: &[f32], out: &mut [f32]) {
-    let d = y.len();
+    let d = out.len();
     let n = d.next_power_of_two();
+    assert_eq!(y.len(), n);
+    assert!(signs.len() >= n);
     
-    let mut temp = vec![0.0f32; n];
-    for i in 0..d {
-        temp[i] = y[i];
-    }
-    
+    let mut temp = y.to_vec();
     fwht(&mut temp);
     
     let norm = 1.0 / (n as f32).sqrt();
@@ -70,18 +73,18 @@ mod tests {
 
     #[test]
     fn test_srht_roundtrip() {
-        // d must be a power of 2 for the SRHT to be exactly orthogonal.
-        let d = 8;
-        let x: Vec<f32> = (1..=d as i32).map(|v| v as f32).collect();
-        let signs = vec![1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, 1.0];
-        let mut y = vec![0.0; d];
+        let d: usize = 5;
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let n = d.next_power_of_two(); // 8
+        let signs = vec![1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0];
+        let mut y = vec![0.0; n];
         let mut x_hat = vec![0.0; d];
-
+        
         srht(&x, &signs, &mut y);
         inverse_srht(&y, &signs, &mut x_hat);
-
+        
         for i in 0..d {
-            assert!((x[i] - x_hat[i]).abs() < 1e-5, "mismatch at i={}: {} vs {}", i, x[i], x_hat[i]);
+            assert!((x[i] - x_hat[i]).abs() < 1e-5);
         }
     }
 }

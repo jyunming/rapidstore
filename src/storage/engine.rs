@@ -61,7 +61,7 @@ pub struct Manifest {
 }
 
 fn default_rerank_enabled() -> bool {
-    true
+    false
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -261,8 +261,9 @@ impl TurboQuantEngine {
         let metadata = MetadataStore::open(&metadata_path)?;
         let graph = GraphManager::open(backend.clone(), local_dir)?;
 
-        let qjl_len = manifest.d.div_ceil(8);
-        let mse_len = (manifest.d * (manifest.b - 1)).div_ceil(8);
+        let n = manifest.d.next_power_of_two();
+        let qjl_len = n.div_ceil(8);
+        let mse_len = (n * (manifest.b - 1)).div_ceil(8);
         let stride = mse_len + qjl_len + LIVE_GAMMA_BYTES + LIVE_NORM_BYTES + LIVE_DELETED_BYTES;
         let live_codes = LiveCodesFile::open(Path::new(local_dir).join("live_codes.bin"), stride)?;
         let live_vraw = if manifest.rerank_enabled {
@@ -479,12 +480,28 @@ impl TurboQuantEngine {
         let metric = self.metric.clone();
         let quantizer = self.quantizer.clone();
         let slots_ref = indexed_slots.clone();
+        let engine_rerank_enabled = self.rerank_enabled;
+        // Share live_vraw reference safely with the closure
+        let vraw_ref = self.live_vraw.as_ref();
 
         let build_scorer = move |from: u32, candidates: &[u32]| -> Vec<(u32, f64)> {
             let from_slot = slots_ref[from as usize] as usize;
-            let (from_i, from_q, from_g, from_n) =
-                live_codes_at_slot_raw(live_codes, d, mse_len, qjl_len, from_slot, &quantizer);
-            let from_vec = quantizer.dequantize_single_no_parallel(&from_i, from_q, from_g as f64);
+            
+            // Use original vector for build if available (perfect graph)
+            let from_vec = if engine_rerank_enabled && vraw_ref.is_some() {
+                let vraw = vraw_ref.unwrap();
+                let rec = vraw.get_slot(from_slot);
+                let mut out = Array1::zeros(d);
+                for i in 0..d {
+                    let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                    out[i] = f32::from_le_bytes(bytes) as f64;
+                }
+                out
+            } else {
+                let (from_i, from_q, from_g, _) = live_codes_at_slot_raw(live_codes, d, mse_len, qjl_len, from_slot, &quantizer);
+                quantizer.dequantize_single_no_parallel(&from_i, from_q, from_g as f64)
+            };
+
             if matches!(metric, DistanceMetric::Ip) {
                 let prep = quantizer.prepare_ip_query_lite(&from_vec);
                 candidates
@@ -502,7 +519,7 @@ impl TurboQuantEngine {
                     .collect()
             } else if matches!(metric, DistanceMetric::Cosine) {
                 let prep = quantizer.prepare_ip_query_lite(&from_vec);
-                let from_norm = from_n;
+                let from_norm = from_vec.iter().map(|x| x * x).sum::<f64>().sqrt();
                 candidates
                     .iter()
                     .map(|&to| {
@@ -617,7 +634,7 @@ impl TurboQuantEngine {
             };
 
             let internal_k = if self.rerank_enabled {
-                top_k * 4
+                top_k * 20
             } else {
                 top_k
             };
@@ -734,7 +751,11 @@ impl TurboQuantEngine {
             return Ok(Vec::new());
         }
 
-        let internal_k = top_k * 4;
+        let internal_k = if self.rerank_enabled {
+            top_k * 10
+        } else {
+            top_k
+        };
         let q_norm = query.iter().map(|x| x * x).sum::<f64>().sqrt();
 
         // Pre-filter slots upfront to keep the hot scoring loop filter-free.
@@ -764,7 +785,6 @@ impl TurboQuantEngine {
         let stride = self.live_stride();
         let mse_len = self.live_mse_len();
         let qjl_len = self.live_qjl_len();
-        let d = self.d;
         let quantizer = &self.quantizer;
         let metric = &self.metric;
 
@@ -776,7 +796,7 @@ impl TurboQuantEngine {
                 candidate_slots
                     .par_chunks(CHUNK)
                     .flat_map(|chunk| {
-                        let mut idx = vec![0u16; d];
+                        let mut idx = vec![0u16; quantizer.n];
                         let mut out = Vec::with_capacity(chunk.len());
                         for &slot in chunk {
                             let rec = &codes_bytes
@@ -804,7 +824,7 @@ impl TurboQuantEngine {
                 candidate_slots
                     .par_chunks(CHUNK)
                     .flat_map(|chunk| {
-                        let mut idx = vec![0u16; d];
+                        let mut idx = vec![0u16; quantizer.n];
                         let mut out = Vec::with_capacity(chunk.len());
                         for &slot in chunk {
                             let rec = &codes_bytes
@@ -842,7 +862,7 @@ impl TurboQuantEngine {
                 candidate_slots
                     .par_chunks(CHUNK)
                     .flat_map(|chunk| {
-                        let mut idx = vec![0u16; d];
+                        let mut idx = vec![0u16; quantizer.n];
                         let mut out = Vec::with_capacity(chunk.len());
                         for &slot in chunk {
                             let rec = &codes_bytes
@@ -997,10 +1017,10 @@ impl TurboQuantEngine {
     }
 
     fn live_mse_len(&self) -> usize {
-        (self.d * (self.b - 1)).div_ceil(8)
+        (self.quantizer.n * (self.b - 1)).div_ceil(8)
     }
     fn live_qjl_len(&self) -> usize {
-        self.d.div_ceil(8)
+        self.quantizer.n.div_ceil(8)
     }
     fn live_stride(&self) -> usize {
         self.live_mse_len()
@@ -1017,7 +1037,7 @@ impl TurboQuantEngine {
         let rec = self.live_codes.get_slot(slot);
         let mse_len = self.live_mse_len();
         let qjl_len = self.live_qjl_len();
-        let mut indices = vec![0 as CodeIndex; self.d];
+        let mut indices = vec![0 as CodeIndex; self.quantizer.n];
         self.quantizer
             .unpack_mse_indices(&rec[0..mse_len], &mut indices);
         let qjl = &rec[mse_len..mse_len + qjl_len];
@@ -1451,14 +1471,14 @@ fn load_index_ids(local_dir: &str) -> Result<Vec<u32>, Box<dyn std::error::Error
 
 fn live_codes_at_slot_raw<'a>(
     live_codes: &'a LiveCodesFile,
-    d: usize,
+    _d_unused: usize,
     mse_len: usize,
     qjl_len: usize,
     slot: usize,
     quantizer: &ProdQuantizer,
 ) -> (Vec<CodeIndex>, &'a [u8], f32, f32) {
     let rec = live_codes.get_slot(slot);
-    let mut indices = vec![0 as CodeIndex; d];
+    let mut indices = vec![0 as CodeIndex; quantizer.n];
     quantizer.unpack_mse_indices(&rec[0..mse_len], &mut indices);
     let gamma = f32::from_le_bytes(
         rec[mse_len + qjl_len..mse_len + qjl_len + 4]

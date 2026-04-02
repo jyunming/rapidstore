@@ -18,7 +18,7 @@ pub struct Database {
 #[pymethods]
 impl Database {
     #[staticmethod]
-    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false))]
+    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=false, fast_mode=false))]
     fn open(
         path: String,
         dimension: usize,
@@ -295,6 +295,7 @@ impl Database {
         Ok(py_list.into())
     }
 
+    #[pyo3(signature = (max_degree=None, ef_construction=None, search_list_size=None, alpha=None))]
     fn create_index(
         &self,
         py: Python<'_>,
