@@ -152,6 +152,11 @@ impl ProdQuantizer {
             mse_score += c * unsafe { *prep_y.get_unchecked(i) };
         }
 
+        // fast_mode stores gamma=0 — skip QJL entirely (saves ~50% of scoring work).
+        if gamma == 0.0 {
+            return mse_score as f64;
+        }
+
         let mut qjl_score = 0.0f32;
         let sq = &prep.sq;
         let qjl_len = qjl.len();
@@ -222,6 +227,11 @@ impl ProdQuantizer {
         while i < self.n {
             mse_sum += *centroids.add(*idx_ptr.add(i) as usize) * *prep_y.add(i);
             i += 1;
+        }
+
+        // fast_mode stores gamma=0 — skip QJL entirely (saves ~50% of scoring work).
+        if gamma == 0.0 {
+            return mse_sum as f64;
         }
 
         // QJL part: for each byte, expand 8 bits → ±1.0 sign vector via integer SIMD,

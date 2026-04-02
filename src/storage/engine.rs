@@ -489,18 +489,24 @@ impl TurboQuantEngine {
         // Pre-cache all encoded vectors for IP/Cosine metrics into flat contiguous arrays.
         // Avoids O(n × candidates × refinements) heap allocations and random slab reads
         // that live_codes_at_slot_raw() would otherwise incur per scoring call.
+        // In fast_mode, gamma=0 for every vector so the QJL loop is skipped by the scorer;
+        // we skip pre-caching qjl_buf entirely to reduce memory footprint and bandwidth.
+        let is_fast_mode = self.manifest.fast_mode;
+        // The stride used to index all_qjl_flat: 0 when fast_mode (empty buffer).
+        let cached_qjl_len = if is_fast_mode { 0 } else { qjl_len };
         let (all_mse, all_qjl_flat, all_gamma, all_norm) =
             if matches!(self.metric, DistanceMetric::Ip | DistanceMetric::Cosine) {
                 let n_indexed = indexed_slots.len();
                 let mut mse_buf = vec![0u16; n_indexed * qn];
-                let mut qjl_buf = vec![0u8; n_indexed * qjl_len];
+                let effective_qjl_len = if is_fast_mode { 0 } else { qjl_len };
+                let mut qjl_buf = vec![0u8; n_indexed * effective_qjl_len];
                 let mut gamma_buf = vec![0.0f32; n_indexed];
                 let mut norm_buf = vec![0.0f32; n_indexed];
                 for (i, &slot) in indexed_slots.iter().enumerate() {
                     let rec = live_codes.get_slot(slot as usize);
                     quantizer
                         .unpack_mse_indices(&rec[..mse_len], &mut mse_buf[i * qn..(i + 1) * qn]);
-                    if qjl_len > 0 {
+                    if !is_fast_mode && qjl_len > 0 {
                         qjl_buf[i * qjl_len..(i + 1) * qjl_len]
                             .copy_from_slice(&rec[mse_len..mse_len + qjl_len]);
                     }
@@ -575,7 +581,11 @@ impl TurboQuantEngine {
                     .map(|&to| {
                         let to_idx = to as usize;
                         let to_i = &all_mse[to_idx * qn..(to_idx + 1) * qn];
-                        let to_q = &all_qjl_flat[to_idx * qjl_len..(to_idx + 1) * qjl_len];
+                        let to_q = if cached_qjl_len > 0 {
+                            &all_qjl_flat[to_idx * cached_qjl_len..(to_idx + 1) * cached_qjl_len]
+                        } else {
+                            &[]
+                        };
                         let to_g = all_gamma[to_idx];
                         (to, quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64))
                     })
@@ -601,7 +611,11 @@ impl TurboQuantEngine {
                     .map(|&to| {
                         let to_idx = to as usize;
                         let to_i = &all_mse[to_idx * qn..(to_idx + 1) * qn];
-                        let to_q = &all_qjl_flat[to_idx * qjl_len..(to_idx + 1) * qjl_len];
+                        let to_q = if cached_qjl_len > 0 {
+                            &all_qjl_flat[to_idx * cached_qjl_len..(to_idx + 1) * cached_qjl_len]
+                        } else {
+                            &[]
+                        };
                         let to_g = all_gamma[to_idx];
                         let to_n = all_norm[to_idx];
                         let ip =
