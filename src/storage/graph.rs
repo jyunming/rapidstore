@@ -174,10 +174,10 @@ impl GraphManager {
     ) -> Result<Vec<(u32, f64)>, Box<dyn std::error::Error + Send + Sync>> {
         if self.node_count == 0 { return Ok(Vec::new()); }
         
-        // Upper-layer beam width: use the same ef as level-0 so the entry point
-        // passed down is not artificially constrained to 32 candidates regardless
-        // of what the caller requested.
-        let ef_upper = search_list_size;
+        // Upper-layer beam uses a fixed cap (not search_list_size) because upper layers
+        // have far fewer nodes and the scoring LUT for large b/dim can be cache-cold.
+        // A 32-wide beam is sufficient for greedy navigation to a good level-0 entry point.
+        const EF_UPPER: usize = 32;
         let mut beam = BinaryHeap::new();
         let start_score = scorer(self.entry_point);
         beam.push(OrderingWrapper(SearchCandidate { id: self.entry_point, score: start_score }));
@@ -195,7 +195,7 @@ impl GraphManager {
             let mut layer_results = beam.clone();
             
             while let Some(current) = candidates.pop() {
-                if layer_results.len() >= ef_upper && current.score < layer_results.peek().unwrap().0.score {
+                if layer_results.len() >= EF_UPPER && current.score < layer_results.peek().unwrap().0.score {
                     break;
                 }
                 
@@ -206,10 +206,10 @@ impl GraphManager {
                         
                         let score = scorer(nb);
                         let cand = SearchCandidate { id: nb, score };
-                        if layer_results.len() < ef_upper || score > layer_results.peek().unwrap().0.score {
+                        if layer_results.len() < EF_UPPER || score > layer_results.peek().unwrap().0.score {
                             candidates.push(cand);
                             layer_results.push(OrderingWrapper(cand));
-                            if layer_results.len() > ef_upper {
+                            if layer_results.len() > EF_UPPER {
                                 layer_results.pop();
                             }
                         }
