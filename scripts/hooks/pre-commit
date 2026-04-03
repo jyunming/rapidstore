@@ -53,14 +53,16 @@ if [ "${SRC_CHANGED}" -gt 0 ]; then
         fi
     done
 
-    if [ -n "$PYTHON" ]; then
+    if [ -n "$PYTHON" ] && [ -f "benchmarks/precommit_perf_check.py" ]; then
         echo -n "[pre-commit] perf check (${SRC_CHANGED} src/ file(s) changed) ... "
         if ! "$PYTHON" benchmarks/precommit_perf_check.py \
                 --baseline benchmarks/perf_baseline.json 2>&1; then
             exit 1
         fi
-    else
+    elif [ -z "$PYTHON" ]; then
         warn "skipping perf check — turboquantdb not installed (run: maturin develop --release)"
+    else
+        warn "skipping perf check — benchmarks/precommit_perf_check.py not found"
     fi
 else
     warn "skipping perf check — no src/ files staged"
