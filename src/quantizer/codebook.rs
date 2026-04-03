@@ -7,8 +7,12 @@ use std::f64::consts::PI;
 /// identical to `c[i] / ((z-1) + i + 1)` with i starting at 0. The final formula
 /// `(z - 0.5) * t.ln()` and `t = z + 6.5` are derived from that same substitution.
 /// Verified: log_gamma(1) ≈ 0, log_gamma(2) ≈ 0, log_gamma(5) ≈ ln(24) = 3.178.
+///
+/// **Precondition:** `z > 0`. Negative or zero inputs produce NaN via the reflection
+/// branch (sin can be zero or negative). Callers must ensure `z > 0`.
 fn log_gamma(z: f64) -> f64 {
-    // Reflection for small z keeps the implementation robust.
+    debug_assert!(z > 0.0, "log_gamma undefined for z <= 0, got {z}");
+    // Reflection for z in (0, 0.5) keeps the Lanczos series in its accurate region.
     if z < 0.5 {
         return (PI / (PI * z).sin()).ln() - log_gamma(1.0 - z);
     }
@@ -33,8 +37,11 @@ fn log_gamma(z: f64) -> f64 {
 /// Evaluates the Beta distribution PDF f_X(x) for the paper's coordinate distribution.
 /// The distribution is scaled to [-1, 1].
 /// f_X(x) = (\Gamma(d/2) / (\sqrt{\pi} \Gamma((d-1)/2))) * (1 - x^2)^((d-3)/2)
+///
+/// Returns 0.0 for `d < 2` (the gamma argument `(d-1)/2` would be ≤ 0, making
+/// log_gamma undefined) and for `|x| >= 1.0`.
 pub fn beta_pdf(x: f64, d: usize) -> f64 {
-    if x.abs() >= 1.0 {
+    if d < 2 || x.abs() >= 1.0 {
         return 0.0;
     }
     let df = d as f64;

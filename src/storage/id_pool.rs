@@ -94,6 +94,14 @@ impl IdPool {
         }
         self.alive[i] = false;
         self.active_count = self.active_count.saturating_sub(1);
+        // Prune the slot from the hash-bucket to prevent unbounded lookup growth under churn.
+        let hash = self.hashes[i];
+        if let Some(candidates) = self.lookup.get_mut(&hash) {
+            candidates.retain(|&c| c != slot);
+            if candidates.is_empty() {
+                self.lookup.remove(&hash);
+            }
+        }
         true
     }
 

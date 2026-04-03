@@ -28,7 +28,7 @@ impl Compactor {
         new_segment_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let state = CompactionState {
-            phase: "prepared".to_string(),
+            phase: CompactionPhase::Prepared,
             old_segment_names: old_segment_names.to_vec(),
             new_segment_name: new_segment_name.to_string(),
         };
@@ -57,6 +57,16 @@ impl Compactor {
                 return Ok(true);
             }
         };
+
+        // Branch on phase: Prepared means we crashed before finishing; Committed means
+        // the marker was not cleaned up but old segments are already gone (safe to ignore).
+        match state.phase {
+            CompactionPhase::Committed => {
+                self.backend.delete(COMPACTION_STATE_FILE)?;
+                return Ok(true);
+            }
+            CompactionPhase::Prepared => {}
+        }
 
         // If the compacted segment exists and is valid, complete old-segment deletion.
         // Validate by attempting to read the segment header; a crash mid-write can leave
@@ -108,9 +118,18 @@ impl Compactor {
 
 const COMPACTION_STATE_FILE: &str = "compaction_state.json";
 
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum CompactionPhase {
+    /// Marker written before old segments are deleted; recovery must validate the new segment.
+    Prepared,
+    /// Marker written after old segments are deleted; recovery should be a no-op.
+    Committed,
+}
+
 #[derive(Serialize, Deserialize)]
 struct CompactionState {
-    phase: String,
+    phase: CompactionPhase,
     old_segment_names: Vec<String>,
     new_segment_name: String,
 }
