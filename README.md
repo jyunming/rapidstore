@@ -180,19 +180,21 @@ results = db.search(query, top_k=10, ann_search_list_size=128)
 
 ## Benchmarks
 
-Full results: **[BENCHMARKS.md](BENCHMARKS.md)**
+Full results: **[BENCHMARKS.md](https://github.com/jyunmitch/TurboQuantDB/blob/main/BENCHMARKS.md)**
 
 **Windows 11 highlights (50k × 1536, top_k=10, DBpedia OpenAI embeddings):**
 
 | Engine | Ingest | Disk | RAM | p50 | Recall@10 |
 |--------|--------|------|-----|-----|-----------|
-| ChromaDB (HNSW) | 30.6s | 398 MB | 865 MB | 1.73ms | 99.75% |
-| LanceDB (IVF_PQ) | 77.6s | 318 MB | 526 MB | 9.17ms | 79.50% |
+| Engine-A (HNSW) | 30.6s | 398 MB | 865 MB | 1.73ms | 99.75% |
+| Engine-B (IVF-PQ) | 77.6s | 318 MB | 526 MB | 9.17ms | 79.50% |
 | **TQDB b=8 HQ** | **59.2s** | **119 MB** | **537 MB** | 12.42ms | **97.25%** |
 | **TQDB b=4 Balanced** | **37.8s** | **70 MB** | **488 MB** | 9.98ms | **89.15%** |
 | **TQDB b=4 FastBuild** | **28.2s** | **70 MB** | **487 MB** | 5.30ms | **83.35%** |
 
-TQDB b=4 is **5.7× smaller** than ChromaDB and uses **44% less RAM**, within 11pp of recall.
+*Engines identified by index algorithm. Reproduction scripts in `benchmarks/`.*
+
+TQDB b=4 is **5.7× smaller** than Engine-A and uses **44% less RAM**, within 11pp of recall.
 
 ---
 
@@ -213,7 +215,7 @@ for r in results:
 
 ## Architecture
 
-TurboQuantDB is an embedded database (like DuckDB) — it runs in-process with no daemon.
+TurboQuantDB is an embedded database — it runs in-process with no daemon.
 
 ```
 ./my_db/
@@ -265,7 +267,7 @@ cd server && cargo build --release
 TQ_SERVER_ADDR=0.0.0.0:8080 TQ_LOCAL_ROOT=./data ./target/release/turboquantdb-server
 ```
 
-See [`server/README.md`](server/README.md) for endpoints and environment variables. Key env vars:
+See [`server/README.md`](https://github.com/jyunmitch/TurboQuantDB/blob/main/server/README.md) for endpoints and environment variables. Key env vars:
 
 | Variable | Default | Description |
 |----------|---------|-------------|

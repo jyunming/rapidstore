@@ -1,4 +1,4 @@
-# M5 Design Doc: Multi-Tenant Service Mode
+# Server Mode Design: Multi-Tenant Architecture
 
 ## Objective
 

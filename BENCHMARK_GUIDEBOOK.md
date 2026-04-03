@@ -52,29 +52,29 @@ Dataset: `KShivendu/dbpedia-entities-openai-1M` — pre-computed OpenAI embeddin
 | Engine | Ingest | vec/s | Disk | RAM-ing | RAM-qry | CPU-ing | CPU-qry | p50 | p95 | Recall@10 | MRR@10 |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | Faiss HNSW *(ceiling)* | 15.1s | 3,316 | 306MB | 698MB | 698MB | 1331% | 100% | 0.96ms | 1.27ms | 99.75% | 1.0000 |
-| ChromaDB (HNSW) | 33.5s | 1,493 | 398MB | 924MB | 924MB | 258% | 92% | 2.41ms | 3.42ms | 99.75% | 1.0000 |
+| Engine-A (HNSW) | 33.5s | 1,493 | 398MB | 924MB | 924MB | 258% | 92% | 2.41ms | 3.42ms | 99.75% | 1.0000 |
 | TQDB b=4 FastBuild | 22.7s | 2,199 | 70MB | 507MB | 506MB | 1262% | 104% | 4.00ms | 6.88ms | 83.10% | 0.9900 |
 | TQDB b=8 FastBuild | 29.8s | 1,678 | 119MB | 552MB | 552MB | 842% | 103% | 4.89ms | 7.23ms | 95.15% | 0.9800 |
 | TQDB b=4 Balanced | 26.0s | 1,922 | 70MB | 507MB | 507MB | 1313% | 196% | 7.46ms | 11.24ms | 88.70% | 0.9900 |
 | TQDB b=8 HQ | 38.0s | 1,316 | 119MB | 554MB | 554MB | 1175% | 179% | 8.73ms | 11.97ms | 97.85% | 0.9950 |
-| LanceDB (IVF_PQ) | 89.8s | 556 | 318MB | 1722MB | 1722MB | 1100% | 152% | 8.10ms | 9.57ms | 79.90% | 1.0000 |
-| Milvus Lite (HNSW) | 251.4s | 198 | 391MB | 514MB | 493MB | 2% | 7% | 12.18ms | 14.20ms | 100.00% | 1.0000 |
-| DuckDB VSS (HNSW) | 407.2s | 122 | 745MB | 1781MB | 1597MB | 132% | 193% | 177.00ms | 195.46ms | 100.00% | 1.0000 |
-| Qdrant (HNSW)* | 805.0s | 62 | 685MB | 1152MB | 1152MB | 7% | 1000% | 123.94ms | 163.84ms | 100.00% | 1.0000 |
+| Engine-B (IVF-PQ) | 89.8s | 556 | 318MB | 1722MB | 1722MB | 1100% | 152% | 8.10ms | 9.57ms | 79.90% | 1.0000 |
+| Engine-D (HNSW) | 251.4s | 198 | 391MB | 514MB | 493MB | 2% | 7% | 12.18ms | 14.20ms | 100.00% | 1.0000 |
+| Engine-E (HNSW) | 407.2s | 122 | 745MB | 1781MB | 1597MB | 132% | 193% | 177.00ms | 195.46ms | 100.00% | 1.0000 |
+| Engine-C (HNSW)* | 805.0s | 62 | 685MB | 1152MB | 1152MB | 7% | 1000% | 123.94ms | 163.84ms | 100.00% | 1.0000 |
 
-*Qdrant tested in embedded mode only — not representative of its server deployment performance.*
+*Engine-C tested in embedded mode only — not representative of its server deployment performance.*
 
 ### 3.2 Disk Compression
 
 Raw float32 baseline: **293 MB** for 50,000 × 1536-dim vectors.
 
-| Engine | Disk | bytes/vec | vs float32 | vs ChromaDB |
+| Engine | Disk | bytes/vec | vs float32 | vs Engine-A |
 |---|---|---|---|---|
-| DuckDB VSS | 745MB | 15,619 | 0.39× | 0.53× |
-| Qdrant | 685MB | 14,373 | 0.43× | 0.58× |
-| ChromaDB | 398MB | 8,353 | 0.74× | baseline |
-| Milvus Lite | 391MB | 8,203 | 0.75× | 1.02× |
-| LanceDB | 318MB | 6,663 | 0.92× | 1.25× |
+| Engine-E | 745MB | 15,619 | 0.39× | 0.53× |
+| Engine-C | 685MB | 14,373 | 0.43× | 0.58× |
+| Engine-A | 398MB | 8,353 | 0.74× | baseline |
+| Engine-D | 391MB | 8,203 | 0.75× | 1.02× |
+| Engine-B | 318MB | 6,663 | 0.92× | 1.25× |
 | Faiss HNSW | 306MB | 6,416 | 0.96× | 1.30× |
 | **TQDB b=8** | **119MB** | **2,490** | **2.47×** | **3.35×** |
 | **TQDB b=4** | **70MB** | **1,466** | **4.19×** | **5.70×** |
@@ -82,11 +82,11 @@ Raw float32 baseline: **293 MB** for 50,000 × 1536-dim vectors.
 ### 3.3 Engine Notes
 
 - **Faiss HNSW** — ANN library only, no persistence/metadata/delete. Ceiling reference.
-- **ChromaDB** — Easiest to use, good recall, moderate storage.
-- **LanceDB** — IVF_PQ index, lowest recall (79.9%) but decent throughput.
-- **Milvus Lite** — Single-threaded indexer (2% CPU), slow ingest but solid query quality.
-- **DuckDB VSS** — HNSW index is experimental; very slow query (177ms), largest disk footprint.
-- **Qdrant** — Embedded mode is not how Qdrant is designed to run; server mode is significantly faster.
+- **Engine-A** — Easiest to use, good recall, moderate storage.
+- **Engine-B** — IVF_PQ index, lowest recall (79.9%) but decent throughput.
+- **Engine-D** — Single-threaded indexer (2% CPU), slow ingest but solid query quality.
+- **Engine-E** — HNSW index is experimental; very slow query (177ms), largest disk footprint.
+- **Engine-C** — Embedded mode is not how Engine-C is designed to run; server mode is significantly faster.
 - **TQDB** — Best ingest throughput among full DBs, smallest disk, lowest RAM.
 
 ---
@@ -98,9 +98,9 @@ Raw float32 baseline: **293 MB** for 50,000 × 1536-dim vectors.
 
 | Engine | Windows | WSL2 /mnt/c | Linux Native | Win→Native Δ |
 |---|---|---|---|---|
-| ChromaDB | 30.6s | 84.2s | 33.5s | +10% |
-| LanceDB | 77.6s | 214.9s | 89.8s | +16% |
-| Qdrant | 538.2s | 854.1s | 805.0s | +50% |
+| Engine-A | 30.6s | 84.2s | 33.5s | +10% |
+| Engine-B | 77.6s | 214.9s | 89.8s | +16% |
+| Engine-C | 538.2s | 854.1s | 805.0s | +50% |
 | TQDB b=8 HQ | 70.5s | 77.7s | **38.0s** | **−46%** |
 | TQDB b=4 Balanced | 52.8s | 57.3s | **26.0s** | **−51%** |
 | TQDB b=4 FastBuild | 26.7s | 56.5s | **22.7s** | **−15%** |
@@ -109,9 +109,9 @@ Raw float32 baseline: **293 MB** for 50,000 × 1536-dim vectors.
 
 | Engine | Windows | WSL2 | Linux Native | Win→Native Δ |
 |---|---|---|---|---|
-| ChromaDB | 1.73ms | 2.88ms | 2.41ms | +39% |
-| LanceDB | 9.17ms | 37.09ms | 8.10ms | −12% ✓ |
-| Qdrant | 179.88ms | 105.81ms | 123.94ms | −31% ✓ |
+| Engine-A | 1.73ms | 2.88ms | 2.41ms | +39% |
+| Engine-B | 9.17ms | 37.09ms | 8.10ms | −12% ✓ |
+| Engine-C | 179.88ms | 105.81ms | 123.94ms | −31% ✓ |
 | TQDB b=8 HQ | 10.74ms | 10.15ms | **8.73ms** | **−19%** ✓ |
 | TQDB b=4 Balanced | 7.13ms | 8.06ms | **7.46ms** | −5% ✓ |
 | TQDB b=4 FastBuild | 3.51ms | 4.42ms | **4.00ms** | +14% |
@@ -122,7 +122,7 @@ Raw float32 baseline: **293 MB** for 50,000 × 1536-dim vectors.
    adds 30–60s of fixed I/O cost per run.
 2. **Linux native ext4 beats Windows for TQDB ingest** — 46–51% faster for HQ/Balanced configs
    once the CPU core cap was fixed.
-3. **Qdrant and LanceDB query faster on Linux** — native Linux binaries benefit from real mmap.
+3. **Engine-C and Engine-B query faster on Linux** — native Linux binaries benefit from real mmap.
 4. **Recall is deterministic across platforms** — seed=42 produces identical results on all OSes.
 5. **WSL2 default core cap was 4** — all early Linux results were artificially throttled.
    After setting `processors=16` in `.wslconfig`, TQDB reached 1,922–2,199 vec/s.
@@ -180,9 +180,9 @@ For a **1TB corpus** (~5M files, avg 200KB/file):
 > Models with ≤512 token context produce 490M–975M vectors from 1TB — unmanageable for
 > single-node embedded databases. Long-context models (8k+) are essential for large corpora.
 
-### Storage for 1TB corpus by model (TQDB b=4 vs ChromaDB)
+### Storage for 1TB corpus by model (TQDB b=4 vs Engine-A)
 
-| Model | Vectors | TQDB b=4 disk | ChromaDB disk | TQDB RAM (mmap) |
+| Model | Vectors | TQDB b=4 disk | Engine-A disk | TQDB RAM (mmap) |
 |---|---|---|---|---|
 | nomic-embed (768-dim) | ~30M | ~35 GB | ~158 GB | ~2 GB |
 | jina-v3 (1024-dim) | ~30M | ~38 GB | ~189 GB | ~2 GB |
@@ -248,7 +248,7 @@ A larger benchmark using real embedded text is currently running:
 |---|---|
 | Corpus | DBpedia full text (~332MB, ~1M documents) |
 | Embedding model | `BAAI/bge-large-en-v1.5` (1024-dim, local CPU, fastembed) |
-| Engines | ChromaDB, LanceDB, Milvus Lite, DuckDB VSS, Faiss, TQDB ×4 |
+| Engines | Engine-A, Engine-B, Engine-D, Engine-E, Faiss, TQDB ×4 |
 | New metrics | RAM peak + avg (ingest + query), CPU peak + avg, p50/p95/p99 |
 | Status | Embedding in progress (~1M chunks × 1024-dim on CPU) |
 

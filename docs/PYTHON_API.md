@@ -1,6 +1,6 @@
-# Batch CRUD and Filter Grammar v1
+# Python API Reference
 
-This document captures the current TurboQuantDB batch APIs and filter behavior for M1.
+This document covers the TurboQuantDB Python API — batch operations, filter grammar, and metadata behavior.
 
 ## Python API (PyO3)
 
@@ -74,17 +74,6 @@ Missing-field policy:
 - `$ne` matches missing fields.
 - `$eq`, range operators, and `$in` do not match missing fields.
 
-## Benchmark Harness
-
-A reproducible benchmark test is available:
-- `tests/bench_batch_crud.rs` (ignored by default)
-
-Run it with:
-
-```powershell
-$env:CARGO_TARGET_DIR="$env:USERPROFILE\.cargo-target\TurboQuantDB"
-cargo test -q --test bench_batch_crud -- --ignored --nocapture
-```
 
 
 

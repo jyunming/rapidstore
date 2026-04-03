@@ -1,4 +1,4 @@
-# M5 API Spec (Draft v1)
+# Server API Reference
 
 ## Purpose
 
