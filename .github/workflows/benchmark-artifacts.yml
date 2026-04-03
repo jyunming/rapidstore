@@ -30,7 +30,7 @@ jobs:
           python -m venv .venv
           echo "$PWD/.venv/bin" >> $GITHUB_PATH
           echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
-          pip install numpy maturin
+          .venv/bin/pip install numpy maturin
 
       - name: Build Python extension
         run: maturin develop --release
