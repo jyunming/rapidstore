@@ -97,112 +97,48 @@ for r in results:
 
 ## Python API
 
-### `Database.open(path, dimension, bits=4, seed=42, metric="ip", rerank=True, fast_mode=False, rerank_precision=None, collection=None)`
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `path` | `str` | Base directory path for database files |
-| `dimension` | `int` | Vector dimension (must match on reopen) |
-| `bits` | `int` | Quantization bits: `4` (4.2× compression) or `8` (2.47× compression, higher recall) |
-| `seed` | `int` | RNG seed for quantizer — must match across sessions |
-| `metric` | `str` | `"ip"`, `"cosine"`, or `"l2"` |
-| `rerank` | `bool` | Enable reranking of ANN candidates. Default `True`. Precision controlled by `rerank_precision`. |
-| `fast_mode` | `bool` | Skip QJL stage — ~30% faster ingest, ~5pp recall loss. Default `False`. |
-| `rerank_precision` | `str\|None` | `None` (default) — dequantization reranking, no extra storage; `"f16"` — float16 exact reranking (+n×d×2 bytes); `"f32"` — float32 exact reranking (+n×d×4 bytes) |
-| `collection` | `str\|None` | Optional subdirectory name. If given, opens `path/collection/` — allows multiple isolated namespaces under one base directory. |
-
-### Insert / Update / Delete
+> Full reference: **[`docs/PYTHON_API.md`](docs/PYTHON_API.md)**
 
 ```python
+# Open / create
+db = Database.open(path, dimension, bits=4, seed=42, metric="ip",
+                   rerank=True, fast_mode=False, rerank_precision=None,
+                   collection=None)   # collection= → opens path/collection/
+
+# Write
 db.insert(id, vector, metadata=None, document=None)
-db.insert_batch(ids, vectors, metadatas=None, documents=None, mode="insert")
-# mode: "insert"  → raises RuntimeError if any ID already exists
-#       "upsert"  → insert or replace (always succeeds)
-#       "update"  → raises RuntimeError if any ID does not exist
+db.insert_batch(ids, vectors, metadatas=None, documents=None, mode="insert")  # "insert"|"upsert"|"update"
+db.upsert(id, vector, metadata=None, document=None)
+db.update(id, vector, metadata=None, document=None)        # RuntimeError if not found
+db.update_metadata(id, metadata=None, document=None)       # RuntimeError if not found
 
-db.upsert(id, vector, metadata=None, document=None)   # insert or replace
-db.update(id, vector, metadata=None, document=None)   # raises RuntimeError if id not found
-db.delete(id)                                         # → bool
-db.delete_batch(ids)                                  # delete multiple ids at once
+# Delete & retrieve
+db.delete(id)                        # → bool
+db.delete_batch(ids)                 # → int (count deleted)
+db.get(id)                           # → {id, metadata, document} | None
+db.get_many(ids)                     # → list[dict | None]
+db.list_all()                        # → list[str]
+db.list_ids(where_filter=None, limit=None, offset=0)       # paginated
+db.count(filter=None)                # → int
+db.stats()                           # → dict
+len(db) / "id" in db                 # container protocol
 
-# Metadata-only update — no re-upload of vector needed
-# raises RuntimeError if id not found
-db.update_metadata(id, metadata=None, document=None)
-```
+# Search
+results = db.search(query, top_k=10, filter=None, _use_ann=True,
+                    ann_search_list_size=None, include=None)
+# include: list of "id"|"score"|"metadata"|"document" (default all)
 
-### Retrieve
+all_results = db.query(query_embeddings, n_results=10, where_filter=None)
+# query_embeddings: np.ndarray (N, D) — returns list[list[dict]]
 
-```python
-db.get(id)                              # → {id, metadata, document} or None
-db.get_many(ids)                        # → list (None for missing)
-db.list_all()                           # → list of all ids
-db.list_ids(where_filter=None,          # → filtered, paginated id list
-            limit=None, offset=0)
-db.count(filter=None)                   # → int — number of matching vectors
-db.stats()                              # → {vector_count, disk_bytes, has_index, …}
+# Index
+db.create_index(max_degree=32, ef_construction=200, n_refinements=5,
+                search_list_size=128, alpha=1.2)
 
-# Python container protocol
-len(db)                                 # → int
-"my-id" in db                           # → bool
-```
-
-### Search
-
-```python
-results = db.search(
-    query,                      # np.ndarray or list[float]
-    top_k=10,
-    filter=None,                # metadata filter (see below)
-    _use_ann=True,              # use HNSW index if available
-    ann_search_list_size=None,  # HNSW ef_search (default: max_degree × 2)
-    include=None,               # list[str] | None — fields to include in results
-                                #   valid: "id", "score", "metadata", "document"
-)
-# Each result: {"id": str, "score": float, "metadata": dict, "document": str | None}
-
-# Batch multi-query
-all_results = db.query(
-    query_embeddings,           # np.ndarray shape (N, D)
-    n_results=10,
-    where_filter=None,
-)
-# Returns list[list[dict]] — one inner list per query vector
-```
-
-### Index (HNSW)
-
-Build **after** loading your data. Not updated incrementally — rebuild after large inserts.
-
-```python
-db.create_index(
-    max_degree=32,          # neighbors per node — higher = better recall, larger graph
-    ef_construction=200,    # beam size during build — higher = better quality
-    n_refinements=5,        # refinement passes — higher = better graph
-    search_list_size=128,   # alias for ef_construction
-    alpha=1.2,              # pruning factor
-)
-```
-
-### Metadata Filtering
-
-```python
-# Simple equality
-db.search(query, top_k=5, filter={"topic": "ml"})
-
-# Comparison operators: $eq $ne $gt $gte $lt $lte
+# Metadata filter operators
+# $eq $ne $gt $gte $lt $lte $in $nin $exists $contains $and $or
 db.search(query, top_k=5, filter={"year": {"$gte": 2023}})
-
-# Set operators: $in $nin
-db.search(query, top_k=5, filter={"status": {"$in": ["published", "featured"]}})
-
-# Field presence / string substring
-db.search(query, top_k=5, filter={"tags": {"$exists": True}})
-db.search(query, top_k=5, filter={"title": {"$contains": "neural"}})
-
-# Logical: $and $or
-db.search(query, top_k=5, filter={
-    "$and": [{"topic": "ml"}, {"year": {"$gte": 2023}}]
-})
+db.search(query, top_k=5, filter={"$and": [{"topic": "ml"}, {"year": {"$gte": 2023}}]})
 ```
 
 ---
