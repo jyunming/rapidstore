@@ -42,7 +42,14 @@ impl ProdQuantizer {
         let qjl_quantizer = QjlQuantizer::new(d, seed ^ 0xdeadbeef);
         let n = d.next_power_of_two();
 
-        Self { d, n, b, mse_quantizer, qjl_quantizer, fast_mode: false }
+        Self {
+            d,
+            n,
+            b,
+            mse_quantizer,
+            qjl_quantizer,
+            fast_mode: false,
+        }
     }
 
     /// Fast-path: skips the QJL residual quantization step. Ingest is ~30% faster;
@@ -52,7 +59,14 @@ impl ProdQuantizer {
         let qjl_quantizer = QjlQuantizer::new(d, seed ^ 0xdeadbeef);
         let n = d.next_power_of_two();
 
-        Self { d, n, b, mse_quantizer, qjl_quantizer, fast_mode: true }
+        Self {
+            d,
+            n,
+            b,
+            mse_quantizer,
+            qjl_quantizer,
+            fast_mode: true,
+        }
     }
 
     pub fn prepare_ip_query(&self, query: &Array1<f64>) -> PreparedIpQuery {
@@ -110,9 +124,7 @@ impl ProdQuantizer {
     /// centroid lookup. Used in HNSW construction when no raw vectors are stored.
     pub fn prepare_ip_query_from_codes(&self, idx: &[CodeIndex]) -> PreparedIpQueryLite {
         let centroids = &self.mse_quantizer.centroids;
-        let y: Vec<f32> = (0..self.n)
-            .map(|i| centroids[idx[i] as usize])
-            .collect();
+        let y: Vec<f32> = (0..self.n).map(|i| centroids[idx[i] as usize]).collect();
         PreparedIpQueryLite {
             y,
             sq: vec![0.0f32; self.n],
@@ -220,8 +232,8 @@ impl ProdQuantizer {
         // Horizontal reduction of mse_acc
         let mut tmp = [0.0f32; 8];
         _mm256_storeu_ps(tmp.as_mut_ptr(), mse_acc);
-        let mut mse_sum: f32 = tmp[0] + tmp[1] + tmp[2] + tmp[3]
-                             + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+        let mut mse_sum: f32 =
+            tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
 
         // Scalar tail for MSE
         while i < self.n {
@@ -276,9 +288,8 @@ impl ProdQuantizer {
         }
 
         _mm256_storeu_ps(tmp.as_mut_ptr(), qjl_acc);
-        let qjl_sum = tmp[0] + tmp[1] + tmp[2] + tmp[3]
-                    + tmp[4] + tmp[5] + tmp[6] + tmp[7]
-                    + qjl_tail;
+        let qjl_sum =
+            tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7] + qjl_tail;
 
         (mse_sum + (gamma as f32) * prep.qjl_scale * qjl_sum) as f64
     }
@@ -530,5 +541,324 @@ impl ProdQuantizer {
             out[i] = (val & mask) as CodeIndex;
             bit_pos += bits_per_idx;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array1;
+
+    fn make_pq(d: usize) -> ProdQuantizer {
+        ProdQuantizer::new(d, 4, 42)
+    }
+
+    #[test]
+    fn new_creates_correct_config() {
+        let d = 64;
+        let pq = make_pq(d);
+        assert_eq!(pq.d, d);
+        assert_eq!(pq.n, d.next_power_of_two());
+        assert_eq!(pq.b, 4);
+        assert!(!pq.fast_mode);
+    }
+
+    #[test]
+    fn new_srht_sets_fast_mode() {
+        let pq = ProdQuantizer::new_srht(64, 4, 42);
+        assert!(pq.fast_mode);
+    }
+
+    #[test]
+    fn quantize_returns_correct_output_sizes() {
+        let d = 64;
+        let pq = make_pq(d);
+        let x: Vec<f32> = (0..d).map(|i| i as f32 * 0.01).collect();
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        assert_eq!(idx.len(), pq.n);
+        assert_eq!(qjl.len(), pq.n.div_ceil(8));
+        assert!(gamma >= 0.0);
+    }
+
+    #[test]
+    fn fast_mode_returns_zero_gamma() {
+        let d = 64;
+        let pq = ProdQuantizer::new_srht(d, 4, 42);
+        let x: Vec<f32> = vec![1.0f32; d];
+        let (_idx, _qjl, gamma) = pq.quantize(&x);
+        assert_eq!(gamma, 0.0, "fast_mode should always produce gamma=0");
+    }
+
+    #[test]
+    fn fast_mode_qjl_all_zero_bits() {
+        let d = 64;
+        let pq = ProdQuantizer::new_srht(d, 4, 42);
+        let x: Vec<f32> = vec![1.0f32; d];
+        let (_idx, qjl, _gamma) = pq.quantize(&x);
+        assert!(
+            qjl.iter().all(|&b| b == 0),
+            "fast_mode qjl bits should all be 0"
+        );
+    }
+
+    #[test]
+    fn dequantize_returns_correct_dimension() {
+        let d = 64;
+        let pq = make_pq(d);
+        let x: Vec<f32> = (0..d).map(|i| i as f32 * 0.01).collect();
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        let recon = pq.dequantize(&idx, &qjl, gamma);
+        assert_eq!(recon.len(), d);
+    }
+
+    #[test]
+    fn quantize_dequantize_reasonable_reconstruction() {
+        let d = 64;
+        let pq = make_pq(d);
+        let x: Vec<f32> = (0..d).map(|i| (i as f32 * 0.1 - 3.2).sin()).collect();
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        let recon = pq.dequantize(&idx, &qjl, gamma);
+        let mse: f64 = x
+            .iter()
+            .zip(recon.iter())
+            .map(|(&a, &b)| (a as f64 - b).powi(2))
+            .sum::<f64>()
+            / d as f64;
+        assert!(mse < 2.0, "MSE too high: {}", mse);
+    }
+
+    #[test]
+    fn pack_unpack_mse_indices_roundtrip() {
+        let d = 64;
+        let pq = make_pq(d);
+        let x: Vec<f32> = (0..d).map(|i| i as f32 * 0.01).collect();
+        let (idx, _, _) = pq.quantize(&x);
+        let packed = pq.pack_mse_indices(&idx);
+        let mut unpacked = vec![0u16; pq.n];
+        pq.unpack_mse_indices(&packed, &mut unpacked);
+        assert_eq!(idx, unpacked, "pack/unpack roundtrip should be lossless");
+    }
+
+    #[test]
+    fn pack_mse_8bit_path_roundtrip() {
+        // b=9 → bits_per_idx = 8 → uses the fast 1-byte-per-index path
+        let d = 64;
+        let pq = ProdQuantizer::new(d, 9, 42);
+        let x: Vec<f32> = (0..d).map(|i| i as f32 * 0.005).collect();
+        let (idx, _, _) = pq.quantize(&x);
+        let packed = pq.pack_mse_indices(&idx);
+        assert_eq!(packed.len(), pq.n, "8-bit path: 1 byte per index");
+        let mut unpacked = vec![0u16; pq.n];
+        pq.unpack_mse_indices(&packed, &mut unpacked);
+        assert_eq!(idx, unpacked);
+    }
+
+    #[test]
+    fn pack_mse_low_bits_roundtrip() {
+        // b=2 → bits_per_idx=1
+        let d = 32;
+        let pq = ProdQuantizer::new(d, 2, 42);
+        let x: Vec<f32> = (0..d).map(|i| i as f32 * 0.01).collect();
+        let (idx, _, _) = pq.quantize(&x);
+        let packed = pq.pack_mse_indices(&idx);
+        let mut unpacked = vec![0u16; pq.n];
+        pq.unpack_mse_indices(&packed, &mut unpacked);
+        assert_eq!(idx, unpacked);
+    }
+
+    #[test]
+    fn quantize_batch_matches_single() {
+        let d = 32;
+        let pq = make_pq(d);
+        let x1: Vec<f32> = (0..d).map(|i| i as f32 * 0.01).collect();
+        let x2: Vec<f32> = (0..d).map(|i| -(i as f32) * 0.01).collect();
+        let batch = pq.quantize_batch(&[&x1, &x2]);
+        let single1 = pq.quantize(&x1);
+        let single2 = pq.quantize(&x2);
+        assert_eq!(batch[0], single1);
+        assert_eq!(batch[1], single2);
+    }
+
+    #[test]
+    fn dequantize_batch_matches_single() {
+        let d = 32;
+        let pq = make_pq(d);
+        let x: Vec<f32> = (0..d).map(|i| i as f32 * 0.01).collect();
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        let single = pq.dequantize(&idx, &qjl, gamma);
+        let batch = pq.dequantize_batch(&[(idx, qjl, gamma)]);
+        for i in 0..d {
+            let diff = (single[i] - batch[0][i]).abs();
+            assert!(
+                diff < 1e-4,
+                "mismatch at dim {}: {} vs {}",
+                i,
+                single[i],
+                batch[0][i]
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_ip_query_and_score_positive() {
+        let d = 32;
+        let pq = make_pq(d);
+        let x: Vec<f32> = vec![1.0f32; d];
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        let query = Array1::from_iter(x.iter().map(|&v| v as f64));
+        let prep = pq.prepare_ip_query(&query);
+        let score = pq.score_ip_encoded(&prep, &idx, &qjl, gamma);
+        assert!(score > 0.0, "self IP score should be positive: {}", score);
+    }
+
+    #[test]
+    fn prepare_ip_query_lite_and_score_positive() {
+        let d = 32;
+        let pq = make_pq(d);
+        let x: Vec<f32> = vec![1.0f32; d];
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        let query = Array1::from_iter(x.iter().map(|&v| v as f64));
+        let prep_lite = pq.prepare_ip_query_lite(&query);
+        let score = pq.score_ip_encoded_lite(&prep_lite, &idx, &qjl, gamma);
+        assert!(
+            score > 0.0,
+            "lite self IP score should be positive: {}",
+            score
+        );
+    }
+
+    #[test]
+    fn prepare_ip_query_from_codes_scores_finite() {
+        let d = 32;
+        let pq = make_pq(d);
+        let x: Vec<f32> = vec![1.0f32; d];
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        let prep = pq.prepare_ip_query_from_codes(&idx);
+        let score = pq.score_ip_encoded_lite(&prep, &idx, &qjl, gamma);
+        assert!(score.is_finite(), "score from codes should be finite");
+    }
+
+    #[test]
+    fn score_ip_with_zero_gamma_skips_qjl() {
+        let d = 32;
+        let pq = make_pq(d);
+        let x: Vec<f32> = vec![0.5f32; d];
+        let (idx, qjl, _gamma) = pq.quantize(&x);
+        let query = Array1::from_iter(x.iter().map(|&v| v as f64));
+
+        let prep = pq.prepare_ip_query(&query);
+        let score_full = pq.score_ip_encoded(&prep, &idx, &qjl, 0.0);
+        assert!(score_full.is_finite());
+
+        let prep_lite = pq.prepare_ip_query_lite(&query);
+        let score_lite = pq.score_ip_encoded_lite(&prep_lite, &idx, &qjl, 0.0);
+        assert!(score_lite.is_finite());
+    }
+
+    #[test]
+    fn rotate_query_for_reranking_returns_n_dims() {
+        let d = 64;
+        let pq = make_pq(d);
+        let query = Array1::from_iter((0..d).map(|i| i as f64 * 0.01));
+        let rotated = pq.rotate_query_for_reranking(&query);
+        assert_eq!(rotated.len(), pq.n);
+    }
+
+    #[test]
+    fn dequantize_single_no_parallel_matches_dequantize() {
+        let d = 32;
+        let pq = make_pq(d);
+        let x: Vec<f32> = vec![0.5f32; d];
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        let a = pq.dequantize(&idx, &qjl, gamma);
+        let b = pq.dequantize_single_no_parallel(&idx, &qjl, gamma);
+        for i in 0..d {
+            let diff = (a[i] - b[i]).abs();
+            assert!(diff < 1e-5, "mismatch at dim {}", i);
+        }
+    }
+
+    #[test]
+    fn score_ip_query_vs_query_lite_close() {
+        // Scores from full LUT vs lite centroid lookup should be close (same input)
+        let d = 32;
+        let pq = make_pq(d);
+        let x: Vec<f32> = (0..d).map(|i| (i as f32 * 0.13).sin()).collect();
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        let query = Array1::from_iter(x.iter().map(|&v| v as f64));
+
+        let prep = pq.prepare_ip_query(&query);
+        let score_full = pq.score_ip_encoded(&prep, &idx, &qjl, gamma);
+
+        let prep_lite = pq.prepare_ip_query_lite(&query);
+        let score_lite = pq.score_ip_encoded_lite(&prep_lite, &idx, &qjl, gamma);
+
+        // They use different paths but both estimate the same inner product
+        let diff = (score_full - score_lite).abs();
+        assert!(
+            diff < 10.0,
+            "full vs lite score should be reasonably close: {} vs {}",
+            score_full,
+            score_lite
+        );
+    }
+
+    /// Directly invoke the scalar scoring paths (avoids AVX2 dispatch on x86_64).
+    #[test]
+    fn score_ip_encoded_scalar_gives_finite_result() {
+        let d = 32;
+        let pq = make_pq(d);
+        let x: Vec<f32> = vec![1.0f32; d];
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        let query = Array1::from_iter(x.iter().map(|&v| v as f64));
+        let prep = pq.prepare_ip_query(&query);
+        let score = pq.score_ip_encoded_scalar(&prep, &idx, &qjl, gamma);
+        assert!(
+            score.is_finite(),
+            "scalar score_ip_encoded should be finite: {}",
+            score
+        );
+        assert!(score > 0.0, "scalar self-score should be positive");
+    }
+
+    #[test]
+    fn score_ip_encoded_lite_scalar_gives_finite_result() {
+        let d = 32;
+        let pq = make_pq(d);
+        let x: Vec<f32> = vec![1.0f32; d];
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        let query = Array1::from_iter(x.iter().map(|&v| v as f64));
+        let prep_lite = pq.prepare_ip_query_lite(&query);
+        let score = pq.score_ip_encoded_lite_scalar(&prep_lite, &idx, &qjl, gamma);
+        assert!(
+            score.is_finite(),
+            "scalar score_ip_encoded_lite should be finite: {}",
+            score
+        );
+        assert!(score > 0.0, "scalar lite self-score should be positive");
+    }
+
+    #[test]
+    fn score_ip_encoded_scalar_zero_gamma_path() {
+        let d = 32;
+        let pq = make_pq(d);
+        let x: Vec<f32> = vec![0.5f32; d];
+        let (idx, qjl, _gamma) = pq.quantize(&x);
+        let query = Array1::from_iter(x.iter().map(|&v| v as f64));
+        let prep = pq.prepare_ip_query(&query);
+        let score = pq.score_ip_encoded_scalar(&prep, &idx, &qjl, 0.0);
+        assert!(score.is_finite());
+    }
+
+    #[test]
+    fn score_ip_encoded_lite_scalar_zero_gamma_path() {
+        let d = 32;
+        let pq = make_pq(d);
+        let x: Vec<f32> = vec![0.5f32; d];
+        let (idx, qjl, _gamma) = pq.quantize(&x);
+        let query = Array1::from_iter(x.iter().map(|&v| v as f64));
+        let prep_lite = pq.prepare_ip_query_lite(&query);
+        let score = pq.score_ip_encoded_lite_scalar(&prep_lite, &idx, &qjl, 0.0);
+        assert!(score.is_finite());
     }
 }

@@ -178,12 +178,107 @@ mod tests {
         let signs = vec![1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0];
         let mut y = vec![0.0; n];
         let mut x_hat = vec![0.0; d];
-        
+
         srht(&x, &signs, &mut y);
         inverse_srht(&y, &signs, &mut x_hat);
-        
+
         for i in 0..d {
             assert!((x[i] - x_hat[i]).abs() < 1e-5);
+        }
+    }
+
+    /// Directly tests the scalar FWHT path (avoids AVX2 dispatch).
+    #[test]
+    fn fwht_scalar_all_ones_size4() {
+        let mut a = vec![1.0f32, 1.0, 1.0, 1.0];
+        fwht_scalar(&mut a);
+        assert_eq!(a, vec![4.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn fwht_scalar_size_2() {
+        let mut a = vec![3.0f32, 1.0];
+        fwht_scalar(&mut a);
+        assert_eq!(a, vec![4.0, 2.0]);
+    }
+
+    #[test]
+    fn fwht_scalar_size_8_all_ones() {
+        let mut a = vec![1.0f32; 8];
+        fwht_scalar(&mut a);
+        assert_eq!(a[0], 8.0);
+        for i in 1..8 {
+            assert_eq!(a[i], 0.0, "element {} should be 0", i);
+        }
+    }
+
+    #[test]
+    fn fwht_scalar_involution() {
+        // Applying FWHT twice gives n * original (it is its own inverse up to scale)
+        let orig = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut a = orig.clone();
+        fwht_scalar(&mut a);
+        fwht_scalar(&mut a);
+        let n = orig.len() as f32;
+        for i in 0..orig.len() {
+            let diff = (a[i] - n * orig[i]).abs();
+            assert!(
+                diff < 1e-5,
+                "FWHT^2 mismatch at {}: {} vs {}",
+                i,
+                a[i],
+                n * orig[i]
+            );
+        }
+    }
+
+    #[test]
+    fn srht_preserves_norm() {
+        let d = 4;
+        let x = vec![1.0f32, 0.0, 0.0, 0.0];
+        let signs = vec![1.0f32; 4];
+        let mut out = vec![0.0f32; 4];
+        srht(&x, &signs, &mut out);
+        let norm: f32 = out.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0f32).abs() < 0.01,
+            "SRHT should preserve norm: {}",
+            norm
+        );
+    }
+
+    #[test]
+    fn srht_padding_with_non_power_of_two_d() {
+        let d: usize = 3;
+        let x = vec![1.0f32, 2.0, 3.0];
+        let signs = vec![1.0f32, -1.0, 1.0, 1.0];
+        let n = d.next_power_of_two();
+        let mut out = vec![0.0f32; n];
+        srht(&x, &signs, &mut out);
+        assert_eq!(out.len(), n);
+        assert!(out.iter().any(|&v| v != 0.0));
+    }
+
+    #[test]
+    fn inverse_srht_roundtrip_non_power_of_two() {
+        let d: usize = 5;
+        let x = vec![2.0f32, -1.0, 0.5, 3.0, -0.5];
+        let n = d.next_power_of_two();
+        let signs: Vec<f32> = (0..n)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let mut y = vec![0.0f32; n];
+        srht(&x, &signs, &mut y);
+        let mut x_hat = vec![0.0f32; d];
+        inverse_srht(&y, &signs, &mut x_hat);
+        for i in 0..d {
+            assert!(
+                (x[i] - x_hat[i]).abs() < 1e-5,
+                "mismatch at {}: {} vs {}",
+                i,
+                x[i],
+                x_hat[i]
+            );
         }
     }
 }

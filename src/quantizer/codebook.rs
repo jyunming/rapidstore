@@ -143,9 +143,17 @@ mod tests {
     #[test]
     fn test_log_gamma_known_values() {
         // Γ(1) = 0! = 1  →  log_gamma(1) = 0
-        assert!((log_gamma(1.0)).abs() < 1e-9, "log_gamma(1) = {}", log_gamma(1.0));
+        assert!(
+            (log_gamma(1.0)).abs() < 1e-9,
+            "log_gamma(1) = {}",
+            log_gamma(1.0)
+        );
         // Γ(2) = 1! = 1  →  log_gamma(2) = 0
-        assert!((log_gamma(2.0)).abs() < 1e-9, "log_gamma(2) = {}", log_gamma(2.0));
+        assert!(
+            (log_gamma(2.0)).abs() < 1e-9,
+            "log_gamma(2) = {}",
+            log_gamma(2.0)
+        );
         // Γ(5) = 4! = 24  →  log_gamma(5) = ln(24) ≈ 3.17805...
         let expected = 24.0_f64.ln();
         assert!(

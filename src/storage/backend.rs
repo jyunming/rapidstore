@@ -78,9 +78,17 @@ impl StorageProvider for LocalProvider {
         };
 
         if target_dir.exists() {
-            let dir_prefix = target_dir.strip_prefix(&self.root).ok()
+            let dir_prefix = target_dir
+                .strip_prefix(&self.root)
+                .ok()
                 .and_then(|p| p.to_str())
-                .map(|s| if s.is_empty() { String::new() } else { format!("{}/", s) })
+                .map(|s| {
+                    if s.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}/", s)
+                    }
+                })
                 .unwrap_or_default();
 
             for entry in fs::read_dir(&target_dir)? {
@@ -168,5 +176,168 @@ impl StorageBackend {
 
     pub fn size(&self, path: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         self.provider.size(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn make_backend() -> (tempfile::TempDir, StorageBackend) {
+        let dir = tempdir().unwrap();
+        let backend = StorageBackend::from_uri(dir.path().to_str().unwrap()).unwrap();
+        (dir, backend)
+    }
+
+    #[test]
+    fn from_uri_local_path_creates_dir() {
+        let dir = tempdir().unwrap();
+        let new_dir = dir.path().join("mydb");
+        let _backend = StorageBackend::from_uri(new_dir.to_str().unwrap()).unwrap();
+        assert!(new_dir.is_dir());
+    }
+
+    #[test]
+    fn from_uri_file_scheme() {
+        let dir = tempdir().unwrap();
+        // Build a valid file:// URI (forward slashes, no drive-letter colon issue on Windows)
+        let path_str = dir.path().to_str().unwrap().replace('\\', "/");
+        let uri = if path_str.starts_with('/') {
+            format!("file://{}", path_str)
+        } else {
+            // Windows: "C:/..." → "file:///C:/..."
+            format!("file:///{}", path_str)
+        };
+        let result = StorageBackend::from_uri(&uri);
+        assert!(
+            result.is_ok(),
+            "file:// URI should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn from_uri_cloud_rejected() {
+        let result = StorageBackend::from_uri("s3://my-bucket/path");
+        assert!(result.is_err(), "s3:// should be rejected");
+        let result2 = StorageBackend::from_uri("gs://my-bucket/path");
+        assert!(result2.is_err(), "gs:// should be rejected");
+    }
+
+    #[test]
+    fn write_and_read_roundtrip() {
+        let (_dir, backend) = make_backend();
+        let data = b"hello world";
+        backend.write("test.bin", data).unwrap();
+        let read = backend.read("test.bin").unwrap();
+        assert_eq!(read.as_slice(), data);
+    }
+
+    #[test]
+    fn exists_returns_correct_values() {
+        let (_dir, backend) = make_backend();
+        assert!(!backend.exists("nonexistent.bin"));
+        backend.write("file.bin", b"data").unwrap();
+        assert!(backend.exists("file.bin"));
+    }
+
+    #[test]
+    fn delete_removes_file() {
+        let (_dir, backend) = make_backend();
+        backend.write("to_delete.bin", b"bye").unwrap();
+        assert!(backend.exists("to_delete.bin"));
+        backend.delete("to_delete.bin").unwrap();
+        assert!(!backend.exists("to_delete.bin"));
+    }
+
+    #[test]
+    fn delete_nonexistent_is_ok() {
+        let (_dir, backend) = make_backend();
+        // Should not error on missing file
+        let result = backend.delete("does_not_exist.bin");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn size_returns_correct_value() {
+        let (_dir, backend) = make_backend();
+        let data = b"12345";
+        backend.write("sized.bin", data).unwrap();
+        let size = backend.size("sized.bin").unwrap();
+        assert_eq!(size, 5);
+    }
+
+    #[test]
+    fn list_empty_prefix_returns_all_files() {
+        let (_dir, backend) = make_backend();
+        backend.write("a.bin", b"a").unwrap();
+        backend.write("b.bin", b"b").unwrap();
+        backend.write("c.txt", b"c").unwrap();
+        let mut files = backend.list("").unwrap();
+        files.sort();
+        assert_eq!(files.len(), 3);
+    }
+
+    #[test]
+    fn list_with_name_prefix_filters() {
+        let (_dir, backend) = make_backend();
+        backend.write("seg-00000000.bin", b"s0").unwrap();
+        backend.write("seg-00000001.bin", b"s1").unwrap();
+        backend.write("manifest.json", b"{}").unwrap();
+        let files = backend.list("seg-").unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|f| f.contains("seg-")));
+    }
+
+    #[test]
+    fn list_with_subdir_prefix() {
+        let (dir, backend) = make_backend();
+        // Create a subdirectory with files via the backend
+        fs::create_dir_all(dir.path().join("subdir")).unwrap();
+        backend.write("subdir/file1.bin", b"f1").unwrap();
+        backend.write("subdir/file2.bin", b"f2").unwrap();
+        backend.write("root.bin", b"r").unwrap();
+
+        // List all files in root — should include root.bin and subdir entry
+        let all = backend.list("").unwrap();
+        assert!(all.iter().any(|f| f.contains("root")));
+
+        // List with subdir prefix — should list files in that directory
+        let sub = backend.list("subdir").unwrap();
+        assert_eq!(sub.len(), 2);
+        assert!(sub.iter().all(|f| f.contains("subdir")));
+    }
+
+    #[test]
+    fn list_nonexistent_subdir_returns_empty() {
+        let (_dir, backend) = make_backend();
+        let files = backend.list("nonexistent_subdir/").unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn write_creates_intermediate_directories() {
+        let (_dir, backend) = make_backend();
+        backend.write("deep/nested/file.bin", b"data").unwrap();
+        assert!(backend.exists("deep/nested/file.bin"));
+    }
+
+    #[test]
+    fn overwrite_replaces_content() {
+        let (_dir, backend) = make_backend();
+        backend.write("file.bin", b"old").unwrap();
+        backend.write("file.bin", b"new content").unwrap();
+        let data = backend.read("file.bin").unwrap();
+        assert_eq!(data.as_slice(), b"new content");
+    }
+
+    #[test]
+    fn base_uri_stored() {
+        let dir = tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let backend = StorageBackend::from_uri(uri).unwrap();
+        assert_eq!(backend.base_uri, uri);
     }
 }

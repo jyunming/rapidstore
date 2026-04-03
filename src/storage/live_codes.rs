@@ -94,7 +94,10 @@ impl LiveCodesFile {
             let new_capacity = self.capacity + GROW_SLOTS;
             self.mmap = None; // mmap must be dropped before set_len on Windows
             self.ensure_open()?;
-            self.file.as_ref().unwrap().set_len((new_capacity * self.stride) as u64)?;
+            self.file
+                .as_ref()
+                .unwrap()
+                .set_len((new_capacity * self.stride) as u64)?;
             self.capacity = new_capacity;
             self.remap()?;
         }
@@ -109,7 +112,10 @@ impl LiveCodesFile {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.mmap = None; // mmap must be dropped before set_len on Windows
         self.ensure_open()?;
-        self.file.as_ref().unwrap().set_len((new_len * self.stride) as u64)?;
+        self.file
+            .as_ref()
+            .unwrap()
+            .set_len((new_len * self.stride) as u64)?;
         self.capacity = new_len;
         self.len = new_len;
         self.remap()?;
@@ -175,5 +181,215 @@ impl LiveCodesFile {
         self.len = 0;
         self.capacity = 0;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    const STRIDE: usize = 16;
+
+    fn make_lc() -> (tempfile::TempDir, LiveCodesFile) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live_codes.bin");
+        let lc = LiveCodesFile::open(path, STRIDE).unwrap();
+        (dir, lc)
+    }
+
+    // -----------------------------------------------------------------------
+    // open / basic state
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn open_empty_file_has_zero_len() {
+        let (_dir, lc) = make_lc();
+        assert_eq!(lc.len(), 0);
+        assert_eq!(lc.stride(), STRIDE);
+        assert_eq!(lc.byte_len(), 0);
+    }
+
+    #[test]
+    fn as_bytes_empty_returns_empty_slice() {
+        let (_dir, lc) = make_lc();
+        assert_eq!(lc.as_bytes().len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // alloc_slot
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn alloc_first_slot_returns_zero() {
+        let (_dir, mut lc) = make_lc();
+        let slot = lc.alloc_slot().unwrap();
+        assert_eq!(slot, 0);
+        assert_eq!(lc.len(), 1);
+    }
+
+    #[test]
+    fn alloc_multiple_slots_are_sequential() {
+        let (_dir, mut lc) = make_lc();
+        for i in 0..5usize {
+            let slot = lc.alloc_slot().unwrap();
+            assert_eq!(slot, i);
+        }
+        assert_eq!(lc.len(), 5);
+    }
+
+    #[test]
+    fn alloc_grows_capacity_in_chunks() {
+        let (_dir, mut lc) = make_lc();
+        // Allocate one slot — forces a GROW_SLOTS (16384) expansion
+        lc.alloc_slot().unwrap();
+        assert!(lc.capacity >= GROW_SLOTS);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_slot / get_slot_mut
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_and_read_slot_data() {
+        let (_dir, mut lc) = make_lc();
+        lc.alloc_slot().unwrap();
+        let data = [42u8; STRIDE];
+        lc.get_slot_mut(0).copy_from_slice(&data);
+        assert_eq!(lc.get_slot(0), &data);
+    }
+
+    #[test]
+    fn two_slots_do_not_overlap() {
+        let (_dir, mut lc) = make_lc();
+        lc.alloc_slot().unwrap();
+        lc.alloc_slot().unwrap();
+
+        let data0 = [1u8; STRIDE];
+        let data1 = [2u8; STRIDE];
+        lc.get_slot_mut(0).copy_from_slice(&data0);
+        lc.get_slot_mut(1).copy_from_slice(&data1);
+
+        assert_eq!(lc.get_slot(0), &data0, "slot 0 corrupted by slot 1 write");
+        assert_eq!(lc.get_slot(1), &data1, "slot 1 data incorrect");
+    }
+
+    // -----------------------------------------------------------------------
+    // truncate_to
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn truncate_to_shrinks_len() {
+        let (_dir, mut lc) = make_lc();
+        for _ in 0..5 {
+            lc.alloc_slot().unwrap();
+        }
+        lc.truncate_to(2).unwrap();
+        assert_eq!(lc.len(), 2);
+        assert_eq!(lc.capacity, 2);
+    }
+
+    #[test]
+    fn truncate_to_zero_empties() {
+        let (_dir, mut lc) = make_lc();
+        lc.alloc_slot().unwrap();
+        lc.truncate_to(0).unwrap();
+        assert_eq!(lc.len(), 0);
+        assert_eq!(lc.byte_len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // flush
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn flush_with_data_does_not_panic() {
+        let (_dir, mut lc) = make_lc();
+        lc.alloc_slot().unwrap();
+        lc.flush().unwrap();
+    }
+
+    #[test]
+    fn flush_empty_does_not_panic() {
+        let (_dir, lc) = make_lc();
+        lc.flush().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // release_handles / release_mmap
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn release_handles_then_alloc_reopens() {
+        let (_dir, mut lc) = make_lc();
+        lc.alloc_slot().unwrap();
+        let data = [77u8; STRIDE];
+        lc.get_slot_mut(0).copy_from_slice(&data);
+        lc.flush().unwrap();
+
+        lc.release_handles();
+        // After release, alloc_slot must reopen the file
+        let slot = lc.alloc_slot().unwrap();
+        assert_eq!(slot, 1, "len should resume at 1 after reopen");
+    }
+
+    #[test]
+    fn release_mmap_then_alloc_continues() {
+        let (_dir, mut lc) = make_lc();
+        lc.alloc_slot().unwrap();
+        lc.release_mmap();
+        let slot = lc.alloc_slot().unwrap();
+        assert_eq!(slot, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // advise_random (no-op on non-Unix, no panic anywhere)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn advise_random_does_not_panic() {
+        let (_dir, mut lc) = make_lc();
+        lc.alloc_slot().unwrap();
+        lc.advise_random();
+    }
+
+    // -----------------------------------------------------------------------
+    // as_bytes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn as_bytes_length_matches_capacity_times_stride() {
+        let (_dir, mut lc) = make_lc();
+        lc.alloc_slot().unwrap();
+        // After first alloc the file grows by GROW_SLOTS
+        assert_eq!(lc.as_bytes().len(), lc.capacity * STRIDE);
+    }
+
+    // -----------------------------------------------------------------------
+    // clear
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clear_resets_to_empty() {
+        let (_dir, mut lc) = make_lc();
+        lc.alloc_slot().unwrap();
+        lc.alloc_slot().unwrap();
+        lc.clear().unwrap();
+        assert_eq!(lc.len(), 0);
+        assert_eq!(lc.byte_len(), 0);
+        assert_eq!(lc.capacity, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // byte_len helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn byte_len_equals_len_times_stride() {
+        let (_dir, mut lc) = make_lc();
+        for _ in 0..3 {
+            lc.alloc_slot().unwrap();
+        }
+        assert_eq!(lc.byte_len(), lc.len() * STRIDE);
     }
 }

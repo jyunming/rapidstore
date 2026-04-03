@@ -1,52 +1,51 @@
-# RapidStore
+# TurboQuantDB
 
-A high-performance, embedded vector database written in Rust with Python bindings. It implements Google DeepMind's **TurboQuant** algorithm (arXiv:2504.19874) for data-oblivious vector quantization — zero training time, 8–16x memory compression, and provably unbiased inner product estimation. It supports both:
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/turboquantdb)](https://pypi.org/project/turboquantdb/)
 
-- Embedded mode (library + Python bindings)
-- Service mode (multi-tenant HTTP API with background jobs)
+An embedded vector database written in Rust with Python bindings, implementing the **TurboQuant** algorithm ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) — zero training time, 2–4 bit compression, and provably unbiased inner product estimation.
 
-The quantization approach is inspired by TurboQuant, with practical storage/indexing components implemented in this repository.
+**Goal:** make massive embedding datasets practical on lightweight hardware. A 50k-vector, 1536-dim collection that would occupy 293 MB as raw float32 fits in **70 MB on disk and 488 MB of RAM** with TQDB b=4 — enabling laptop-scale RAG over millions of documents without a dedicated server.
 
-## Current Capabilities
+Two deployment modes:
+- **Embedded** — `turboquantdb` Python package, runs in-process (no daemon)
+- **Server** — Axum HTTP service in `server/`, with multi-tenancy, RBAC, quotas, and async jobs
 
-- **Zero training time** — No `train()` step. Vectors are quantized and stored immediately on insert.
-- **Extreme compression** — Reduces float32 embeddings to 2–4 bits per coordinate (8–16x less RAM).
-- **Unbiased scoring** — Quantized Johnson-Lindenstrauss (QJL) transforms guarantee unbiased inner product estimation.
-- **Optional ANN index** — Build an HNSW graph after loading data for sub-millisecond search on large collections.
-- **Metadata filtering** — Filter search results by metadata fields, with support for MongoDB-style operators.
-- **Crash recovery** — Write-ahead log (WAL) ensures inserts survive process crashes without explicit flushing.
-- **Python native** — Built with PyO3 and Maturin; runs in-process, no server required.
-- **Server mode** — Optional Axum HTTP service with multi-tenancy, RBAC, quotas, and async jobs.
+---
 
-- Collection-scoped storage model (`tenant/database/collection` in service mode)
-- Batch write APIs: add, upsert, update, delete
-- Query APIs with include controls and pagination (`offset`, `limit`)
-- Filter support (`filter` / `where_filter`) for query/delete/get paths
-- Async maintenance jobs: compact, index build, snapshot
-- Persisted auth/RBAC, quotas, and job store in server mode
-- Quota admission controls for vectors, disk usage, and concurrent jobs
+## Key Properties
 
-<<<<<<< HEAD
+- **Zero training** — No `train()` step. Vectors are quantized and stored immediately on insert.
+- **4.2× compression** — Reduces float32 embeddings to 2–4 bits per coordinate; b=4 stores each vector in 1,466 bytes vs 6,144 bytes for float32.
+- **Unbiased scoring** — QJL transform guarantees unbiased inner product estimation.
+- **Optional ANN index** — Build an HNSW graph after loading data for fast approximate search.
+- **Metadata filtering** — MongoDB-style filter operators on any metadata field.
+- **Crash recovery** — Write-ahead log (WAL) ensures durability without explicit flushing.
+- **Python native** — Built with PyO3 and Maturin; no server or sidecar required.
+
+---
+
 ## Installation
 
 ### Prerequisites
 
-TurboQuantDB is a Rust extension that compiles into Python. You need:
-
-- [Rust](https://rustup.rs/) (stable toolchain)
+- [Rust](https://rustup.rs/) stable toolchain
 - Python 3.8+
-- A C++ compiler:
-  - **Windows**: [Visual Studio Build Tools](https://aka.ms/vs/17/release/vs_BuildTools.exe) — select **"Desktop development with C++"** workload
-  - **macOS**: `xcode-select --install`
-  - **Linux**: `sudo apt-get install build-essential`
+- C++ compiler: Visual Studio Build Tools (Windows) · `xcode-select --install` (macOS) · `build-essential` (Linux)
 
-### Build
+### Build from source
 
 ```bash
 python -m venv venv
 source venv/bin/activate        # Windows: .\venv\Scripts\activate
 pip install maturin
-maturin develop --release       # Compiles Rust and installs into venv
+maturin develop --release
+```
+
+### Install pre-built wheel
+
+```bash
+pip install turboquantdb
 ```
 
 ---
@@ -57,177 +56,164 @@ maturin develop --release       # Compiles Rust and installs into venv
 import numpy as np
 from turboquantdb import Database
 
-# Open (or create) a database
-db = Database.open("./my_db", dimension=128, bits=4, metric="cosine")
+db = Database.open("./my_db", dimension=1536, bits=4, metric="ip", rerank=True)
 
-# Insert vectors
-db.insert("doc-1", np.random.randn(128).tolist(), metadata={"topic": "ml"}, document="Machine learning intro")
-db.insert("doc-2", np.random.randn(128).tolist(), metadata={"topic": "systems"}, document="Rust memory model")
+db.insert("doc-1", np.random.randn(1536).astype("f4"), metadata={"topic": "ml"}, document="Machine learning intro")
+db.insert("doc-2", np.random.randn(1536).astype("f4"), metadata={"topic": "systems"}, document="Rust memory model")
 
-# Search
-query = np.random.randn(128).tolist()
-results = db.search(query, top_k=5)
-
+results = db.search(np.random.randn(1536).astype("f4"), top_k=5)
 for r in results:
     print(r["id"], r["score"], r["document"])
 ```
 
 ---
 
-## Python API Reference
+## Python API
 
-### `Database.open(path, dimension, bits=4, seed=42, metric="ip", rerank=True)`
-
-Opens an existing database or creates a new one.
+### `Database.open(path, dimension, bits=4, seed=42, metric="ip", rerank=True, fast_mode=False)`
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `path` | `str` | Directory path for database files |
 | `dimension` | `int` | Vector dimension (must match on reopen) |
-| `bits` | `int` | Quantization bits — `2` (16x compression) or `4` (8x compression, higher recall) |
-| `seed` | `int` | Random seed for quantizer initialization (must match on reopen) |
-| `metric` | `str` | `"ip"` (inner product), `"cosine"`, or `"l2"` |
-| `rerank` | `bool` | Store raw vectors for reranking; improves recall at the cost of extra disk/RAM |
+| `bits` | `int` | Quantization bits: `4` (4.2× compression) or `8` (2.5× compression, higher recall) |
+| `seed` | `int` | RNG seed for quantizer — must match across sessions |
+| `metric` | `str` | `"ip"`, `"cosine"`, or `"l2"` |
+| `rerank` | `bool` | Store dequantized vectors for final reranking; improves recall |
+| `fast_mode` | `bool` | Skip QJL stage — ~2× faster ingest, ~3pp recall loss |
 
-### Insert & Update
+### Insert / Update / Delete
 
 ```python
-# Single insert
 db.insert(id, vector, metadata=None, document=None)
-
-# Batch insert — chunked internally at 2000 vectors for memory efficiency
 db.insert_batch(ids, vectors, metadatas=None, documents=None, mode="insert")
 # mode: "insert" | "upsert" | "update"
 
-# Upsert / update
-db.upsert(id, vector, metadata=None, document=None)   # insert or replace
-db.update(id, vector, metadata=None, document=None)   # error if id not found
+db.upsert(id, vector, metadata=None, document=None)
+db.update(id, vector, metadata=None, document=None)
+db.delete(id)
 ```
 
-### Delete & Retrieve
+### Retrieve
 
 ```python
-db.delete(id)                     # Returns True if id existed
-db.get(id)                        # Returns {id, metadata, document} or None
-db.get_many(ids)                  # Returns list; None for missing ids
-db.list_all()                     # Returns all ids as a list
+db.get(id)             # → {id, metadata, document} or None
+db.get_many(ids)       # → list (None for missing)
+db.list_all()          # → list of all ids
+db.stats()             # → {vector_count, disk_bytes, has_index, …}
 ```
 
 ### Search
 
 ```python
 results = db.search(
-    query,                        # list[float] or np.ndarray
+    query,                      # np.ndarray or list[float]
     top_k=10,
-    filter=None,                  # metadata filter dict (see Filtering section)
-    _use_ann=True,                # use HNSW index if available
-    ann_search_list_size=None,    # HNSW ef_search parameter (default: max_degree * 2)
+    filter=None,                # metadata filter (see below)
+    _use_ann=True,              # use HNSW index if available
+    ann_search_list_size=None,  # HNSW ef_search (default: max_degree × 2)
 )
 # Each result: {"id": str, "score": float, "metadata": dict, "document": str | None}
 ```
 
 ### Index (HNSW)
 
-Building an HNSW index is optional but dramatically improves search latency on large collections.
+Build **after** loading your data. Not updated incrementally — rebuild after large inserts.
 
 ```python
 db.create_index(
-    max_degree=16,          # Max neighbors per node (higher = better recall, larger graph)
-    search_list_size=64,    # Beam size during construction (higher = better quality)
-    alpha=1.2,              # Pruning factor
+    max_degree=32,          # neighbors per node — higher = better recall, larger graph
+    ef_construction=200,    # beam size during build — higher = better quality
+    n_refinements=5,        # refinement passes — higher = better graph
+    search_list_size=128,   # alias for ef_construction
+    alpha=1.2,              # pruning factor
 )
 ```
 
-Build the index **after** loading your data. It is not updated incrementally — rebuild after large batches of inserts.
-
-### Stats
+### Metadata Filtering
 
 ```python
-stats = db.stats()
-# Returns: vector_count, segment_count, total_disk_bytes, index_nodes,
-#          live_slots, has_index, ram_estimate_bytes, etc.
+# Simple equality
+db.search(query, top_k=5, filter={"topic": "ml"})
+
+# Comparison operators: $eq $ne $gt $gte $lt $lte
+db.search(query, top_k=5, filter={"year": {"$gte": 2023}})
+
+# Logical: $and $or
+db.search(query, top_k=5, filter={
+    "$and": [{"topic": "ml"}, {"year": {"$gte": 2023}}]
+})
 ```
 
 ---
 
-## Metadata Filtering
+## Recommended Presets
 
-Filters are applied server-side during search. Two syntaxes are supported:
+### High Quality — recall matters most
 
-**Simple equality** (shorthand):
 ```python
-results = db.search(query, top_k=5, filter={"topic": "ml", "year": 2024})
+db = Database.open(path, dimension=DIM, bits=8, rerank=True)
+db.create_index(max_degree=32, ef_construction=200, n_refinements=8)
+results = db.search(query, top_k=10, ann_search_list_size=200)
+# ~97% Recall@10 at 50k×1536  |  ~38s ingest  |  119 MB disk
 ```
 
-**MongoDB-style operators**:
-```python
-# Comparison: $eq, $ne, $gt, $gte, $lt, $lte
-filter = {"year": {"$gte": 2023}}
+### Balanced — default recommendation
 
-# Logical: $and, $or
-filter = {
-    "$and": [
-        {"topic": {"$eq": "ml"}},
-        {"year": {"$gte": 2023}}
-    ]
-}
+```python
+db = Database.open(path, dimension=DIM, bits=4, rerank=True)
+db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
+results = db.search(query, top_k=10, ann_search_list_size=128)
+# ~89% Recall@10 at 50k×1536  |  ~26s ingest  |  70 MB disk
+```
+
+### Fast Build — ingest speed is priority
+
+```python
+db = Database.open(path, dimension=DIM, bits=4, fast_mode=True, rerank=False)
+db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
+results = db.search(query, top_k=10, ann_search_list_size=128)
+# ~83% Recall@10 at 50k×1536  |  ~22s ingest  |  70 MB disk
 ```
 
 ---
 
-## Distance Metrics
+## Benchmarks
 
-| Metric | `metric=` | Best for |
-|--------|-----------|----------|
-| Inner product | `"ip"` | Pre-normalized embeddings (fastest) |
-| Cosine similarity | `"cosine"` | Text embeddings where magnitude varies |
-| Euclidean (L2) | `"l2"` | Image features, coordinate spaces |
+Full results: **[BENCHMARKS.md](BENCHMARKS.md)**
 
-The metric is fixed at database creation time.
+**Windows 11 highlights (50k × 1536, top_k=10, DBpedia OpenAI embeddings):**
+
+| Engine | Ingest | Disk | RAM | p50 | Recall@10 |
+|--------|--------|------|-----|-----|-----------|
+| ChromaDB (HNSW) | 30.6s | 398 MB | 865 MB | 1.73ms | 99.75% |
+| LanceDB (IVF_PQ) | 77.6s | 318 MB | 526 MB | 9.17ms | 79.50% |
+| **TQDB b=8 HQ** | **59.2s** | **119 MB** | **537 MB** | 12.42ms | **97.25%** |
+| **TQDB b=4 Balanced** | **37.8s** | **70 MB** | **488 MB** | 9.98ms | **89.15%** |
+| **TQDB b=4 FastBuild** | **28.2s** | **70 MB** | **487 MB** | 5.30ms | **83.35%** |
+
+TQDB b=4 is **5.7× smaller** than ChromaDB and uses **44% less RAM**, within 11pp of recall.
 
 ---
 
 ## RAG Integration
 
 ```python
-import numpy as np
 from turboquantdb.rag import TurboQuantRetriever
 
-retriever = TurboQuantRetriever(db_path="./rag_db", dimension=1536, bits=4, metric="cosine")
-
-texts = [
-    "TurboQuant is a near-optimal quantization algorithm.",
-    "Rust provides memory safety without garbage collection.",
-    "Vector databases power modern RAG pipelines.",
-]
-embeddings = [np.random.randn(1536).tolist() for _ in texts]
-metadatas = [{"source": "paper"}, {"source": "docs"}, {"source": "blog"}]
-
+retriever = TurboQuantRetriever(db_path="./rag_db", dimension=1536, bits=4)
 retriever.add_texts(texts=texts, embeddings=embeddings, metadatas=metadatas)
 
-results = retriever.similarity_search(query_embedding=np.random.randn(1536).tolist(), k=2)
+results = retriever.similarity_search(query_embedding=query_vec, k=5)
 for r in results:
     print(r["score"], r["text"])
 ```
 
 ---
 
-## Server Mode
-
-An optional Axum-based HTTP server is available in `server/`. It adds multi-tenancy, API key authentication, quota enforcement, and async job management (compaction, index building, snapshots).
-
-```bash
-cd server && cargo build --release
-TQ_SERVER_ADDR=0.0.0.0:8080 TQ_LOCAL_ROOT=./data ./target/release/turboquantdb-server
-```
-
-See [`server/README.md`](server/README.md) for the full API reference and environment variable documentation.
-
----
-
 ## Architecture
 
-TurboQuantDB is an embedded database (like DuckDB or LanceDB) — it runs in-process with no daemon required. The storage layout on disk:
+TurboQuantDB is an embedded database (like DuckDB) — it runs in-process with no daemon.
 
 ```
 ./my_db/
@@ -235,122 +221,65 @@ TurboQuantDB is an embedded database (like DuckDB or LanceDB) — it runs in-pro
 ├── quantizer.bin        — Serialized quantizer state
 ├── live_codes.bin       — Memory-mapped quantized vectors (hot path)
 ├── live_vectors.bin     — Raw float32 vectors (only if rerank=True)
-├── wal.log              — Write-ahead log (crash recovery)
-├── metadata.bin         — Vector metadata and documents
+├── wal.log              — Write-ahead log
+├── metadata.bin         — Per-vector metadata and documents
 ├── live_ids.bin         — ID → slot index
 ├── graph.bin            — HNSW adjacency list (if index built)
-├── graph_ids.json       — Slot list for index nodes
-└── seg-00000001.bin     — Immutable segment files (flushed from WAL)
+└── seg-XXXXXXXX.bin     — Immutable flushed segment files
 ```
 
-**Write path:** `insert()` → quantize (SRHT → MSE → QJL) → WAL entry → `live_codes.bin` → periodic flush to segment
+**Write path:** `insert()` → quantize (QR rotation → MSE → Gaussian QJL) → WAL → `live_codes.bin` → flush to segment
 
-**Search path (brute-force):** query → precompute lookup tables → score all live vectors → top-k
+**Search (brute-force):** query → precompute lookup tables → score all live vectors → top-k
 
-**Search path (ANN):** query → HNSW beam search → candidate rerank (if `rerank=True`) → top-k
+**Search (ANN):** query → HNSW beam search → rerank → top-k
 
-**Quantization pipeline:** Each vector goes through two stages:
-1. **MSE stage** — Structured Random Hadamard Transform (SRHT) rotation, then Lloyd-Max scalar quantization to `b-1` bits per dimension
-2. **QJL stage** — A second independent SRHT projection, 1-bit quantized (sign), packed into bytes
+**Quantization:** Two-stage pipeline:
+1. **MSE** — QR rotation + Lloyd-Max scalar quantization to `bits` per coordinate
+2. **QJL** — Dense Gaussian projection, 1-bit quantized, bit-packed
 
-The combination gives unbiased inner product estimates with provably near-optimal distortion.
+The combination gives unbiased inner product estimates with near-optimal distortion, requiring no training data.
 
----
+### Module Map
 
-## Benchmarks
-
-Full results across Windows / WSL2 / Linux (50k vectors, dim=1536, cosine): see **[BENCHMARKS.md](BENCHMARKS.md)**.
-
-**Linux native highlights (50k × 1536, top_k=10):**
-
-| Engine | Ingest | Disk | RAM | p50 | Recall@10 |
-|--------|--------|------|-----|-----|----------|
-| FAISS HNSW *(ceiling)* | 15.1s | 306 MB | 698 MB | 0.96ms | 99.75% |
-| ChromaDB | 33.5s | 398 MB | 924 MB | 2.41ms | 99.75% |
-| **TQDB b=4 FastBuild** | **22.7s** | **70 MB** | **506 MB** | **4.00ms** | **83.1%** |
-| **TQDB b=4 Balanced** | 26.0s | 70 MB | 507 MB | 7.46ms | 88.7% |
-| **TQDB b=8 HQ** | 38.0s | 119 MB | 554 MB | 8.73ms | 97.9% |
-| LanceDB | 89.8s | 318 MB | 1,722 MB | 8.10ms | 79.9% |
-
-TQDB b=4 stores each vector in **1,466 bytes** vs float32's 6,144 bytes — **4.2× compression** with no training.
+| Path | Responsibility |
+|------|---------------|
+| `src/python/mod.rs` | `Database` class — Python-facing API |
+| `src/storage/engine.rs` | `TurboQuantEngine` — insert/search/delete orchestration |
+| `src/storage/wal.rs` | Write-ahead log |
+| `src/storage/segment.rs` | Immutable append-only segments |
+| `src/storage/live_codes.rs` | Memory-mapped hot vector cache |
+| `src/storage/graph.rs` | HNSW graph index |
+| `src/quantizer/prod.rs` | `ProdQuantizer` — MSE + QJL orchestrator |
+| `src/quantizer/mse.rs` | `MseQuantizer` — QR rotation + Lloyd-Max codebook |
+| `src/quantizer/qjl.rs` | `QjlQuantizer` — 1-bit Gaussian projection, bit-packed |
+| `python/turboquantdb/rag.py` | `TurboQuantRetriever` — LangChain-style wrapper |
+| `server/` | Optional Axum HTTP service (separate Cargo workspace) |
 
 ---
 
-## Performance Roadmap
+## Server Mode
 
-### Current bottlenecks (profiled at n=50k, dim=1536)
+```bash
+cd server && cargo build --release
+TQ_SERVER_ADDR=0.0.0.0:8080 TQ_LOCAL_ROOT=./data ./target/release/turboquantdb-server
+```
 
-| Phase | Dominant cost | Parallelism |
-|-------|--------------|-------------|
-| Ingest: SRHT rotation | 2 × d×d matmul (MSE + QJL) | Rayon per-batch |
-| Ingest: WAL write | Sequential I/O (fsync avoided) | — |
-| Search: brute-force scan | `n × score_ip_encoded_lite` | Rayon par_chunks |
-| Search: HNSW beam | Sequential graph traversal | — |
+See [`server/README.md`](server/README.md) for endpoints and environment variables. Key env vars:
 
-### Near-term (CPU)
-
-- **AVX-512 codebook scan** — widen the inner-product accumulator from 256-bit to 512-bit (2× throughput on supported CPUs)
-- **Cached rotation matrices** — precompute MSE/QJL rotation as a contiguous f32 slab to improve BLAS locality
-- **HNSW parallel construction** — build candidate lists concurrently (requires slot-level locking)
-
-### Long-term (GPU)
-
-GPU acceleration is technically viable **only for batch ingest** where the two d×d SRHT matrix multiplies dominate:
-
-| Scenario | CPU (16 cores) | GPU (RTX class) | Whole-system gain | Effort |
-|----------|---------------|----------------|------------------|--------|
-| Ingest matmul (n=50k, d=1536) | ~26–38s | ~0.05s (cuBLAS) | ~3–5× end-to-end | 6–8 weeks |
-| Search / HNSW beam | ~4–11ms | worse (kernel launch overhead) | N/A | — |
-
-**Why not now:** current CPU ingest (22–38s at 50k/1536) is already faster than ChromaDB; the search path does not benefit from GPU; and the embedded in-process design means GPU memory must be explicitly managed. A `gpu` feature flag is reserved for future work.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TQ_SERVER_ADDR` | `127.0.0.1:8080` | Bind address |
+| `TQ_LOCAL_ROOT` | `./data` | Storage root |
+| `TQ_JOB_WORKERS` | `2` | Async job thread count |
 
 ---
-
-## Reference
-
-TurboQuant algorithm: [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) — *TurboQuant: Near-Optimal Data-Oblivious Vector Quantization*
-
----
-
-## Repository Layout
-
-- `src/`: core Rust engine, quantization, storage, indexing, Python bindings
-- `server/`: Axum HTTP service crate (`turboquantdb-server`)
-- `python/`: Python package helpers
-- `tests/`: Rust integration and benchmark-style tests
-- `docs/`: design docs, roadmap, API notes
-- `benchmarks/`: recall/latency scripts and CI gates
-
-## Service Mode
-
-See [server/README.md](server/README.md) for endpoints and env vars.
-
-Common env vars:
-
-- `TQ_SERVER_ADDR` (default `127.0.0.1:8080`)
-- `TQ_LOCAL_ROOT` (default `./data`)
-- `TQ_JOB_WORKERS` (default `2`)
-
-## Documentation
-
-- [Python Migration Guide](docs/PYTHON_MIGRATION.md)
-- [M5 Multi-Tenant Service Design](docs/M5_MULTITENANT_SERVICE_DESIGN.md)
-- [M5 API Spec](docs/M5_API_SPEC.md)
-- [Compatibility Matrix](docs/COMPATIBILITY_MATRIX.md)
-- [Roadmap Backlog](docs/ROADMAP_BACKLOG.md)
 
 ## Research Basis
 
-This repository is an independent implementation that uses ideas described in the TurboQuant paper; the paper itself was authored by the original researchers.
+This is an independent implementation of ideas from the TurboQuant paper. The algorithm itself was authored by the original researchers.
 
-Reference:
-
-Zandieh, A., Daliri, M., Hadian, M., & Mirrokni, V. (2025). *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate*. arXiv:2504.19874.
-
-- arXiv: https://arxiv.org/abs/2504.19874
-- Local copy in this repo: [2504.19874v1.pdf](2504.19874v1.pdf)
-
-If your academic work depends on the TurboQuant theory, please cite the original paper:
+> Zandieh, A., Daliri, M., Hadian, M., & Mirrokni, V. (2025). *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate*. [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)
 
 ```bibtex
 @article{zandieh2025turboquant,
@@ -360,3 +289,9 @@ If your academic work depends on the TurboQuant theory, please cite the original
   year={2025}
 }
 ```
+
+---
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).

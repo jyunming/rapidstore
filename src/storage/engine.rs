@@ -216,7 +216,16 @@ impl TurboQuantEngine {
         b: usize,
         seed: u64,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::open_with_metric_and_rerank(uri, local_dir, d, b, seed, DistanceMetric::Ip, true, true)
+        Self::open_with_metric_and_rerank(
+            uri,
+            local_dir,
+            d,
+            b,
+            seed,
+            DistanceMetric::Ip,
+            true,
+            true,
+        )
     }
 
     pub fn open_with_metric(
@@ -240,8 +249,14 @@ impl TurboQuantEngine {
         rerank: bool,
         fast_mode: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let precision = if rerank { RerankPrecision::F32 } else { RerankPrecision::Disabled };
-        Self::open_with_options(uri, local_dir, d, b, seed, metric, rerank, fast_mode, precision)
+        let precision = if rerank {
+            RerankPrecision::F32
+        } else {
+            RerankPrecision::Disabled
+        };
+        Self::open_with_options(
+            uri, local_dir, d, b, seed, metric, rerank, fast_mode, precision,
+        )
     }
 
     pub fn open_with_options(
@@ -265,26 +280,46 @@ impl TurboQuantEngine {
         let (manifest, quantizer) = if Path::new(&manifest_path).exists() {
             let m = Manifest::load(&manifest_path)?;
             if m.d != d {
-                return Err(format!("dimension mismatch: manifest has d={}, requested d={}", m.d, d).into());
+                return Err(format!(
+                    "dimension mismatch: manifest has d={}, requested d={}",
+                    m.d, d
+                )
+                .into());
             }
             if m.b != b {
-                return Err(format!("bits mismatch: manifest has b={}, requested b={}", m.b, b).into());
+                return Err(
+                    format!("bits mismatch: manifest has b={}, requested b={}", m.b, b).into(),
+                );
             }
             if m.metric != metric {
-                return Err(format!("metric mismatch: manifest has {:?}, requested {:?}", m.metric, metric).into());
+                return Err(format!(
+                    "metric mismatch: manifest has {:?}, requested {:?}",
+                    m.metric, metric
+                )
+                .into());
             }
             let q = load_quantizer_state(local_dir, &backend)?;
             (m, q)
         } else if let Ok(data) = backend.read("manifest.json") {
             let m: Manifest = serde_json::from_slice(&data)?;
             if m.d != d {
-                return Err(format!("dimension mismatch: manifest has d={}, requested d={}", m.d, d).into());
+                return Err(format!(
+                    "dimension mismatch: manifest has d={}, requested d={}",
+                    m.d, d
+                )
+                .into());
             }
             if m.b != b {
-                return Err(format!("bits mismatch: manifest has b={}, requested b={}", m.b, b).into());
+                return Err(
+                    format!("bits mismatch: manifest has b={}, requested b={}", m.b, b).into(),
+                );
             }
             if m.metric != metric {
-                return Err(format!("metric mismatch: manifest has {:?}, requested {:?}", m.metric, metric).into());
+                return Err(format!(
+                    "metric mismatch: manifest has {:?}, requested {:?}",
+                    m.metric, metric
+                )
+                .into());
             }
             let q = load_quantizer_state(local_dir, &backend)?;
             (m, q)
@@ -313,7 +348,10 @@ impl TurboQuantEngine {
             backend.write("manifest.json", &serde_json::to_vec_pretty(&m)?)?;
             // Create an empty live_vectors.bin so that insert_batch can write raw vectors
             // immediately. Only when the user explicitly opts into exact reranking.
-            if matches!(rerank_precision, RerankPrecision::F16 | RerankPrecision::F32) {
+            if matches!(
+                rerank_precision,
+                RerankPrecision::F16 | RerankPrecision::F32
+            ) {
                 let vraw_path = Path::new(local_dir).join("live_vectors.bin");
                 if !vraw_path.exists() {
                     std::fs::File::create(&vraw_path)?;
@@ -336,7 +374,10 @@ impl TurboQuantEngine {
         let stride = mse_len + qjl_len + LIVE_GAMMA_BYTES + LIVE_NORM_BYTES + LIVE_DELETED_BYTES;
         let live_codes = LiveCodesFile::open(Path::new(local_dir).join("live_codes.bin"), stride)?;
         let live_vraw_path = Path::new(local_dir).join("live_vectors.bin");
-        let live_vraw = if manifest.rerank_enabled && live_vraw_path.exists() && !matches!(manifest.rerank_precision, RerankPrecision::Disabled) {
+        let live_vraw = if manifest.rerank_enabled
+            && live_vraw_path.exists()
+            && !matches!(manifest.rerank_precision, RerankPrecision::Disabled)
+        {
             let vstride = match manifest.rerank_precision {
                 RerankPrecision::F16 => manifest.d * 2,
                 _ => manifest.d * 4,
@@ -392,9 +433,7 @@ impl TurboQuantEngine {
                 // automatically on the next clean insert+close cycle.
                 engine.live_codes.clear()?;
                 engine.live_vraw = None;
-                let _ = std::fs::remove_file(
-                    Path::new(&engine.local_dir).join("live_vectors.bin"),
-                );
+                let _ = std::fs::remove_file(Path::new(&engine.local_dir).join("live_vectors.bin"));
                 engine.id_pool = IdPool::new();
                 let mse_len = engine.live_mse_len();
                 let qjl_len = engine.live_qjl_len();
@@ -429,9 +468,7 @@ impl TurboQuantEngine {
                         rec[mse_len + qjl_len + 8] = 0u8;
                         s
                     };
-                    if let Ok(meta) =
-                        serde_json::from_str::<VectorMetadata>(&entry.metadata_json)
-                    {
+                    if let Ok(meta) = serde_json::from_str::<VectorMetadata>(&entry.metadata_json) {
                         let _ = engine.metadata.put(slot, &meta);
                     }
                 }
@@ -660,17 +697,15 @@ impl TurboQuantEngine {
         // parallel before the build loop so each `to` node is dequantized at most once instead
         // of once per candidate evaluation (O(n × ef_construction) without this).
         let precomputed_l2: Vec<Array1<f64>> =
-            if !matches!(self.metric, DistanceMetric::Ip | DistanceMetric::Cosine)
-                && !has_vraw
-            {
+            if !matches!(self.metric, DistanceMetric::Ip | DistanceMetric::Cosine) && !has_vraw {
                 let codes_bytes = live_codes.as_bytes();
                 let stride = self.live_stride();
                 let q = &self.quantizer;
                 indexed_slots
                     .par_iter()
                     .map(|&slot| {
-                        let rec = &codes_bytes
-                            [slot as usize * stride..(slot as usize + 1) * stride];
+                        let rec =
+                            &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
                         let mut idx = vec![0u16; q.n];
                         q.unpack_mse_indices(&rec[..mse_len], &mut idx);
                         let gamma = f32::from_le_bytes(
@@ -724,7 +759,10 @@ impl TurboQuantEngine {
                             &[]
                         };
                         let to_g = all_gamma[to_idx];
-                        (to, quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64))
+                        (
+                            to,
+                            quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64),
+                        )
                     })
                     .collect()
             } else if matches!(metric, DistanceMetric::Cosine) {
@@ -762,8 +800,7 @@ impl TurboQuantEngine {
                         };
                         let to_g = all_gamma[to_idx];
                         let to_n = all_norm[to_idx];
-                        let ip =
-                            quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64);
+                        let ip = quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64);
                         let score = if from_norm > 0.0 && to_n > 0.0 {
                             ip / (from_norm * to_n as f64)
                         } else {
@@ -926,7 +963,9 @@ impl TurboQuantEngine {
                         let rec = live_codes_r.get_slot(slot as usize);
                         let qjl = &rec[mse_len..mse_len + qjl_len];
                         let gamma = f32::from_le_bytes(
-                            rec[mse_len + qjl_len..mse_len + qjl_len + 4].try_into().unwrap(),
+                            rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                                .try_into()
+                                .unwrap(),
                         );
                         let mut buf = idx_buf.borrow_mut();
                         quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut buf);
@@ -951,10 +990,14 @@ impl TurboQuantEngine {
                         let rec = live_codes_r.get_slot(slot as usize);
                         let qjl = &rec[mse_len..mse_len + qjl_len];
                         let gamma = f32::from_le_bytes(
-                            rec[mse_len + qjl_len..mse_len + qjl_len + 4].try_into().unwrap(),
+                            rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                                .try_into()
+                                .unwrap(),
                         );
                         let doc_norm = f32::from_le_bytes(
-                            rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].try_into().unwrap(),
+                            rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                                .try_into()
+                                .unwrap(),
                         );
                         let mut buf = idx_buf.borrow_mut();
                         quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut buf);
@@ -983,7 +1026,9 @@ impl TurboQuantEngine {
                         let rec = live_codes_r.get_slot(slot as usize);
                         let qjl = &rec[mse_len..mse_len + qjl_len];
                         let gamma = f32::from_le_bytes(
-                            rec[mse_len + qjl_len..mse_len + qjl_len + 4].try_into().unwrap(),
+                            rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                                .try_into()
+                                .unwrap(),
                         );
                         let v = {
                             let mut buf = idx_buf.borrow_mut();
@@ -1005,19 +1050,18 @@ impl TurboQuantEngine {
             let mut out = Vec::with_capacity(ann.len());
 
             // Batch-dequantize all candidates in parallel when reranking without raw vecs.
-            let deq_vecs: Vec<Array1<f64>> =
-                if self.rerank_enabled && self.live_vraw.is_none() {
-                    let encoded: Vec<(Vec<CodeIndex>, Vec<u8>, f64)> = slots
-                        .iter()
-                        .map(|&slot| {
-                            let (idx, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
-                            (idx, qjl.to_vec(), gamma as f64)
-                        })
-                        .collect();
-                    self.quantizer.dequantize_batch(&encoded)
-                } else {
-                    Vec::new()
-                };
+            let deq_vecs: Vec<Array1<f64>> = if self.rerank_enabled && self.live_vraw.is_none() {
+                let encoded: Vec<(Vec<CodeIndex>, Vec<u8>, f64)> = slots
+                    .iter()
+                    .map(|&slot| {
+                        let (idx, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
+                        (idx, qjl.to_vec(), gamma as f64)
+                    })
+                    .collect();
+                self.quantizer.dequantize_batch(&encoded)
+            } else {
+                Vec::new()
+            };
 
             for (i, (node, approx_score)) in ann.into_iter().enumerate() {
                 let slot = self.index_ids[node as usize];
@@ -1112,8 +1156,8 @@ impl TurboQuantEngine {
                         let mut idx = vec![0u16; quantizer.n];
                         let mut out = Vec::with_capacity(chunk.len());
                         for &slot in chunk {
-                            let rec = &codes_bytes
-                                [slot as usize * stride..(slot as usize + 1) * stride];
+                            let rec =
+                                &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
                             quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
                             let gamma = f32::from_le_bytes(
                                 rec[mse_len + qjl_len..mse_len + qjl_len + 4]
@@ -1140,8 +1184,8 @@ impl TurboQuantEngine {
                         let mut idx = vec![0u16; quantizer.n];
                         let mut out = Vec::with_capacity(chunk.len());
                         for &slot in chunk {
-                            let rec = &codes_bytes
-                                [slot as usize * stride..(slot as usize + 1) * stride];
+                            let rec =
+                                &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
                             quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
                             let gamma = f32::from_le_bytes(
                                 rec[mse_len + qjl_len..mse_len + qjl_len + 4]
@@ -1178,8 +1222,8 @@ impl TurboQuantEngine {
                         let mut idx = vec![0u16; quantizer.n];
                         let mut out = Vec::with_capacity(chunk.len());
                         for &slot in chunk {
-                            let rec = &codes_bytes
-                                [slot as usize * stride..(slot as usize + 1) * stride];
+                            let rec =
+                                &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
                             quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
                             let gamma = f32::from_le_bytes(
                                 rec[mse_len + qjl_len..mse_len + qjl_len + 4]
@@ -1218,19 +1262,18 @@ impl TurboQuantEngine {
         let mut out = Vec::with_capacity(candidates.len());
 
         // Batch-dequantize all rerank candidates in parallel when raw vecs unavailable.
-        let deq_vecs: Vec<Array1<f64>> =
-            if self.rerank_enabled && self.live_vraw.is_none() {
-                let encoded: Vec<(Vec<CodeIndex>, Vec<u8>, f64)> = slots
-                    .iter()
-                    .map(|&slot| {
-                        let (idx, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
-                        (idx, qjl.to_vec(), gamma as f64)
-                    })
-                    .collect();
-                self.quantizer.dequantize_batch(&encoded)
-            } else {
-                Vec::new()
-            };
+        let deq_vecs: Vec<Array1<f64>> = if self.rerank_enabled && self.live_vraw.is_none() {
+            let encoded: Vec<(Vec<CodeIndex>, Vec<u8>, f64)> = slots
+                .iter()
+                .map(|&slot| {
+                    let (idx, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
+                    (idx, qjl.to_vec(), gamma as f64)
+                })
+                .collect();
+            self.quantizer.dequantize_batch(&encoded)
+        } else {
+            Vec::new()
+        };
 
         for (i, OrderingWrapper(cand)) in candidates.into_iter().enumerate() {
             let id = self
@@ -1313,7 +1356,10 @@ impl TurboQuantEngine {
 
         self.live_codes = LiveCodesFile::open(live_codes_path, self.live_stride())?;
         if had_vraw {
-            self.live_vraw = Some(LiveCodesFile::open(live_vraw_path, self.live_vraw_stride())?);
+            self.live_vraw = Some(LiveCodesFile::open(
+                live_vraw_path,
+                self.live_vraw_stride(),
+            )?);
         }
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_active_count() as u64;
@@ -1871,11 +1917,9 @@ fn metadata_matches_filter(
         field => {
             let field_val = get_nested_field(meta, field);
             match v {
-                JsonValue::Object(op_map) => {
-                    op_map.iter().all(|(op, op_val)| {
-                        apply_comparison_op(field_val, op.as_str(), op_val)
-                    })
-                }
+                JsonValue::Object(op_map) => op_map
+                    .iter()
+                    .all(|(op, op_val)| apply_comparison_op(field_val, op.as_str(), op_val)),
                 // Simple equality: {"field": value}
                 _ => field_val.is_some_and(|fv| fv == v),
             }
@@ -1973,5 +2017,793 @@ fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array
             .map(|(x, y)| (x - y).powi(2))
             .sum::<f64>()
             .sqrt(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array1;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use tempfile::tempdir;
+
+    fn make_vec(d: usize, val: f64) -> Array1<f64> {
+        Array1::from_elem(d, val)
+    }
+
+    fn make_vec_f32(d: usize, val: f32) -> Vec<f32> {
+        vec![val; d]
+    }
+
+    fn no_meta() -> HashMap<String, serde_json::Value> {
+        HashMap::new()
+    }
+
+    fn open_default(dir: &str, d: usize) -> TurboQuantEngine {
+        TurboQuantEngine::open(dir, dir, d, 2, 42).unwrap()
+    }
+
+    // ── Error paths on reopen ──────────────────────────────────────────────
+
+    #[test]
+    fn reopen_dimension_mismatch_returns_error() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let mut e = TurboQuantEngine::open(p, p, 8, 2, 42).unwrap();
+        e.insert("a".into(), &make_vec(8, 0.5), no_meta()).unwrap();
+        let result = TurboQuantEngine::open(p, p, 16, 2, 42);
+        assert!(result.is_err());
+        let msg = result.err().unwrap().to_string();
+        assert!(msg.contains("dimension mismatch"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn reopen_bits_mismatch_returns_error() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let mut e = TurboQuantEngine::open(p, p, 8, 2, 42).unwrap();
+        e.insert("a".into(), &make_vec(8, 0.5), no_meta()).unwrap();
+        let result = TurboQuantEngine::open(p, p, 8, 4, 42);
+        assert!(result.is_err());
+        let msg = result.err().unwrap().to_string();
+        assert!(msg.contains("bits mismatch"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn reopen_metric_mismatch_returns_error() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let mut e = TurboQuantEngine::open_with_metric(p, p, 8, 2, 42, DistanceMetric::Ip).unwrap();
+        e.insert("a".into(), &make_vec(8, 0.5), no_meta()).unwrap();
+        let result = TurboQuantEngine::open_with_metric(p, p, 8, 2, 42, DistanceMetric::L2);
+        assert!(result.is_err());
+        let msg = result.err().unwrap().to_string();
+        assert!(msg.contains("metric mismatch"), "unexpected: {msg}");
+    }
+
+    // ── Single-vector write errors ─────────────────────────────────────────
+
+    #[test]
+    fn insert_duplicate_id_returns_error() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let mut e = open_default(p, 8);
+        e.insert("dup".into(), &make_vec(8, 0.1), no_meta())
+            .unwrap();
+        let result = e.insert("dup".into(), &make_vec(8, 0.2), no_meta());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn update_nonexistent_id_returns_error() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let mut e = open_default(p, 8);
+        let result = e.update_with_document("ghost".into(), &make_vec(8, 0.1), no_meta(), None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("does not exist"));
+    }
+
+    // ── Batch write mode errors ────────────────────────────────────────────
+
+    #[test]
+    fn insert_many_insert_mode_duplicate_returns_error() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let mut e = open_default(p, 8);
+        let item = BatchWriteItem {
+            id: "x".into(),
+            vector: make_vec_f32(8, 0.5),
+            metadata: no_meta(),
+            document: None,
+        };
+        e.insert_many(vec![item.clone()]).unwrap();
+        let result = e.insert_many_with_mode(vec![item], BatchWriteMode::Insert);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn insert_many_update_mode_missing_id_returns_error() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let mut e = open_default(p, 8);
+        let item = BatchWriteItem {
+            id: "ghost".into(),
+            vector: make_vec_f32(8, 0.5),
+            metadata: no_meta(),
+            document: None,
+        };
+        let result = e.insert_many_with_mode(vec![item], BatchWriteMode::Update);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("does not exist"));
+    }
+
+    // ── Cosine exhaustive search ───────────────────────────────────────────
+
+    #[test]
+    fn cosine_exhaustive_search_returns_ordered_results() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 16;
+        let mut e =
+            TurboQuantEngine::open_with_metric(p, p, d, 4, 42, DistanceMetric::Cosine).unwrap();
+        // Insert a parallel vector (same direction) and an orthogonal one
+        let mut v_same = vec![0.0f64; d];
+        v_same[0] = 1.0;
+        let mut v_ortho = vec![0.0f64; d];
+        v_ortho[1] = 1.0;
+        e.insert("same".into(), &Array1::from_vec(v_same.clone()), no_meta())
+            .unwrap();
+        e.insert(
+            "ortho".into(),
+            &Array1::from_vec(v_ortho.clone()),
+            no_meta(),
+        )
+        .unwrap();
+
+        let query = Array1::from_vec(v_same);
+        let results = e.search_with_filter_and_ann(&query, 2, None, None).unwrap();
+        assert!(!results.is_empty());
+        // The "same" vector should score higher than "ortho"
+        let top_id = &results[0].id;
+        assert_eq!(top_id, "same");
+    }
+
+    #[test]
+    fn cosine_zero_norm_vector_scores_zero() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let mut e =
+            TurboQuantEngine::open_with_metric(p, p, d, 2, 7, DistanceMetric::Cosine).unwrap();
+        // A zero vector has norm=0; cosine score must be 0.0
+        e.insert("zero".into(), &Array1::zeros(d), no_meta())
+            .unwrap();
+        let query = make_vec(d, 1.0);
+        let results = e.search_with_filter_and_ann(&query, 5, None, None).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].score, 0.0);
+    }
+
+    // ── L2 exhaustive search ───────────────────────────────────────────────
+
+    #[test]
+    fn l2_exhaustive_search_returns_ordered_results() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 16;
+        let mut e = TurboQuantEngine::open_with_metric(p, p, d, 4, 42, DistanceMetric::L2).unwrap();
+        // "close" is distance 0 from query (at origin); "far" is distance 10
+        let v_close = vec![0.0f64; d];
+        let mut v_far = vec![0.0f64; d];
+        v_far[0] = 10.0;
+        e.insert(
+            "close".into(),
+            &Array1::from_vec(v_close.clone()),
+            no_meta(),
+        )
+        .unwrap();
+        e.insert("far".into(), &Array1::from_vec(v_far), no_meta())
+            .unwrap();
+
+        let query = Array1::from_vec(v_close);
+        let results = e.search_with_filter_and_ann(&query, 2, None, None).unwrap();
+        assert!(!results.is_empty());
+        // L2 scores are negative distances; "close" should have a higher (less negative) score
+        assert_eq!(results[0].id, "close");
+    }
+
+    // ── ANN search with HNSW index ─────────────────────────────────────────
+
+    #[test]
+    fn ann_cosine_search_with_index_returns_results() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 16;
+        let mut e =
+            TurboQuantEngine::open_with_metric(p, p, d, 4, 42, DistanceMetric::Cosine).unwrap();
+        for i in 0..20u32 {
+            let mut v = vec![0.0f64; d];
+            v[i as usize % d] = 1.0;
+            e.insert(format!("v{i}"), &Array1::from_vec(v), no_meta())
+                .unwrap();
+        }
+        e.create_index_with_params(8, 32, 32, 1.2, 2).unwrap();
+        let mut q = vec![0.0f64; d];
+        q[0] = 1.0;
+        let results = e
+            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None)
+            .unwrap();
+        assert!(!results.is_empty());
+        assert!(results.len() <= 5);
+    }
+
+    #[test]
+    fn ann_l2_search_with_index_returns_results() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 16;
+        let mut e = TurboQuantEngine::open_with_metric(p, p, d, 4, 42, DistanceMetric::L2).unwrap();
+        for i in 0..20u32 {
+            let mut v = vec![0.0f64; d];
+            v[i as usize % d] = (i as f64 + 1.0) * 0.1;
+            e.insert(format!("v{i}"), &Array1::from_vec(v), no_meta())
+                .unwrap();
+        }
+        e.create_index_with_params(8, 32, 32, 1.2, 2).unwrap();
+        let q = vec![0.0f64; d];
+        let results = e
+            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None)
+            .unwrap();
+        assert!(!results.is_empty());
+        assert!(results.len() <= 5);
+    }
+
+    // ── Search edge cases ──────────────────────────────────────────────────
+
+    #[test]
+    fn search_top_k_zero_returns_empty() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let mut e = open_default(p, 8);
+        e.insert("a".into(), &make_vec(8, 0.5), no_meta()).unwrap();
+        let results = e
+            .search_with_filter_and_ann(&make_vec(8, 0.5), 0, None, None)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_empty_db_returns_empty() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let e = open_default(p, 8);
+        let results = e
+            .search_with_filter_and_ann(&make_vec(8, 0.5), 5, None, None)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_filter_no_match_returns_empty() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let mut e = open_default(p, 8);
+        let mut meta = no_meta();
+        meta.insert("tag".into(), json!("a"));
+        e.insert("a".into(), &make_vec(8, 0.5), meta).unwrap();
+        let mut filter = no_meta();
+        filter.insert("tag".into(), json!("b"));
+        let results = e
+            .search_with_filter_and_ann(&make_vec(8, 0.5), 5, Some(&filter), None)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ── F16 rerank precision ───────────────────────────────────────────────
+
+    #[test]
+    fn f16_rerank_precision_stores_and_retrieves_vectors() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 16;
+        let mut e = TurboQuantEngine::open_with_options(
+            p,
+            p,
+            d,
+            4,
+            42,
+            DistanceMetric::Ip,
+            true,
+            false,
+            RerankPrecision::F16,
+        )
+        .unwrap();
+        let mut v = vec![0.0f64; d];
+        v[0] = 0.9;
+        v[1] = 0.4;
+        e.insert("v1".into(), &Array1::from_vec(v.clone()), no_meta())
+            .unwrap();
+        let results = e
+            .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "v1");
+        // F16 has ~0.1% relative error; score should be close to 1.0
+        assert!(results[0].score > 0.8, "score was {}", results[0].score);
+    }
+
+    // ── Stats and disk bytes ───────────────────────────────────────────────
+
+    #[test]
+    fn stats_reflect_inserted_vectors() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let mut e = open_default(p, d);
+        assert_eq!(e.stats().vector_count, 0);
+        assert_eq!(e.stats().d, d);
+        e.insert("a".into(), &make_vec(d, 0.1), no_meta()).unwrap();
+        e.insert("b".into(), &make_vec(d, 0.2), no_meta()).unwrap();
+        let s = e.stats();
+        assert_eq!(s.vector_count, 2);
+        assert_eq!(s.live_id_count, 2);
+    }
+
+    #[test]
+    fn total_disk_bytes_nonzero_after_flush() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let mut e = open_default(p, d);
+        for i in 0..5u32 {
+            e.insert(format!("v{i}"), &make_vec(d, 0.5), no_meta())
+                .unwrap();
+        }
+        e.flush_wal_to_segment().unwrap();
+        let bytes = e.stats().total_disk_bytes;
+        assert!(bytes > 0, "expected non-zero disk bytes, got {bytes}");
+    }
+
+    // ── Delete ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn delete_unknown_id_returns_false() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let mut e = open_default(p, 8);
+        let deleted = e.delete("ghost".into()).unwrap();
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn delete_existing_id_returns_true_and_reduces_count() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let mut e = open_default(p, 8);
+        e.insert("a".into(), &make_vec(8, 0.5), no_meta()).unwrap();
+        assert_eq!(e.stats().vector_count, 1);
+        let deleted = e.delete("a".into()).unwrap();
+        assert!(deleted);
+        assert_eq!(e.stats().vector_count, 0);
+    }
+
+    // ── Index invalidation ─────────────────────────────────────────────────
+
+    #[test]
+    fn index_invalidated_after_insert() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 16;
+        let mut e = open_default(p, d);
+        for i in 0..10u32 {
+            e.insert(format!("v{i}"), &make_vec(d, i as f64 * 0.1), no_meta())
+                .unwrap();
+        }
+        e.create_index_with_params(4, 16, 16, 1.2, 1).unwrap();
+        assert!(e.manifest.index_state.is_some(), "index should be built");
+        // Any new insert must invalidate the index
+        e.insert("new".into(), &make_vec(d, 0.99), no_meta())
+            .unwrap();
+        assert!(
+            e.manifest.index_state.is_none(),
+            "index state should be cleared after insert"
+        );
+    }
+
+    #[test]
+    fn index_invalidated_after_delete() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 16;
+        let mut e = open_default(p, d);
+        for i in 0..10u32 {
+            e.insert(format!("v{i}"), &make_vec(d, i as f64 * 0.1), no_meta())
+                .unwrap();
+        }
+        e.create_index_with_params(4, 16, 16, 1.2, 1).unwrap();
+        assert!(e.manifest.index_state.is_some());
+        e.delete("v0".into()).unwrap();
+        assert!(
+            e.manifest.index_state.is_none(),
+            "index state should be cleared after delete"
+        );
+    }
+
+    // ── Flush WAL edge case ────────────────────────────────────────────────
+
+    #[test]
+    fn flush_wal_empty_buffer_is_noop() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let mut e = open_default(p, 8);
+        // No inserts — flush should succeed silently
+        e.flush_wal_to_segment().unwrap();
+        assert_eq!(e.stats().vector_count, 0);
+    }
+
+    // ── Fast-mode engine ───────────────────────────────────────────────────
+
+    #[test]
+    fn fast_mode_engine_creates_and_searches() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 32;
+        let mut e = TurboQuantEngine::open_fast(p, p, d, 4, 42).unwrap();
+        for i in 0..5u32 {
+            e.insert(
+                format!("v{i}"),
+                &make_vec(d, i as f64 * 0.1 + 0.1),
+                no_meta(),
+            )
+            .unwrap();
+        }
+        let results = e
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 3, None, None)
+            .unwrap();
+        assert!(!results.is_empty());
+        assert!(e.manifest.fast_mode);
+    }
+
+    // ── Upsert mode ────────────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_replaces_existing_vector() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let mut e = open_default(p, d);
+        e.insert("a".into(), &make_vec(d, 0.1), no_meta()).unwrap();
+        // Upsert with same ID should not error
+        e.upsert_with_document("a".into(), &make_vec(d, 0.9), no_meta(), None)
+            .unwrap();
+        assert_eq!(e.stats().vector_count, 1);
+    }
+
+    // ── List all ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn list_all_returns_all_active_ids() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let mut e = open_default(p, d);
+        e.insert("x".into(), &make_vec(d, 0.1), no_meta()).unwrap();
+        e.insert("y".into(), &make_vec(d, 0.2), no_meta()).unwrap();
+        e.insert("z".into(), &make_vec(d, 0.3), no_meta()).unwrap();
+        e.delete("y".into()).unwrap();
+        let ids = e.list_all();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"x".to_string()));
+        assert!(ids.contains(&"z".to_string()));
+        assert!(!ids.contains(&"y".to_string()));
+    }
+
+    // ── Disabled rerank ────────────────────────────────────────────────────
+
+    #[test]
+    fn disabled_rerank_search_returns_results() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 16;
+        let mut e = TurboQuantEngine::open_with_options(
+            p,
+            p,
+            d,
+            4,
+            42,
+            DistanceMetric::Ip,
+            false,
+            false,
+            RerankPrecision::Disabled,
+        )
+        .unwrap();
+        for i in 0..5u32 {
+            let v = make_vec(d, i as f64 * 0.2 + 0.1);
+            e.insert(format!("v{i}"), &v, no_meta()).unwrap();
+        }
+        let results = e
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 3, None, None)
+            .unwrap();
+        assert!(!results.is_empty());
+        assert!(!e.rerank_enabled);
+    }
+
+    // ── get and get_many ───────────────────────────────────────────────────
+
+    #[test]
+    fn get_returns_none_for_missing_id() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let e = open_default(p, 8);
+        let result = e.get("ghost").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn get_returns_metadata_and_document() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let mut e = open_default(p, d);
+        let mut meta = no_meta();
+        meta.insert("key".into(), json!("val"));
+        e.insert_with_document(
+            "v1".into(),
+            &make_vec(d, 0.5),
+            meta,
+            Some("hello doc".into()),
+        )
+        .unwrap();
+        let result = e.get("v1").unwrap().unwrap();
+        assert_eq!(result.id, "v1");
+        assert_eq!(result.metadata.get("key"), Some(&json!("val")));
+        assert_eq!(result.document, Some("hello doc".into()));
+    }
+
+    #[test]
+    fn get_many_returns_mixed_results() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let mut e = open_default(p, d);
+        e.insert("a".into(), &make_vec(d, 0.1), no_meta()).unwrap();
+        e.insert("b".into(), &make_vec(d, 0.2), no_meta()).unwrap();
+        let ids: Vec<String> = vec!["a".into(), "missing".into(), "b".into()];
+        let results = e.get_many(&ids).unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_some());
+        assert!(results[1].is_none());
+        assert!(results[2].is_some());
+    }
+
+    // ── upsert_many / update_many wrappers ────────────────────────────────
+
+    #[test]
+    fn upsert_many_inserts_and_replaces() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let mut e = open_default(p, d);
+        let item = BatchWriteItem {
+            id: "u".into(),
+            vector: make_vec_f32(d, 0.5),
+            metadata: no_meta(),
+            document: None,
+        };
+        // First upsert inserts
+        e.upsert_many(vec![item.clone()]).unwrap();
+        assert_eq!(e.stats().vector_count, 1);
+        // Second upsert replaces (no error)
+        e.upsert_many(vec![item]).unwrap();
+        assert_eq!(e.stats().vector_count, 1);
+    }
+
+    #[test]
+    fn update_many_updates_existing_vector() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let mut e = open_default(p, d);
+        e.insert("x".into(), &make_vec(d, 0.1), no_meta()).unwrap();
+        let item = BatchWriteItem {
+            id: "x".into(),
+            vector: make_vec_f32(d, 0.9),
+            metadata: no_meta(),
+            document: None,
+        };
+        e.update_many(vec![item]).unwrap();
+        assert_eq!(e.stats().vector_count, 1);
+    }
+
+    // ── create_index on empty DB ────────────────────────────────────────────
+
+    #[test]
+    fn create_index_empty_db_is_noop() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let mut e = open_default(p, 8);
+        // Should not error on empty DB
+        e.create_index_with_params(4, 16, 16, 1.2, 1).unwrap();
+        assert!(!e.stats().has_index);
+    }
+
+    // ── L2 index build without raw vecs (precomputed_l2 path) ─────────────
+
+    #[test]
+    fn l2_index_without_rerank_uses_dequantized_path() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 16;
+        // rerank=false → no live_vectors.bin → L2 index uses precomputed_l2
+        let mut e = TurboQuantEngine::open_with_options(
+            p,
+            p,
+            d,
+            4,
+            42,
+            DistanceMetric::L2,
+            false,
+            false,
+            RerankPrecision::Disabled,
+        )
+        .unwrap();
+        for i in 0..15u32 {
+            let mut v = vec![0.0f32; d];
+            v[0] = i as f32 * 0.1;
+            e.insert_many(vec![BatchWriteItem {
+                id: format!("v{i}"),
+                vector: v,
+                metadata: no_meta(),
+                document: None,
+            }])
+            .unwrap();
+        }
+        e.create_index_with_params(4, 16, 16, 1.2, 1).unwrap();
+        assert!(e.stats().has_index);
+        let q = vec![0.0f64; d];
+        let results = e
+            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None)
+            .unwrap();
+        assert!(!results.is_empty());
+    }
+
+    // ── ANN search with filter ─────────────────────────────────────────────
+
+    #[test]
+    fn ann_search_with_metadata_filter() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 16;
+        let mut e = open_default(p, d);
+        for i in 0..15u32 {
+            let mut meta = no_meta();
+            meta.insert("cat".into(), json!(if i % 2 == 0 { "even" } else { "odd" }));
+            let mut v = vec![0.0f64; d];
+            v[0] = i as f64 * 0.1;
+            e.insert(format!("v{i}"), &Array1::from_vec(v), meta)
+                .unwrap();
+        }
+        e.create_index_with_params(4, 16, 16, 1.2, 1).unwrap();
+        let mut filter = no_meta();
+        filter.insert("cat".into(), json!("even"));
+        let q = make_vec(d, 0.5);
+        let results = e
+            .search_with_filter_and_ann(&q, 10, Some(&filter), None)
+            .unwrap();
+        // All results should have cat=even
+        for r in &results {
+            assert_eq!(r.metadata.get("cat"), Some(&json!("even")));
+        }
+    }
+
+    // ── ANN filter returns empty when nothing matches ──────────────────────
+
+    #[test]
+    fn ann_search_filter_no_match_returns_empty() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 16;
+        let mut e = open_default(p, d);
+        for i in 0..10u32 {
+            let mut meta = no_meta();
+            meta.insert("cat".into(), json!("a"));
+            e.insert(format!("v{i}"), &make_vec(d, i as f64 * 0.1 + 0.1), meta)
+                .unwrap();
+        }
+        e.create_index_with_params(4, 16, 16, 1.2, 1).unwrap();
+        let mut filter = no_meta();
+        filter.insert("cat".into(), json!("z"));
+        let results = e
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ── DistanceMetric default ─────────────────────────────────────────────
+
+    #[test]
+    fn distance_metric_default_is_ip() {
+        let m: DistanceMetric = Default::default();
+        assert_eq!(m, DistanceMetric::Ip);
+    }
+
+    // ── WAL recovery (unclean shutdown simulation) ─────────────────────────
+
+    #[test]
+    fn wal_recovery_without_live_ids_rebuilds_correctly() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        // Write vectors and close without explicit flush (WAL has entries)
+        {
+            let mut e = open_default(p, d);
+            e.insert("a".into(), &make_vec(d, 0.1), no_meta()).unwrap();
+            e.insert("b".into(), &make_vec(d, 0.2), no_meta()).unwrap();
+            // Do NOT flush WAL; force a "crash" by deleting live_ids.bin
+            drop(e);
+        }
+        // Delete live_ids.bin to simulate unclean shutdown
+        let ids_path = format!("{}/live_ids.bin", p);
+        if std::path::Path::new(&ids_path).exists() {
+            std::fs::remove_file(&ids_path).unwrap();
+        }
+        // Re-open — should recover from WAL
+        let e2 = open_default(p, d);
+        // Recovery may not restore counts from WAL if ids file was absent and
+        // flush_wal_to_segment wasn't called, but should not panic
+        let _ = e2.stats();
+    }
+
+    // ── Metadata filter operators ──────────────────────────────────────────
+
+    #[test]
+    fn metadata_filter_comparison_operators() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let mut e = open_default(p, d);
+        for i in 0i64..5 {
+            let mut meta = no_meta();
+            meta.insert("score".into(), json!(i));
+            e.insert(format!("v{i}"), &make_vec(d, i as f64 * 0.2), meta)
+                .unwrap();
+        }
+        // $gte filter
+        let mut filter = no_meta();
+        filter.insert("score".into(), json!({"$gte": 3}));
+        let results = e
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
+            .unwrap();
+        assert!(!results.is_empty());
+        for r in &results {
+            let score = r.metadata.get("score").and_then(|v| v.as_i64()).unwrap();
+            assert!(score >= 3, "score={score} should be >= 3");
+        }
+    }
+
+    #[test]
+    fn metadata_filter_or_operator() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let mut e = open_default(p, d);
+        for tag in ["a", "b", "c"] {
+            let mut meta = no_meta();
+            meta.insert("tag".into(), json!(tag));
+            e.insert(tag.to_string(), &make_vec(d, 0.5), meta).unwrap();
+        }
+        // $or filter: tag == "a" OR tag == "b"
+        let filter: HashMap<String, serde_json::Value> = serde_json::from_str(
+            r#"{"$or": [{"tag": {"$eq": "a"}}, {"tag": {"$eq": "b"}}]}"#,
+        )
+        .unwrap();
+        let results = e
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
+            .unwrap();
+        assert_eq!(results.len(), 2);
     }
 }

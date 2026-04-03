@@ -66,14 +66,14 @@ TQDB b=4 stores each vector in **1,466 bytes** vs float32's 6,144 bytes — a **
 
 50,000 vectors · dim=1,536 · top_k=10
 
-| Engine | Ingest | vec/s | Disk | RAM | CPU-ing | CPU-qry | p50 | Recall@10 |
-|--------|--------|-------|------|-----|---------|---------|-----|----------|
-| ChromaDB (HNSW) | 30.6s | 1,633 | 398 MB | 865 MB | 244% | 100% | 1.73ms | 99.75% |
-| **TQDB b=4 FastBuild** | **26.7s** | **1,872** | **70 MB** | **487 MB** | 983% | 99% | 3.51ms | 82.35% |
-| **TQDB b=4 Balanced** | 52.8s | 947 | 70 MB | 488 MB | 861% | 173% | 7.13ms | 88.60% |
-| **TQDB b=8 HQ** | 70.5s | 709 | 119 MB | 538 MB | 889% | 157% | 10.74ms | 97.40% |
-| LanceDB (IVF_PQ) | 77.6s | 644 | 318 MB | 526 MB | 1067% | 155% | 9.17ms | 79.50% |
-| Qdrant (HNSW)† | 538.2s | 92 | 685 MB | 1,151 MB | 17% | 130% | 179.88ms | 100.00% |
+| Engine | Ingest | vec/s | Disk | RAM | CPU-ing | CPU-qry | p50 | p95 | Recall@10 |
+|--------|--------|-------|------|-----|---------|---------|-----|-----|----------|
+| ChromaDB (HNSW) | 30.6s | 1,633 | 398 MB | 865 MB | 244% | 100% | 1.73ms | 2.44ms | 99.75% |
+| **TQDB b=4 FastBuild** | **28.2s** | **1,775** | **70 MB** | **487 MB** | 801% | 95% | 5.30ms | 8.71ms | 83.35% |
+| **TQDB b=4 Balanced** | 37.8s | 1,324 | 70 MB | 488 MB | 898% | 170% | 9.98ms | 15.21ms | 89.15% |
+| **TQDB b=8 HQ** | 59.2s | 844 | 119 MB | 537 MB | 780% | 147% | 12.42ms | 19.34ms | 97.25% |
+| LanceDB (IVF_PQ) | 77.6s | 644 | 318 MB | 526 MB | 1067% | 155% | 9.17ms | 10.51ms | 79.50% |
+| Qdrant (HNSW)† | 538.2s | 92 | 685 MB | 1,151 MB | 17% | 130% | 179.88ms | 186.80ms | 100.00% |
 
 ---
 
@@ -99,13 +99,13 @@ TQDB b=4 stores each vector in **1,466 bytes** vs float32's 6,144 bytes — a **
 | Preset | Windows | WSL2 (/mnt/c) | Linux Native | Win→Native Δ |
 |--------|---------|--------------|-------------|-------------|
 | **Ingest time** | | | | |
-| b=8 HQ | 70.5s | 77.7s | 38.0s | −46% ✅ |
-| b=4 Balanced | 52.8s | 57.3s | 26.0s | −51% ✅ |
-| b=4 FastBuild | 26.7s | 56.5s | 22.7s | −15% ✅ |
+| b=8 HQ | 59.2s | 77.7s | 38.0s | −36% ✅ |
+| b=4 Balanced | 37.8s | 57.3s | 26.0s | −31% ✅ |
+| b=4 FastBuild | 28.2s | 56.5s | 22.7s | −19% ✅ |
 | **p50 latency** | | | | |
-| b=8 HQ | 10.74ms | 10.15ms | 8.73ms | −19% ✅ |
-| b=4 Balanced | 7.13ms | 8.06ms | 7.46ms | −5% ✅ |
-| b=4 FastBuild | 3.51ms | 4.42ms | 4.00ms | +14% |
+| b=8 HQ | 12.42ms | 10.15ms | 8.73ms | −30% ✅ |
+| b=4 Balanced | 9.98ms | 8.06ms | 7.46ms | −25% ✅ |
+| b=4 FastBuild | 5.30ms | 4.42ms | 4.00ms | −25% ✅ |
 
 Linux native is the best platform for TQDB due to efficient `mmap` and lower `madvise` overhead.
 

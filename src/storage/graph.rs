@@ -128,7 +128,7 @@ impl GraphManager {
             let n = u32::from_le_bytes(mmap[4..8].try_into().unwrap()) as usize;
             self.entry_point = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
             self.max_level = u32::from_le_bytes(mmap[12..16].try_into().unwrap());
-            
+
             let table_bytes = (n + 1) * 8;
             let data_start = 16 + table_bytes;
             if mmap.len() >= data_start {
@@ -139,7 +139,7 @@ impl GraphManager {
                     let off = u64::from_le_bytes(mmap[start..end].try_into().unwrap());
                     offsets.push(off);
                 }
-                
+
                 self.node_count = n;
                 self.offsets = offsets;
                 self.data_start = data_start;
@@ -152,28 +152,42 @@ impl GraphManager {
     pub fn get_neighbors_at_level(&self, node_id: u32, level: u32) -> Result<Vec<u32>, String> {
         let mmap = self.mmap.as_ref().ok_or("Graph not loaded")?;
         let i = node_id as usize;
-        if i >= self.node_count { return Err("OOR".into()); }
-        
+        if i >= self.node_count {
+            return Err("OOR".into());
+        }
+
         let start = self.data_start + self.offsets[i] as usize;
         let end = self.data_start + self.offsets[i + 1] as usize;
         let rec = &mmap[start..end];
-        
+
         if rec.len() < 4 {
-            return Err(format!("corrupt graph record for node {}: too short ({} bytes)", node_id, rec.len()));
+            return Err(format!(
+                "corrupt graph record for node {}: too short ({} bytes)",
+                node_id,
+                rec.len()
+            ));
         }
         let num_levels = u32::from_le_bytes(rec[0..4].try_into().unwrap());
-        if level >= num_levels { return Ok(Vec::new()); }
-        
+        if level >= num_levels {
+            return Ok(Vec::new());
+        }
+
         let mut curr = 4;
         for l in 0..num_levels {
             if curr + 4 > rec.len() {
-                return Err(format!("corrupt graph record for node {}: truncated at level {}", node_id, l));
+                return Err(format!(
+                    "corrupt graph record for node {}: truncated at level {}",
+                    node_id, l
+                ));
             }
-            let count = u32::from_le_bytes(rec[curr..curr+4].try_into().unwrap()) as usize;
+            let count = u32::from_le_bytes(rec[curr..curr + 4].try_into().unwrap()) as usize;
             // Validate count is plausible given remaining bytes (each varint is at least 1 byte)
             let max_possible = (rec.len() - curr - 4).min(count);
             if count > rec.len() {
-                return Err(format!("corrupt graph record for node {}: implausible neighbour count {}", node_id, count));
+                return Err(format!(
+                    "corrupt graph record for node {}: implausible neighbour count {}",
+                    node_id, count
+                ));
             }
             let _ = max_possible;
             curr += 4;
@@ -182,7 +196,10 @@ impl GraphManager {
                 let mut last_nb = 0u32;
                 for _ in 0..count {
                     if curr >= rec.len() {
-                        return Err(format!("corrupt graph record for node {}: varint overrun", node_id));
+                        return Err(format!(
+                            "corrupt graph record for node {}: varint overrun",
+                            node_id
+                        ));
                     }
                     let (delta, bytes_read) = decode_varint(&rec[curr..]);
                     let nb = last_nb + delta;
@@ -195,7 +212,10 @@ impl GraphManager {
             // Skip level data
             for _ in 0..count {
                 if curr >= rec.len() {
-                    return Err(format!("corrupt graph record for node {}: varint overrun while skipping", node_id));
+                    return Err(format!(
+                        "corrupt graph record for node {}: varint overrun while skipping",
+                        node_id
+                    ));
                 }
                 let (_, bytes_read) = decode_varint(&rec[curr..]);
                 curr += bytes_read;
@@ -212,41 +232,52 @@ impl GraphManager {
         scorer: impl Fn(u32) -> f64,
         filter: Option<impl Fn(u32) -> bool>,
     ) -> Result<Vec<(u32, f64)>, Box<dyn std::error::Error + Send + Sync>> {
-        if self.node_count == 0 { return Ok(Vec::new()); }
-        
+        if self.node_count == 0 {
+            return Ok(Vec::new());
+        }
+
         // Upper-layer beam uses a fixed cap (not search_list_size) because upper layers
         // have far fewer nodes and the scoring LUT for large b/dim can be cache-cold.
         // A 32-wide beam is sufficient for greedy navigation to a good level-0 entry point.
         const EF_UPPER: usize = 32;
         let mut beam = BinaryHeap::new();
         let start_score = scorer(self.entry_point);
-        beam.push(OrderingWrapper(SearchCandidate { id: self.entry_point, score: start_score }));
-        
+        beam.push(OrderingWrapper(SearchCandidate {
+            id: self.entry_point,
+            score: start_score,
+        }));
+
         // Multi-level navigation with beam search
         for l in (1..=self.max_level).rev() {
             let mut candidates = BinaryHeap::new();
             let mut visited = HashSet::new();
-            
+
             for OrderingWrapper(cand) in &beam {
                 candidates.push(cand.clone());
                 visited.insert(cand.id);
             }
-            
+
             let mut layer_results = beam.clone();
-            
+
             while let Some(current) = candidates.pop() {
-                if layer_results.len() >= EF_UPPER && current.score < layer_results.peek().unwrap().0.score {
+                if layer_results.len() >= EF_UPPER
+                    && current.score < layer_results.peek().unwrap().0.score
+                {
                     break;
                 }
-                
+
                 if let Ok(nbs) = self.get_neighbors_at_level(current.id, l) {
                     for nb in nbs {
-                        if visited.contains(&nb) { continue; }
+                        if visited.contains(&nb) {
+                            continue;
+                        }
                         visited.insert(nb);
-                        
+
                         let score = scorer(nb);
                         let cand = SearchCandidate { id: nb, score };
-                        if layer_results.len() < EF_UPPER || score > layer_results.peek().unwrap().0.score {
+                        if layer_results.len() < EF_UPPER
+                            || score > layer_results.peek().unwrap().0.score
+                        {
                             candidates.push(cand);
                             layer_results.push(OrderingWrapper(cand));
                             if layer_results.len() > EF_UPPER {
@@ -258,7 +289,7 @@ impl GraphManager {
             }
             beam = layer_results;
         }
-        
+
         // Level 0 search
         let mut visited = HashSet::new();
         let mut candidates = BinaryHeap::new();
@@ -267,31 +298,42 @@ impl GraphManager {
         for OrderingWrapper(seed) in beam {
             candidates.push(seed);
             visited.insert(seed.id);
-            let matches = if let Some(f) = &filter { f(seed.id) } else { true };
+            let matches = if let Some(f) = &filter {
+                f(seed.id)
+            } else {
+                true
+            };
             if matches {
                 results.push(OrderingWrapper(seed));
             }
         }
 
         while let Some(current) = candidates.pop() {
-            if results.len() >= search_list_size && current.score < results.peek().unwrap().0.score {
+            if results.len() >= search_list_size && current.score < results.peek().unwrap().0.score
+            {
                 break;
             }
 
             if let Ok(nbs) = self.get_neighbors_at_level(current.id, 0) {
                 for nb in nbs {
-                    if visited.contains(&nb) { continue; }
+                    if visited.contains(&nb) {
+                        continue;
+                    }
                     visited.insert(nb);
-                    
+
                     let score = scorer(nb);
                     let cand = SearchCandidate { id: nb, score };
                     candidates.push(cand);
 
                     let matches = if let Some(f) = &filter { f(nb) } else { true };
                     if matches {
-                        if results.len() < search_list_size || cand.score > results.peek().unwrap().0.score {
+                        if results.len() < search_list_size
+                            || cand.score > results.peek().unwrap().0.score
+                        {
                             results.push(OrderingWrapper(cand));
-                            if results.len() > search_list_size { results.pop(); }
+                            if results.len() > search_list_size {
+                                results.pop();
+                            }
                         }
                     }
                 }
@@ -318,7 +360,7 @@ impl GraphManager {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.mmap = None;
         let mut rng = rand::thread_rng();
-        
+
         let m = (max_degree / 2).max(4);
         let m0 = max_degree.min(MAX_DEGREE);
         let level_mult = 1.0 / (m as f64).ln();
@@ -327,7 +369,7 @@ impl GraphManager {
         let mut node_levels = vec![0u32; n];
         let mut max_l = 0u32;
         let mut ep = 0u32;
-        
+
         for i in 0..n {
             let r: f64 = rng.gen_range(0.0..1.0);
             let l = ((-r.ln() * level_mult) as u32).min(5);
@@ -339,53 +381,76 @@ impl GraphManager {
         }
 
         let mut adjacency: Vec<Vec<Vec<u32>>> = vec![vec![Vec::new(); 6]; n];
-        
+
         for l in 0..=max_l {
-            let level_nodes: Vec<u32> = (0..n).filter(|&i| node_levels[i] >= l).map(|i| i as u32).collect();
-            if level_nodes.len() < 2 { continue; }
-            
+            let level_nodes: Vec<u32> = (0..n)
+                .filter(|&i| node_levels[i] >= l)
+                .map(|i| i as u32)
+                .collect();
+            if level_nodes.len() < 2 {
+                continue;
+            }
+
             let ln = level_nodes.len();
             let degree_cap = if l == 0 { m0 } else { m };
-            
+
             // Build adjacency for this level subset
-            let level_adj: Vec<Vec<u32>> = level_nodes.par_iter().map(|&i| {
-                let mut local_rng = rand::thread_rng();
-                let mut candidates = HashSet::new();
-                while candidates.len() < cand_pool && candidates.len() < ln - 1 {
-                    let cand = level_nodes[local_rng.gen_range(0..ln)];
-                    if cand != i { candidates.insert(cand); }
-                }
-                
-                let cand_vec: Vec<u32> = candidates.into_iter().collect();
-                let mut scored = build_scorer(i, &cand_vec);
-                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                let mut chosen: Vec<u32> = scored.into_iter().take(degree_cap).map(|(id, _)| id).collect();
-                chosen.sort_unstable();
-                chosen
-            }).collect();
-            
-            for (idx, &i) in level_nodes.iter().enumerate() {
-                adjacency[i as usize][l as usize] = level_adj[idx].clone();
-            }
-            
-            // Multiple refinement iterations (nn-descent style)
-            for _ in 0..n_refinements {
-                let next_level_adj: Vec<Vec<u32>> = level_nodes.par_iter().map(|&i| {
+            let level_adj: Vec<Vec<u32>> = level_nodes
+                .par_iter()
+                .map(|&i| {
+                    let mut local_rng = rand::thread_rng();
                     let mut candidates = HashSet::new();
-                    for &nb in &adjacency[i as usize][l as usize] {
-                        candidates.insert(nb);
-                        for &nbnb in &adjacency[nb as usize][l as usize] {
-                            if nbnb != i { candidates.insert(nbnb); }
+                    while candidates.len() < cand_pool && candidates.len() < ln - 1 {
+                        let cand = level_nodes[local_rng.gen_range(0..ln)];
+                        if cand != i {
+                            candidates.insert(cand);
                         }
                     }
+
                     let cand_vec: Vec<u32> = candidates.into_iter().collect();
                     let mut scored = build_scorer(i, &cand_vec);
                     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                    let mut chosen: Vec<u32> = scored.into_iter().take(degree_cap).map(|(id, _)| id).collect();
+                    let mut chosen: Vec<u32> = scored
+                        .into_iter()
+                        .take(degree_cap)
+                        .map(|(id, _)| id)
+                        .collect();
                     chosen.sort_unstable();
                     chosen
-                }).collect();
-                
+                })
+                .collect();
+
+            for (idx, &i) in level_nodes.iter().enumerate() {
+                adjacency[i as usize][l as usize] = level_adj[idx].clone();
+            }
+
+            // Multiple refinement iterations (nn-descent style)
+            for _ in 0..n_refinements {
+                let next_level_adj: Vec<Vec<u32>> = level_nodes
+                    .par_iter()
+                    .map(|&i| {
+                        let mut candidates = HashSet::new();
+                        for &nb in &adjacency[i as usize][l as usize] {
+                            candidates.insert(nb);
+                            for &nbnb in &adjacency[nb as usize][l as usize] {
+                                if nbnb != i {
+                                    candidates.insert(nbnb);
+                                }
+                            }
+                        }
+                        let cand_vec: Vec<u32> = candidates.into_iter().collect();
+                        let mut scored = build_scorer(i, &cand_vec);
+                        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+                        let mut chosen: Vec<u32> = scored
+                            .into_iter()
+                            .take(degree_cap)
+                            .map(|(id, _)| id)
+                            .collect();
+                        chosen.sort_unstable();
+                        chosen
+                    })
+                    .collect();
+
                 for (idx, &i) in level_nodes.iter().enumerate() {
                     adjacency[i as usize][l as usize] = next_level_adj[idx].clone();
                 }
@@ -395,7 +460,7 @@ impl GraphManager {
         let mut payload = Vec::<u8>::new();
         let mut offsets = Vec::<u64>::with_capacity(n + 1);
         offsets.push(0);
-        
+
         for i in 0..n {
             let l_count = node_levels[i] + 1;
             payload.extend_from_slice(&l_count.to_le_bytes());

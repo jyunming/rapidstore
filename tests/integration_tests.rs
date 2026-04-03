@@ -9,7 +9,6 @@ use turboquantdb::storage::backend::StorageBackend;
 use turboquantdb::storage::engine::{DistanceMetric, TurboQuantEngine};
 use turboquantdb::storage::graph::GraphManager;
 
-
 /// Test full insert → flush → search roundtrip with metadata.
 #[test]
 fn test_insert_and_search() {
@@ -62,7 +61,9 @@ fn test_wal_recovery() {
         let mut engine = TurboQuantEngine::open(db_path, db_path, 8, 2, 42).unwrap();
         for i in 0..5u32 {
             let v = Array1::<f64>::from_elem(8, i as f64 / 10.0);
-            engine.insert(format!("v{}", i), &v, HashMap::new()).unwrap();
+            engine
+                .insert(format!("v{}", i), &v, HashMap::new())
+                .unwrap();
         }
         // Simulate crash: drop without close() so live_ids.bin is missing.
         drop(engine);
@@ -71,7 +72,11 @@ fn test_wal_recovery() {
 
     // Reopen must recover from WAL without panicking.
     let mut recovered = TurboQuantEngine::open(db_path, db_path, 8, 2, 42).unwrap();
-    assert_eq!(recovered.vector_count(), 5, "all 5 vectors must be recoverable from WAL");
+    assert_eq!(
+        recovered.vector_count(),
+        5,
+        "all 5 vectors must be recoverable from WAL"
+    );
 
     // Flush and verify data survives the slab compaction (used to panic on Windows).
     recovered.flush_wal_to_segment().unwrap();
@@ -152,7 +157,9 @@ fn test_vamana_search() {
     }
 
     // Build index
-    engine.create_index_with_params(32, 200, 64, 1.2, 0).unwrap();
+    engine
+        .create_index_with_params(32, 200, 64, 1.2, 0)
+        .unwrap();
 
     // Search with query
     let query = Array1::<f64>::from_iter((0..d).map(|j| j as f64 / 1000.0));
@@ -178,13 +185,20 @@ fn test_crud_and_filter() {
 
     let mut meta_b = HashMap::new();
     meta_b.insert("tenant".to_string(), JsonValue::String("beta".to_string()));
-    engine.upsert_with_document("b".to_string(), &v_b, meta_b, None).unwrap();
+    engine
+        .upsert_with_document("b".to_string(), &v_b, meta_b, None)
+        .unwrap();
 
     // Update existing
     let mut meta_b2 = HashMap::new();
     meta_b2.insert("tenant".to_string(), JsonValue::String("alpha".to_string()));
     engine
-        .update_with_document("b".to_string(), &Array1::<f64>::from_elem(16, 0.3), meta_b2, None)
+        .update_with_document(
+            "b".to_string(),
+            &Array1::<f64>::from_elem(16, 0.3),
+            meta_b2,
+            None,
+        )
         .unwrap();
 
     // Filter by metadata
@@ -247,7 +261,9 @@ fn test_batch_and_advanced_filters() {
         let mut meta = HashMap::new();
         meta.insert("year".to_string(), serde_json::json!(year));
         meta.insert("topic".to_string(), serde_json::json!(topic));
-        engine.upsert_with_document(id.to_string(), &v, meta, None).unwrap();
+        engine
+            .upsert_with_document(id.to_string(), &v, meta, None)
+            .unwrap();
     }
     engine.flush_wal_to_segment().unwrap();
 
@@ -384,20 +400,29 @@ fn test_filter_nested_path_and_missing_field_semantics() {
 
     // Insert: one with nested "profile.region", one without.
     let mut meta_with = HashMap::new();
-    meta_with.insert("profile".to_string(), serde_json::json!({"region": "us-west"}));
+    meta_with.insert(
+        "profile".to_string(),
+        serde_json::json!({"region": "us-west"}),
+    );
     meta_with.insert("score".to_string(), serde_json::json!(95));
-    engine.upsert_with_document("has_profile".to_string(), &v, meta_with, None).unwrap();
+    engine
+        .upsert_with_document("has_profile".to_string(), &v, meta_with, None)
+        .unwrap();
 
     let mut meta_without = HashMap::new();
     meta_without.insert("score".to_string(), serde_json::json!(80));
-    engine.upsert_with_document("no_profile".to_string(), &v, meta_without, None).unwrap();
+    engine
+        .upsert_with_document("no_profile".to_string(), &v, meta_without, None)
+        .unwrap();
 
     engine.flush_wal_to_segment().unwrap();
 
     // Dotted path traversal.
     let f_region = serde_json::json!({"profile.region": "us-west"});
     let f_region_map: HashMap<String, JsonValue> = serde_json::from_value(f_region).unwrap();
-    let got = engine.search_with_filter(&v, 10, Some(&f_region_map)).unwrap();
+    let got = engine
+        .search_with_filter(&v, 10, Some(&f_region_map))
+        .unwrap();
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].id, "has_profile");
 
@@ -425,7 +450,9 @@ fn test_filter_negative_paths_invalid_operator_and_type_strictness() {
     let mut meta = HashMap::new();
     meta.insert("year".to_string(), JsonValue::Number(2025.into()));
     meta.insert("tag".to_string(), JsonValue::String("a".to_string()));
-    engine.upsert_with_document("x".to_string(), &v, meta, None).unwrap();
+    engine
+        .upsert_with_document("x".to_string(), &v, meta, None)
+        .unwrap();
     engine.flush_wal_to_segment().unwrap();
 
     // Unknown operator should reject match.
@@ -558,12 +585,24 @@ fn test_index_config_persisted_in_manifest_and_stats() {
             .upsert_with_document(format!("id-{i}"), &v, HashMap::new(), None)
             .unwrap();
     }
-    engine.create_index_with_params(24, 200, 37, 1.7, 0).unwrap();
+    engine
+        .create_index_with_params(24, 200, 37, 1.7, 0)
+        .unwrap();
     let s = engine.stats();
     assert!(s.has_index);
     assert_eq!(s.index_nodes, 40);
-    assert_eq!(engine.manifest.index_state.as_ref().map(|s| s.search_list_size), Some(37));
-    assert_eq!(engine.manifest.index_state.as_ref().map(|s| s.alpha), Some(1.7));
+    assert_eq!(
+        engine
+            .manifest
+            .index_state
+            .as_ref()
+            .map(|s| s.search_list_size),
+        Some(37)
+    );
+    assert_eq!(
+        engine.manifest.index_state.as_ref().map(|s| s.alpha),
+        Some(1.7)
+    );
     engine.close().unwrap();
     drop(engine);
 
@@ -628,7 +667,9 @@ fn test_search_ann_override_api_and_high_beam_matches_bruteforce_top1() {
             a - b
         }));
         let id = format!("id-{i:03}");
-        engine.upsert_with_document(id.clone(), &v, HashMap::new(), None).unwrap();
+        engine
+            .upsert_with_document(id.clone(), &v, HashMap::new(), None)
+            .unwrap();
         vectors.insert(id, v);
     }
 
@@ -685,12 +726,16 @@ fn test_compaction_recovery_deletes_old_segments_when_marker_exists() {
     let mut engine = TurboQuantEngine::open(db_path, db_path, 8, 2, 42).unwrap();
     for i in 0..5u32 {
         let v = Array1::<f64>::from_elem(8, i as f64 / 10.0);
-        engine.insert(format!("v{}", i), &v, HashMap::new()).unwrap();
+        engine
+            .insert(format!("v{}", i), &v, HashMap::new())
+            .unwrap();
     }
     engine.flush_wal_to_segment().unwrap();
     for i in 5..10u32 {
         let v = Array1::<f64>::from_elem(8, i as f64 / 10.0);
-        engine.insert(format!("v{}", i), &v, HashMap::new()).unwrap();
+        engine
+            .insert(format!("v{}", i), &v, HashMap::new())
+            .unwrap();
     }
     engine.flush_wal_to_segment().unwrap();
     let before_count = engine.vector_count();
@@ -710,7 +755,9 @@ fn test_compaction_recovery_deletes_old_segments_when_marker_exists() {
     // Write a fake "prepared" compaction marker — simulates a crash mid-compaction.
     let compacted_name = "seg-99999999.bin";
     let compactor = Compactor::new(backend.clone());
-    compactor.begin_compaction(&old_names, compacted_name).unwrap();
+    compactor
+        .begin_compaction(&old_names, compacted_name)
+        .unwrap();
     // Write a dummy (empty) compacted segment so the recovery sees it as complete.
     backend.write(compacted_name, &[]).unwrap();
 
@@ -727,9 +774,16 @@ fn test_compaction_recovery_deletes_old_segments_when_marker_exists() {
 
     // Old segment files must be gone; only the compacted placeholder remains.
     for old in &old_names {
-        assert!(!backend_after.exists(old), "old segment {} must be deleted", old);
+        assert!(
+            !backend_after.exists(old),
+            "old segment {} must be deleted",
+            old
+        );
     }
-    assert!(backend_after.exists(compacted_name), "compacted segment must still exist");
+    assert!(
+        backend_after.exists(compacted_name),
+        "compacted segment must still exist"
+    );
 }
 
 #[test]
@@ -842,10 +896,16 @@ fn test_wal_versioning_and_migration() {
     // Write first batch, verify WAL header is present.
     {
         let mut engine = TurboQuantEngine::open(db_path, db_path, 8, 2, 42).unwrap();
-        engine.insert("v1".to_string(), &Array1::zeros(8), HashMap::new()).unwrap();
+        engine
+            .insert("v1".to_string(), &Array1::zeros(8), HashMap::new())
+            .unwrap();
     }
     let wal_bytes = std::fs::read(&wal_path).unwrap();
-    assert_eq!(&wal_bytes[0..4], b"TQWV", "WAL must start with version header");
+    assert_eq!(
+        &wal_bytes[0..4],
+        b"TQWV",
+        "WAL must start with version header"
+    );
 
     // Reopen and verify recovery + flush work without any panic.
     let mut engine = TurboQuantEngine::open(db_path, db_path, 8, 2, 42).unwrap();
@@ -870,7 +930,9 @@ fn test_hnsw_beam_search_recall() {
             .unwrap();
     }
 
-    engine.create_index_with_params(16, 200, 64, 1.2, 0).unwrap();
+    engine
+        .create_index_with_params(16, 200, 64, 1.2, 0)
+        .unwrap();
 
     let query = Array1::<f64>::from_iter((0..16).map(|j| j as f64 / 1000.0));
     let results = engine.search(&query, 10).unwrap();
@@ -906,7 +968,9 @@ fn test_rerank_precision_f16_roundtrip() {
     let n = 10usize;
     for i in 0..n {
         let v = Array1::<f64>::from_iter((0..d).map(|j| (i * d + j) as f64 / (n * d) as f64));
-        engine.insert(format!("v{}", i), &v, HashMap::new()).unwrap();
+        engine
+            .insert(format!("v{}", i), &v, HashMap::new())
+            .unwrap();
     }
 
     // Flush WAL to compact live_vectors.bin to exactly the logical size.
@@ -914,7 +978,10 @@ fn test_rerank_precision_f16_roundtrip() {
 
     // live_vectors.bin must exist and be exactly n * d * 2 bytes.
     let vraw_path = dir.path().join("live_vectors.bin");
-    assert!(vraw_path.exists(), "live_vectors.bin should be created for F16 precision");
+    assert!(
+        vraw_path.exists(),
+        "live_vectors.bin should be created for F16 precision"
+    );
     let file_size = std::fs::metadata(&vraw_path).unwrap().len() as usize;
     assert_eq!(
         file_size,
@@ -926,7 +993,10 @@ fn test_rerank_precision_f16_roundtrip() {
     // Search must succeed and return a valid result.
     let query = Array1::<f64>::from_iter((0..d).map(|j| j as f64 / (n * d) as f64));
     let results = engine.search(&query, 3).unwrap();
-    assert!(!results.is_empty(), "search with F16 reranking must return results");
+    assert!(
+        !results.is_empty(),
+        "search with F16 reranking must return results"
+    );
     assert!(results[0].score > 0.0, "top score must be positive");
 }
 
@@ -955,14 +1025,19 @@ fn test_rerank_precision_f32_file_size() {
 
     for i in 0..n {
         let v = Array1::<f64>::from_iter((0..d).map(|j| (i + j) as f64 / 100.0));
-        engine.insert(format!("v{}", i), &v, HashMap::new()).unwrap();
+        engine
+            .insert(format!("v{}", i), &v, HashMap::new())
+            .unwrap();
     }
 
     // Flush WAL to compact live_vectors.bin to exactly the logical size.
     engine.flush_wal_to_segment().unwrap();
 
     let vraw_path = dir.path().join("live_vectors.bin");
-    assert!(vraw_path.exists(), "live_vectors.bin must exist for F32 precision");
+    assert!(
+        vraw_path.exists(),
+        "live_vectors.bin must exist for F32 precision"
+    );
     let file_size = std::fs::metadata(&vraw_path).unwrap().len() as usize;
     assert_eq!(
         file_size,
@@ -982,7 +1057,10 @@ fn test_rerank_precision_f16_vs_f32_size_ratio() {
     let n = 20usize;
     let mut sizes = [0usize; 2];
 
-    for (idx, precision) in [RerankPrecision::F16, RerankPrecision::F32].iter().enumerate() {
+    for (idx, precision) in [RerankPrecision::F16, RerankPrecision::F32]
+        .iter()
+        .enumerate()
+    {
         let dir = tempdir().unwrap();
         let db_path = dir.path().to_str().unwrap();
 
@@ -1001,7 +1079,9 @@ fn test_rerank_precision_f16_vs_f32_size_ratio() {
 
         for i in 0..n {
             let v = Array1::<f64>::from_iter((0..d).map(|j| (i * d + j + 1) as f64));
-            engine.insert(format!("v{}", i), &v, HashMap::new()).unwrap();
+            engine
+                .insert(format!("v{}", i), &v, HashMap::new())
+                .unwrap();
         }
 
         let vraw_path = dir.path().join("live_vectors.bin");
@@ -1009,7 +1089,11 @@ fn test_rerank_precision_f16_vs_f32_size_ratio() {
 
         let query = Array1::<f64>::from_iter((0..d).map(|j| j as f64));
         let results = engine.search(&query, 5).unwrap();
-        assert!(!results.is_empty(), "search must return results for {:?}", precision);
+        assert!(
+            !results.is_empty(),
+            "search must return results for {:?}",
+            precision
+        );
     }
 
     // F16 file should be exactly half of F32 file.
@@ -1045,7 +1129,9 @@ fn test_rerank_precision_disabled_no_file() {
 
     for i in 0..5 {
         let v = Array1::<f64>::from_iter((0..16).map(|j| (i + j) as f64 / 100.0));
-        engine.insert(format!("v{}", i), &v, HashMap::new()).unwrap();
+        engine
+            .insert(format!("v{}", i), &v, HashMap::new())
+            .unwrap();
     }
 
     // Must NOT create live_vectors.bin
@@ -1057,6 +1143,8 @@ fn test_rerank_precision_disabled_no_file() {
     // Search must still work via dequantization reranking.
     let query = Array1::<f64>::from_elem(16, 0.5);
     let results = engine.search(&query, 3).unwrap();
-    assert!(!results.is_empty(), "search must work with dequant reranking");
+    assert!(
+        !results.is_empty(),
+        "search must work with dequant reranking"
+    );
 }
-

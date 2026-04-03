@@ -623,7 +623,7 @@ Disk per project: ~14M × 700 B ≈ 10 GB. All projects for 1 TB: ~50 GB disk to
 ## Benchmarking After Each Phase
 
 ```
-cd C:\dev\turboquantDB
+cd C:\dev\TurboQuantDB
 cargo build --release
 pip install --force-reinstall target_py\wheels\turboquantdb-*.whl
 python Qualification\ClaudeQual\tqdb_comparison_bench.py

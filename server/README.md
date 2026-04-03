@@ -1,4 +1,4 @@
-# rapidstore-server (crate: turboquantdb-server)
+# turboquantdb-server
 
 Optional Axum HTTP service providing TurboQuantDB in multi-tenant server mode. Use this when you need REST API access, multi-tenancy, authentication, quotas, or async job management. For single-process Python use, the embedded `turboquantdb` package is simpler.
 

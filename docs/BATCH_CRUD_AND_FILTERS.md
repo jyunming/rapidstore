@@ -1,6 +1,6 @@
 # Batch CRUD and Filter Grammar v1
 
-This document captures the current RapidStore batch APIs and filter behavior for M1.
+This document captures the current TurboQuantDB batch APIs and filter behavior for M1.
 
 ## Python API (PyO3)
 
@@ -82,7 +82,7 @@ A reproducible benchmark test is available:
 Run it with:
 
 ```powershell
-$env:CARGO_TARGET_DIR="$env:USERPROFILE\.cargo-target\turboquantDB"
+$env:CARGO_TARGET_DIR="$env:USERPROFILE\.cargo-target\TurboQuantDB"
 cargo test -q --test bench_batch_crud -- --ignored --nocapture
 ```
 

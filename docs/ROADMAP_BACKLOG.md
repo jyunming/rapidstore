@@ -1,6 +1,6 @@
-# RapidStore GitHub Roadmap Backlog
+# TurboQuantDB GitHub Roadmap Backlog
 
-This backlog is ordered by urgency for making RapidStore comparable to ChromaDB/LanceDB as an embedded RAG vector store.
+This backlog is ordered by urgency for making TurboQuantDB comparable to ChromaDB/LanceDB as an embedded RAG vector store.
 
 ## Milestones
 

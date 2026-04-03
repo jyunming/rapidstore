@@ -106,3 +106,168 @@ struct CompactionState {
     old_segment_names: Vec<String>,
     new_segment_name: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::segment::{Segment, SegmentRecord};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn make_compactor_and_backend() -> (tempfile::TempDir, Arc<StorageBackend>, Compactor) {
+        let dir = tempdir().unwrap();
+        let backend = Arc::new(StorageBackend::from_uri(dir.path().to_str().unwrap()).unwrap());
+        let compactor = Compactor::new(Arc::clone(&backend));
+        (dir, backend, compactor)
+    }
+
+    #[test]
+    fn should_compact_threshold() {
+        let (_dir, _backend, compactor) = make_compactor_and_backend();
+        assert!(!compactor.should_compact(9));
+        assert!(compactor.should_compact(10));
+        assert!(compactor.should_compact(100));
+    }
+
+    #[test]
+    fn compact_live_records_creates_new_and_deletes_old() {
+        let (_dir, backend, compactor) = make_compactor_and_backend();
+        let r = vec![SegmentRecord {
+            id: "a".to_string(),
+            is_deleted: false,
+        }];
+        Segment::write_batch(&backend, "seg-00000000.bin", &r).unwrap();
+        Segment::write_batch(&backend, "seg-00000001.bin", &r).unwrap();
+
+        let live = vec![SegmentRecord {
+            id: "a".to_string(),
+            is_deleted: false,
+        }];
+        let old_names = vec![
+            "seg-00000000.bin".to_string(),
+            "seg-00000001.bin".to_string(),
+        ];
+        let new_seg = compactor
+            .compact_live_records(&old_names, "seg-00000002.bin", &live)
+            .unwrap();
+
+        assert_eq!(new_seg.name, "seg-00000002.bin");
+        assert_eq!(new_seg.record_count, 1);
+        assert!(!backend.exists("seg-00000000.bin"));
+        assert!(!backend.exists("seg-00000001.bin"));
+        assert!(backend.exists("seg-00000002.bin"));
+    }
+
+    #[test]
+    fn compact_live_records_guard_prevents_self_deletion() {
+        let (_dir, backend, compactor) = make_compactor_and_backend();
+        let r = vec![SegmentRecord {
+            id: "a".to_string(),
+            is_deleted: false,
+        }];
+        Segment::write_batch(&backend, "seg-00000000.bin", &r).unwrap();
+
+        // new_segment_name also appears in old_segment_names — must NOT be deleted
+        let old_names = vec![
+            "seg-00000000.bin".to_string(),
+            "seg-00000001.bin".to_string(),
+        ];
+        compactor
+            .compact_live_records(&old_names, "seg-00000001.bin", &r)
+            .unwrap();
+
+        assert!(
+            backend.exists("seg-00000001.bin"),
+            "freshly compacted segment must survive"
+        );
+    }
+
+    #[test]
+    fn begin_and_finish_compaction_lifecycle() {
+        let (_dir, backend, compactor) = make_compactor_and_backend();
+        compactor
+            .begin_compaction(&["seg-00000000.bin".to_string()], "seg-00000001.bin")
+            .unwrap();
+        assert!(backend.exists("compaction_state.json"));
+        compactor.finish_compaction().unwrap();
+        assert!(!backend.exists("compaction_state.json"));
+    }
+
+    #[test]
+    fn recover_if_needed_no_state_file_returns_false() {
+        let (_dir, _backend, compactor) = make_compactor_and_backend();
+        let recovered = compactor.recover_if_needed().unwrap();
+        assert!(!recovered);
+    }
+
+    #[test]
+    fn recover_with_completed_new_segment_deletes_old() {
+        let (_dir, backend, compactor) = make_compactor_and_backend();
+        let r = vec![SegmentRecord {
+            id: "a".to_string(),
+            is_deleted: false,
+        }];
+        Segment::write_batch(&backend, "seg-00000000.bin", &r).unwrap();
+        Segment::write_batch(&backend, "seg-00000001.bin", &r).unwrap();
+
+        // Simulate crash after write_batch but before finish_compaction
+        compactor
+            .begin_compaction(&["seg-00000000.bin".to_string()], "seg-00000001.bin")
+            .unwrap();
+
+        let recovered = compactor.recover_if_needed().unwrap();
+        assert!(recovered);
+        assert!(!backend.exists("compaction_state.json"));
+        assert!(
+            !backend.exists("seg-00000000.bin"),
+            "old segment must be cleaned up"
+        );
+        assert!(
+            backend.exists("seg-00000001.bin"),
+            "new segment must be preserved"
+        );
+    }
+
+    #[test]
+    fn recover_with_missing_new_segment_preserves_old() {
+        let (_dir, backend, compactor) = make_compactor_and_backend();
+        let r = vec![SegmentRecord {
+            id: "a".to_string(),
+            is_deleted: false,
+        }];
+        Segment::write_batch(&backend, "seg-00000000.bin", &r).unwrap();
+
+        // Crash before write_batch: new segment doesn't exist
+        compactor
+            .begin_compaction(&["seg-00000000.bin".to_string()], "seg-00000001.bin")
+            .unwrap();
+
+        let recovered = compactor.recover_if_needed().unwrap();
+        assert!(recovered);
+        assert!(!backend.exists("compaction_state.json"));
+        assert!(
+            backend.exists("seg-00000000.bin"),
+            "old segment must survive abandoned compaction"
+        );
+    }
+
+    #[test]
+    fn recover_with_corrupt_state_file_cleans_up() {
+        let (_dir, backend, compactor) = make_compactor_and_backend();
+        backend
+            .write("compaction_state.json", b"not valid json!!")
+            .unwrap();
+        let recovered = compactor.recover_if_needed().unwrap();
+        assert!(recovered);
+        assert!(
+            !backend.exists("compaction_state.json"),
+            "corrupt state file must be removed"
+        );
+    }
+
+    #[test]
+    fn compactor_new_sets_min_segments_to_10() {
+        let (_dir, _backend, compactor) = make_compactor_and_backend();
+        assert_eq!(compactor.min_segments, 10);
+    }
+}

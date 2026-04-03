@@ -268,3 +268,281 @@ impl SegmentManager {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn make_backend() -> (tempfile::TempDir, Arc<StorageBackend>) {
+        let dir = tempdir().unwrap();
+        let backend = StorageBackend::from_uri(dir.path().to_str().unwrap()).unwrap();
+        (dir, Arc::new(backend))
+    }
+
+    #[test]
+    fn write_batch_and_read_all_roundtrip() {
+        let (_dir, backend) = make_backend();
+        let records = vec![
+            SegmentRecord {
+                id: "a".to_string(),
+                is_deleted: false,
+            },
+            SegmentRecord {
+                id: "b".to_string(),
+                is_deleted: true,
+            },
+        ];
+        Segment::write_batch(&backend, "seg-00000001.bin", &records).unwrap();
+        let loaded = Segment::read_all(&backend, "seg-00000001.bin").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, "a");
+        assert!(!loaded[0].is_deleted);
+        assert_eq!(loaded[1].id, "b");
+        assert!(loaded[1].is_deleted);
+    }
+
+    #[test]
+    fn write_batch_returns_correct_segment_metadata() {
+        let (_dir, backend) = make_backend();
+        let records = vec![SegmentRecord {
+            id: "x".to_string(),
+            is_deleted: false,
+        }];
+        let seg = Segment::write_batch(&backend, "seg-00000042.bin", &records).unwrap();
+        assert_eq!(seg.name, "seg-00000042.bin");
+        assert_eq!(seg.record_count, 1);
+    }
+
+    #[test]
+    fn write_batch_empty_segment() {
+        let (_dir, backend) = make_backend();
+        let seg = Segment::write_batch(&backend, "empty.bin", &[]).unwrap();
+        assert_eq!(seg.record_count, 0);
+        let loaded = Segment::read_all(&backend, "empty.bin").unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn segment_manager_open_empty_dir() {
+        let (_dir, backend) = make_backend();
+        let mgr = SegmentManager::open(backend).unwrap();
+        assert_eq!(mgr.segments.len(), 0);
+        assert_eq!(mgr.total_vectors(), 0);
+    }
+
+    #[test]
+    fn segment_manager_open_discovers_existing_segments() {
+        let (_dir, backend) = make_backend();
+        let records = vec![
+            SegmentRecord {
+                id: "r1".to_string(),
+                is_deleted: false,
+            },
+            SegmentRecord {
+                id: "r2".to_string(),
+                is_deleted: false,
+            },
+        ];
+        Segment::write_batch(&backend, "seg-00000000.bin", &records).unwrap();
+        let mgr = SegmentManager::open(backend).unwrap();
+        assert_eq!(mgr.segments.len(), 1);
+        assert_eq!(mgr.total_vectors(), 2);
+    }
+
+    #[test]
+    fn flush_batch_creates_segment_file() {
+        let (_dir, backend) = make_backend();
+        let mut mgr = SegmentManager::open(backend).unwrap();
+        let records = vec![
+            SegmentRecord {
+                id: "id1".to_string(),
+                is_deleted: false,
+            },
+            SegmentRecord {
+                id: "id2".to_string(),
+                is_deleted: false,
+            },
+        ];
+        mgr.flush_batch(records).unwrap();
+        assert_eq!(mgr.segments.len(), 1);
+        assert_eq!(mgr.total_vectors(), 2);
+    }
+
+    #[test]
+    fn flush_batch_empty_is_no_op() {
+        let (_dir, backend) = make_backend();
+        let mut mgr = SegmentManager::open(backend).unwrap();
+        mgr.flush_batch(vec![]).unwrap();
+        assert_eq!(mgr.segments.len(), 0);
+    }
+
+    #[test]
+    fn flush_multiple_batches_accumulate() {
+        let (_dir, backend) = make_backend();
+        let mut mgr = SegmentManager::open(backend).unwrap();
+        mgr.flush_batch(vec![SegmentRecord {
+            id: "a".to_string(),
+            is_deleted: false,
+        }])
+        .unwrap();
+        mgr.flush_batch(vec![SegmentRecord {
+            id: "b".to_string(),
+            is_deleted: false,
+        }])
+        .unwrap();
+        assert_eq!(mgr.segments.len(), 2);
+        assert_eq!(mgr.total_vectors(), 2);
+    }
+
+    #[test]
+    fn iter_all_records_across_multiple_segments() {
+        let (_dir, backend) = make_backend();
+        let mut mgr = SegmentManager::open(backend).unwrap();
+        mgr.flush_batch(vec![SegmentRecord {
+            id: "a".to_string(),
+            is_deleted: false,
+        }])
+        .unwrap();
+        mgr.flush_batch(vec![SegmentRecord {
+            id: "b".to_string(),
+            is_deleted: true,
+        }])
+        .unwrap();
+        let all = mgr.iter_all_records().unwrap();
+        assert_eq!(all.len(), 2);
+        let ids: Vec<&str> = all.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"a"));
+        assert!(ids.contains(&"b"));
+        let b = all.iter().find(|r| r.id == "b").unwrap();
+        assert!(b.is_deleted);
+    }
+
+    #[test]
+    fn iter_records_streaming_yields_all() {
+        let (_dir, backend) = make_backend();
+        let mut mgr = SegmentManager::open(backend).unwrap();
+        for i in 0..3usize {
+            mgr.flush_batch(vec![SegmentRecord {
+                id: format!("v{}", i),
+                is_deleted: false,
+            }])
+            .unwrap();
+        }
+        let streamed: Vec<_> = mgr
+            .iter_records_streaming()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(streamed.len(), 3);
+    }
+
+    #[test]
+    fn total_disk_size_and_segment_sizes() {
+        let (_dir, backend) = make_backend();
+        let mut mgr = SegmentManager::open(backend).unwrap();
+        mgr.flush_batch(vec![SegmentRecord {
+            id: "z".to_string(),
+            is_deleted: false,
+        }])
+        .unwrap();
+        let sizes = mgr.segment_sizes_bytes();
+        assert_eq!(sizes.len(), 1);
+        assert!(sizes[0] > 0);
+        assert_eq!(mgr.total_disk_size(), sizes[0]);
+    }
+
+    #[test]
+    fn remove_segments_removes_by_name() {
+        let (_dir, backend) = make_backend();
+        let mut mgr = SegmentManager::open(backend).unwrap();
+        mgr.flush_batch(vec![SegmentRecord {
+            id: "keep".to_string(),
+            is_deleted: false,
+        }])
+        .unwrap();
+        mgr.flush_batch(vec![SegmentRecord {
+            id: "drop".to_string(),
+            is_deleted: false,
+        }])
+        .unwrap();
+        assert_eq!(mgr.segments.len(), 2);
+        let to_remove = vec![mgr.segments[1].name.clone()];
+        mgr.remove_segments(&to_remove);
+        assert_eq!(mgr.segments.len(), 1);
+        assert_eq!(mgr.segments[0].record_count, 1);
+    }
+
+    #[test]
+    fn add_segment_appends_to_list() {
+        let (_dir, backend) = make_backend();
+        let mut mgr = SegmentManager::open(backend).unwrap();
+        let seg = Segment {
+            name: "custom.bin".to_string(),
+            record_count: 7,
+        };
+        mgr.add_segment(seg);
+        assert_eq!(mgr.segments.len(), 1);
+        assert_eq!(mgr.segments[0].record_count, 7);
+    }
+
+    #[test]
+    fn next_segment_name_is_monotonic() {
+        let (_dir, backend) = make_backend();
+        let mut mgr = SegmentManager::open(backend).unwrap();
+        let name1 = mgr.next_segment_name();
+        mgr.flush_batch(vec![SegmentRecord {
+            id: "x".to_string(),
+            is_deleted: false,
+        }])
+        .unwrap();
+        let name2 = mgr.next_segment_name();
+        assert!(
+            name2 > name1,
+            "segment names should be monotonically increasing"
+        );
+    }
+
+    #[test]
+    fn flush_batch_named_with_non_standard_name() {
+        let (_dir, backend) = make_backend();
+        let mut mgr = SegmentManager::open(backend).unwrap();
+        let records = vec![SegmentRecord {
+            id: "custom".to_string(),
+            is_deleted: false,
+        }];
+        mgr.flush_batch_named("custom_segment.bin".to_string(), records)
+            .unwrap();
+        assert_eq!(mgr.segments.len(), 1);
+    }
+
+    #[test]
+    fn segment_manager_sorts_by_name_on_open() {
+        let (_dir, backend) = make_backend();
+        // Write segments out of order
+        let r = vec![SegmentRecord {
+            id: "x".to_string(),
+            is_deleted: false,
+        }];
+        Segment::write_batch(&backend, "seg-00000002.bin", &r).unwrap();
+        Segment::write_batch(&backend, "seg-00000000.bin", &r).unwrap();
+        Segment::write_batch(&backend, "seg-00000001.bin", &r).unwrap();
+        let mgr = SegmentManager::open(backend).unwrap();
+        assert_eq!(mgr.segments.len(), 3);
+        assert_eq!(mgr.segments[0].name, "seg-00000000.bin");
+        assert_eq!(mgr.segments[1].name, "seg-00000001.bin");
+        assert_eq!(mgr.segments[2].name, "seg-00000002.bin");
+    }
+
+    #[test]
+    fn segment_manager_next_id_after_open() {
+        let (_dir, backend) = make_backend();
+        let r = vec![SegmentRecord {
+            id: "x".to_string(),
+            is_deleted: false,
+        }];
+        Segment::write_batch(&backend, "seg-00000005.bin", &r).unwrap();
+        let mgr = SegmentManager::open(backend).unwrap();
+        assert_eq!(mgr.next_segment_name(), "seg-00000006.bin");
+    }
+}

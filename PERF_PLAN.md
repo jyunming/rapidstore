@@ -381,7 +381,7 @@ Impact: `create_index` on 16k vectors: >60s timeout → ~2–5s.
 Use `Qualification/ClaudeQual/tqdb_probe2.py` after each phase rebuild:
 
 ```
-cd C:\dev\turboquantDB
+cd C:\dev\TurboQuantDB
 cargo build --release
 pip install --force-reinstall target_py\wheels\turboquantdb-*.whl
 python Qualification\ClaudeQual\tqdb_probe2.py

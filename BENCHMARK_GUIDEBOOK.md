@@ -314,4 +314,4 @@ All feedback, results from your own hardware, and pull requests are welcome.
 ---
 
 *Generated: 2026-04-03 | Platform: WSL2 Linux, Intel Core Ultra 7 255H, 16 cores*
-*TQDB: arXiv:2504.19874 | Repo: turboquantDB*
+*TQDB: arXiv:2504.19874 | Repo: TurboQuantDB*

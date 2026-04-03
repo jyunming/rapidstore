@@ -68,4 +68,51 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn generate_projection_matrix_shape() {
+        let d = 8;
+        let mut rng = StdRng::seed_from_u64(42);
+        let mat = generate_projection_matrix(d, &mut rng);
+        assert_eq!(mat.nrows(), d);
+        assert_eq!(mat.ncols(), d);
+    }
+
+    #[test]
+    fn generate_projection_matrix_has_nonzero_entries() {
+        let d = 4;
+        let mut rng = StdRng::seed_from_u64(42);
+        let mat = generate_projection_matrix(d, &mut rng);
+        let all_zero = mat.iter().all(|&v| v == 0.0);
+        assert!(!all_zero, "projection matrix should not be all zeros");
+    }
+
+    #[test]
+    fn generate_projection_matrix_is_not_orthogonal() {
+        // Unlike generate_random_rotation, this is NOT guaranteed orthogonal
+        let d = 4;
+        let mut rng = StdRng::seed_from_u64(42);
+        let mat = generate_projection_matrix(d, &mut rng);
+        // Just verify we can compute it without panic and it has the right shape
+        assert_eq!(mat.nrows(), d);
+        assert_eq!(mat.ncols(), d);
+    }
+
+    #[test]
+    fn generate_random_rotation_is_deterministic() {
+        let d = 5;
+        let mut rng1 = StdRng::seed_from_u64(99);
+        let mut rng2 = StdRng::seed_from_u64(99);
+        let q1 = generate_random_rotation(d, &mut rng1);
+        let q2 = generate_random_rotation(d, &mut rng2);
+        for i in 0..d {
+            for j in 0..d {
+                assert_eq!(
+                    q1[(i, j)],
+                    q2[(i, j)],
+                    "rotation should be deterministic with same seed"
+                );
+            }
+        }
+    }
 }

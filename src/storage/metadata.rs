@@ -158,3 +158,214 @@ impl MetadataStore {
         Ok(map)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn make_meta(key: &str, val: &str) -> VectorMetadata {
+        let mut props = HashMap::new();
+        props.insert(key.to_string(), serde_json::Value::String(val.to_string()));
+        VectorMetadata {
+            properties: props,
+            document: None,
+        }
+    }
+
+    fn open_store(dir: &tempfile::TempDir, filename: &str) -> MetadataStore {
+        let path = dir.path().join(filename).to_str().unwrap().to_string();
+        MetadataStore::open(&path).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // open
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn open_creates_empty_store() {
+        let dir = tempdir().unwrap();
+        let store = open_store(&dir, "meta.bin");
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn open_creates_parent_directory() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("sub").join("meta.bin");
+        MetadataStore::open(nested.to_str().unwrap()).unwrap();
+        assert!(
+            dir.path().join("sub").is_dir(),
+            "parent dir should be created"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // put / get
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn put_and_get_roundtrip() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        let meta = make_meta("color", "blue");
+        store.put(0, &meta).unwrap();
+        let got = store.get(0).unwrap().expect("should exist");
+        assert_eq!(got.properties["color"], json!("blue"));
+    }
+
+    #[test]
+    fn get_missing_key_returns_none() {
+        let dir = tempdir().unwrap();
+        let store = open_store(&dir, "meta.bin");
+        assert!(store.get(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn put_overwrites_existing() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        store.put(0, &make_meta("k", "v1")).unwrap();
+        store.put(0, &make_meta("k", "v2")).unwrap();
+        let got = store.get(0).unwrap().unwrap();
+        assert_eq!(got.properties["k"], json!("v2"));
+    }
+
+    // -----------------------------------------------------------------------
+    // put_many / get_many
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn put_many_and_get_many() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        let entries = vec![
+            (0u32, make_meta("a", "1")),
+            (1u32, make_meta("b", "2")),
+            (2u32, make_meta("c", "3")),
+        ];
+        store.put_many(&entries).unwrap();
+        assert_eq!(store.len(), 3);
+        let got = store.get_many(&[0, 1, 2, 99]).unwrap();
+        assert_eq!(got.len(), 3);
+        assert!(got.contains_key(&0));
+        assert!(!got.contains_key(&99));
+    }
+
+    #[test]
+    fn put_many_empty_is_no_op() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        store.put_many(&[]).unwrap();
+        assert_eq!(store.len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // delete
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn delete_removes_entry() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        store.put(0, &make_meta("k", "v")).unwrap();
+        assert_eq!(store.len(), 1);
+        store.delete(0).unwrap();
+        assert_eq!(store.len(), 0);
+        assert!(store.get(0).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_missing_slot_is_no_op() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        // Should not error
+        store.delete(42).unwrap();
+        assert_eq!(store.len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // flush / persistence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn flush_and_reload_persists_data() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.bin").to_str().unwrap().to_string();
+        {
+            let mut store = MetadataStore::open(&path).unwrap();
+            store.put(0, &make_meta("field", "hello")).unwrap();
+            let with_doc = VectorMetadata {
+                properties: Default::default(),
+                document: Some("doc text".to_string()),
+            };
+            store.put(1, &with_doc).unwrap();
+            store.flush().unwrap();
+        }
+        // Reload from disk
+        let store2 = MetadataStore::open(&path).unwrap();
+        assert_eq!(store2.len(), 2);
+        let m0 = store2.get(0).unwrap().unwrap();
+        assert_eq!(m0.properties["field"], json!("hello"));
+        let m1 = store2.get(1).unwrap().unwrap();
+        assert_eq!(m1.document, Some("doc text".to_string()));
+    }
+
+    #[test]
+    fn flush_is_idempotent_when_not_dirty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.bin").to_str().unwrap().to_string();
+        let mut store = MetadataStore::open(&path).unwrap();
+        store.put(0, &make_meta("k", "v")).unwrap();
+        store.flush().unwrap();
+        let size1 = std::fs::metadata(&path).unwrap().len();
+        // Not dirty — second flush should not touch the file
+        store.flush().unwrap();
+        let size2 = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            size1, size2,
+            "flush on non-dirty store should not modify file"
+        );
+    }
+
+    #[test]
+    fn flush_empty_store_creates_valid_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.bin").to_str().unwrap().to_string();
+        let mut store = MetadataStore::open(&path).unwrap();
+        store.put(0, &make_meta("x", "y")).unwrap();
+        store.delete(0).unwrap(); // mark dirty again after delete
+        store.flush().unwrap();
+        // Reload should succeed and return empty
+        let store2 = MetadataStore::open(&path).unwrap();
+        assert_eq!(store2.len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // approx_bytes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn approx_bytes_increases_with_entries() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        let before = store.approx_bytes();
+        store.put(0, &make_meta("key", "value")).unwrap();
+        assert!(
+            store.approx_bytes() > before,
+            "approx_bytes should grow after put"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // VectorMetadata default / document
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vector_metadata_default_has_empty_properties_and_no_document() {
+        let meta = VectorMetadata::default();
+        assert!(meta.properties.is_empty());
+        assert!(meta.document.is_none());
+    }
+}

@@ -447,3 +447,304 @@ class TestPersistence:
         got = db2.get("a")
         assert got["metadata"]["key"] == "value"
         assert got["document"] == "doc text"
+
+
+# ---------------------------------------------------------------------------
+# TurboQuantRetriever (RAG wrapper) tests
+# ---------------------------------------------------------------------------
+
+class TestTurboQuantRetriever:
+    """Tests for the TurboQuantRetriever class in turboquantdb.rag."""
+
+    DIM = 32
+
+    def _make_embeddings(self, n: int, seed: int = 0) -> list:
+        rng = np.random.default_rng(seed)
+        vecs = rng.standard_normal((n, self.DIM)).astype(np.float64)
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        vecs /= norms
+        return vecs.tolist()
+
+    def test_import_retriever(self):
+        """TurboQuantRetriever can be imported from turboquantdb.rag."""
+        from turboquantdb.rag import TurboQuantRetriever  # noqa: F401
+
+    def test_add_texts_without_metadata(self, tmp_path):
+        """add_texts with no metadata arg uses empty dicts."""
+        from turboquantdb.rag import TurboQuantRetriever
+
+        retriever = TurboQuantRetriever(
+            str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
+        )
+        texts = ["hello world", "foo bar"]
+        embeddings = self._make_embeddings(2, seed=1)
+        retriever.add_texts(texts, embeddings)
+        # doc_store should have two entries
+        assert len(retriever.doc_store) == 2
+
+    def test_add_texts_with_metadata(self, tmp_path):
+        """add_texts stores metadata alongside the text."""
+        from turboquantdb.rag import TurboQuantRetriever
+
+        retriever = TurboQuantRetriever(
+            str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
+        )
+        texts = ["doc one", "doc two", "doc three"]
+        embeddings = self._make_embeddings(3, seed=2)
+        metadatas = [{"source": "a"}, {"source": "b"}, {"source": "c"}]
+        retriever.add_texts(texts, embeddings, metadatas=metadatas)
+
+        assert retriever.doc_store["doc_0"]["metadata"]["source"] == "a"
+        assert retriever.doc_store["doc_1"]["text"] == "doc two"
+        assert retriever.doc_store["doc_2"]["metadata"]["source"] == "c"
+
+    def test_add_texts_accumulates_ids(self, tmp_path):
+        """Calling add_texts twice generates non-overlapping IDs."""
+        from turboquantdb.rag import TurboQuantRetriever
+
+        retriever = TurboQuantRetriever(
+            str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
+        )
+        retriever.add_texts(["first"], self._make_embeddings(1, seed=0))
+        retriever.add_texts(["second"], self._make_embeddings(1, seed=1))
+
+        assert len(retriever.doc_store) == 2
+        assert "doc_0" in retriever.doc_store
+        assert "doc_1" in retriever.doc_store
+
+    def test_similarity_search_returns_list_of_dicts(self, tmp_path):
+        """similarity_search returns a list of dicts with text/metadata/score."""
+        from turboquantdb.rag import TurboQuantRetriever
+
+        retriever = TurboQuantRetriever(
+            str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
+        )
+        texts = [f"document {i}" for i in range(10)]
+        embeddings = self._make_embeddings(10, seed=7)
+        retriever.add_texts(texts, embeddings)
+
+        query = self._make_embeddings(1, seed=99)[0]
+        results = retriever.similarity_search(query, k=3)
+
+        assert isinstance(results, list)
+        assert len(results) <= 3
+        for r in results:
+            assert "text" in r, f"missing 'text' key in result: {r}"
+            assert "metadata" in r, f"missing 'metadata' key in result: {r}"
+            assert "score" in r, f"missing 'score' key in result: {r}"
+
+    def test_similarity_search_result_text_is_original(self, tmp_path):
+        """similarity_search results contain the original inserted text."""
+        from turboquantdb.rag import TurboQuantRetriever
+
+        retriever = TurboQuantRetriever(
+            str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
+        )
+        texts = ["alpha text", "beta text", "gamma text"]
+        embeddings = self._make_embeddings(3, seed=5)
+        retriever.add_texts(texts, embeddings)
+
+        query = embeddings[0]  # query == first embedding
+        results = retriever.similarity_search(query, k=1)
+
+        assert len(results) == 1
+        assert results[0]["text"] in texts
+
+    def test_similarity_search_empty_db_returns_empty(self, tmp_path):
+        """similarity_search on an empty database returns an empty list."""
+        from turboquantdb.rag import TurboQuantRetriever
+
+        retriever = TurboQuantRetriever(
+            str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
+        )
+        query = self._make_embeddings(1, seed=0)[0]
+        results = retriever.similarity_search(query, k=5)
+        assert results == []
+
+    def test_similarity_search_k_limits_results(self, tmp_path):
+        """similarity_search respects the k parameter."""
+        from turboquantdb.rag import TurboQuantRetriever
+
+        retriever = TurboQuantRetriever(
+            str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
+        )
+        texts = [f"doc {i}" for i in range(20)]
+        embeddings = self._make_embeddings(20, seed=3)
+        retriever.add_texts(texts, embeddings)
+
+        query = self._make_embeddings(1, seed=10)[0]
+        results = retriever.similarity_search(query, k=5)
+        assert len(results) <= 5
+
+    def test_similarity_search_metadata_preserved(self, tmp_path):
+        """Metadata inserted via add_texts is returned in search results."""
+        from turboquantdb.rag import TurboQuantRetriever
+
+        retriever = TurboQuantRetriever(
+            str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
+        )
+        texts = ["tagged doc"]
+        embeddings = self._make_embeddings(1, seed=11)
+        retriever.add_texts(texts, embeddings, metadatas=[{"tag": "important"}])
+
+        query = embeddings[0]
+        results = retriever.similarity_search(query, k=1)
+        assert len(results) == 1
+        assert results[0]["metadata"].get("tag") == "important"
+
+
+class TestTurboQuantRetrieverFallbackStub:
+    """Tests the fallback stub behaviour when the C extension is unavailable."""
+
+    def test_stub_raises_runtime_error(self):
+        """Database.open on the stub raises RuntimeError."""
+        # Import the rag module's fallback stub class directly by temporarily
+        # hiding the real extension.
+        import sys
+        import importlib
+        import types
+
+        # Create a fake turboquantdb package that lacks the real extension.
+        fake_pkg = types.ModuleType("turboquantdb_stub_test")
+        # The rag module's try/except block falls back to a stub Database class
+        # that raises RuntimeError on .open(). We can import rag with this
+        # setup by temporarily replacing the turboquantdb.turboquantdb submodule.
+        original = sys.modules.get("turboquantdb.turboquantdb")
+        try:
+            # Remove the real extension so the ImportError branch fires.
+            sys.modules["turboquantdb.turboquantdb"] = None  # type: ignore
+            # Force reimport of rag to pick up the stub path.
+            if "turboquantdb.rag" in sys.modules:
+                del sys.modules["turboquantdb.rag"]
+            from turboquantdb import rag as rag_mod
+            # The stub Database.open should raise RuntimeError.
+            with pytest.raises(RuntimeError):
+                rag_mod.Database.open("/tmp/stub_test_db", 16)
+        finally:
+            # Restore the real extension.
+            if original is None:
+                sys.modules.pop("turboquantdb.turboquantdb", None)
+            else:
+                sys.modules["turboquantdb.turboquantdb"] = original
+            # Clear the rag module cache so future tests use the real extension.
+            sys.modules.pop("turboquantdb.rag", None)
+
+
+# ---------------------------------------------------------------------------
+# TurboQuantRetriever (rag.py)
+# ---------------------------------------------------------------------------
+
+class TestTurboQuantRetriever:
+    """Tests for the LangChain-style TurboQuantRetriever wrapper."""
+
+    def test_import(self):
+        from turboquantdb.rag import TurboQuantRetriever  # noqa: F401
+
+    def test_add_texts_and_similarity_search(self, tmp_path):
+        from turboquantdb.rag import TurboQuantRetriever
+
+        d = 32
+        retriever = TurboQuantRetriever(str(tmp_path / "rag_db"), dimension=d, bits=4, seed=42)
+
+        rng = np.random.default_rng(0)
+        texts = [f"document {i}" for i in range(20)]
+        embeddings = rng.standard_normal((20, d)).tolist()
+
+        retriever.add_texts(texts, embeddings)
+
+        query = embeddings[0]
+        results = retriever.similarity_search(query, k=3)
+
+        assert len(results) == 3
+        for r in results:
+            assert "text" in r
+            assert "metadata" in r
+            assert "score" in r
+
+    def test_add_texts_with_metadata(self, tmp_path):
+        from turboquantdb.rag import TurboQuantRetriever
+
+        d = 32
+        retriever = TurboQuantRetriever(str(tmp_path / "rag_db"), dimension=d, bits=4, seed=42)
+
+        rng = np.random.default_rng(1)
+        texts = ["alpha", "beta", "gamma"]
+        embeddings = rng.standard_normal((3, d)).tolist()
+        metadatas = [{"tag": "a"}, {"tag": "b"}, {"tag": "c"}]
+
+        retriever.add_texts(texts, embeddings, metadatas=metadatas)
+
+        results = retriever.similarity_search(embeddings[1], k=1)
+        assert results[0]["text"] == "beta"
+        assert results[0]["metadata"]["tag"] == "b"
+
+    def test_add_texts_without_metadata_defaults_empty(self, tmp_path):
+        from turboquantdb.rag import TurboQuantRetriever
+
+        d = 16
+        retriever = TurboQuantRetriever(str(tmp_path / "rag_db"), dimension=d, bits=4, seed=42)
+
+        rng = np.random.default_rng(2)
+        texts = ["x", "y"]
+        embeddings = rng.standard_normal((2, d)).tolist()
+        retriever.add_texts(texts, embeddings)  # no metadatas arg
+
+        results = retriever.similarity_search(embeddings[0], k=1)
+        assert results[0]["metadata"] == {}
+
+    def test_multiple_add_texts_accumulates(self, tmp_path):
+        from turboquantdb.rag import TurboQuantRetriever
+
+        d = 16
+        retriever = TurboQuantRetriever(str(tmp_path / "rag_db"), dimension=d, bits=4, seed=42)
+
+        rng = np.random.default_rng(3)
+        texts1 = ["a", "b"]
+        texts2 = ["c", "d", "e"]
+        emb1 = rng.standard_normal((2, d)).tolist()
+        emb2 = rng.standard_normal((3, d)).tolist()
+
+        retriever.add_texts(texts1, emb1)
+        retriever.add_texts(texts2, emb2)
+
+        assert len(retriever.doc_store) == 5
+
+    def test_similarity_search_empty_db_returns_empty(self, tmp_path):
+        from turboquantdb.rag import TurboQuantRetriever
+
+        d = 16
+        retriever = TurboQuantRetriever(str(tmp_path / "rag_db"), dimension=d, bits=4, seed=42)
+        rng = np.random.default_rng(4)
+        results = retriever.similarity_search(rng.standard_normal(d).tolist(), k=5)
+        assert results == []
+
+    def test_fallback_stub_raises_runtime_error(self):
+        """The fallback Database stub (used when extension is unavailable) must raise."""
+        import importlib, sys
+
+        # Temporarily hide the real extension to force the fallback path
+        real_mod = sys.modules.pop("turboquantdb.turboquantdb", None)
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "_rag_stub_test",
+                "python/turboquantdb/rag.py",
+            )
+            mod = importlib.util.module_from_spec(spec)
+            # Patch the import inside rag.py to use the stub Database
+            mod.__package__ = None  # prevent relative import
+            # Execute with turboquantdb.turboquantdb hidden → ImportError → stub activated
+            orig = sys.modules.get("turboquantdb.turboquantdb")
+            sys.modules["turboquantdb.turboquantdb"] = None  # type: ignore
+            try:
+                spec.loader.exec_module(mod)
+                with pytest.raises(RuntimeError, match="not available"):
+                    mod.Database.open("path", 8)
+            finally:
+                if orig is None:
+                    sys.modules.pop("turboquantdb.turboquantdb", None)
+                else:
+                    sys.modules["turboquantdb.turboquantdb"] = orig
+        finally:
+            if real_mod is not None:
+                sys.modules["turboquantdb.turboquantdb"] = real_mod

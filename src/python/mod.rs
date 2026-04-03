@@ -22,7 +22,6 @@ pub struct Database {
     engine: Arc<RwLock<TurboQuantEngine>>,
 }
 
-
 #[pymethods]
 impl Database {
     /// Open (or create) a TurboQuantDB database at the given directory path.
@@ -75,7 +74,9 @@ impl Database {
 
         let precision = match rerank_precision.map(|s| s.to_lowercase()) {
             None => RerankPrecision::Disabled,
-            Some(ref s) if s == "none" || s == "disabled" || s == "dequant" => RerankPrecision::Disabled,
+            Some(ref s) if s == "none" || s == "disabled" || s == "dequant" => {
+                RerankPrecision::Disabled
+            }
             Some(ref s) if s == "f16" || s == "half" => RerankPrecision::F16,
             Some(ref s) if s == "f32" || s == "float" || s == "full" => RerankPrecision::F32,
             Some(ref s) => {
@@ -561,7 +562,10 @@ fn to_py_runtime(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
 }
 
 #[allow(dead_code)]
-fn parse_include_set(include: Option<Vec<String>>, defaults: &[&str]) -> std::collections::HashSet<String> {
+fn parse_include_set(
+    include: Option<Vec<String>>,
+    defaults: &[&str],
+) -> std::collections::HashSet<String> {
     include
         .unwrap_or_else(|| defaults.iter().map(|s| s.to_string()).collect())
         .into_iter()
