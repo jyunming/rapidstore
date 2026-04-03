@@ -718,6 +718,7 @@ fn test_search_ann_override_api_and_high_beam_matches_bruteforce_top1() {
 #[test]
 fn test_compaction_recovery_deletes_old_segments_when_marker_exists() {
     use turboquantdb::storage::compaction::Compactor;
+    use turboquantdb::storage::segment::{Segment, SegmentRecord};
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().to_str().unwrap();
@@ -753,13 +754,14 @@ fn test_compaction_recovery_deletes_old_segments_when_marker_exists() {
     assert!(!old_names.is_empty(), "should have at least one segment");
 
     // Write a fake "prepared" compaction marker — simulates a crash mid-compaction.
+    // Use Segment::write_batch with zero records to produce a valid (but empty) segment
+    // so that recovery's read_all() validation passes and the old segments are deleted.
     let compacted_name = "seg-99999999.bin";
     let compactor = Compactor::new(backend.clone());
     compactor
         .begin_compaction(&old_names, compacted_name)
         .unwrap();
-    // Write a dummy (empty) compacted segment so the recovery sees it as complete.
-    backend.write(compacted_name, &[]).unwrap();
+    Segment::write_batch(&backend, compacted_name, &[] as &[SegmentRecord]).unwrap();
 
     // Reopen the engine — recovery must delete old segments and the marker.
     let recovered = TurboQuantEngine::open(db_path, db_path, 8, 2, 42).unwrap();
