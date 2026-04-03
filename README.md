@@ -73,8 +73,6 @@ db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
 results = db.search(query, top_k=10, ann_search_list_size=128)
 ```
 
-*Ingest times measured on Windows 11, 12-core. Linux native is ~35% faster — see [BENCHMARKS.md](https://github.com/jyunming/TurboQuantDB/blob/main/BENCHMARKS.md).*
-
 Full parameter reference: [`docs/PYTHON_API.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md)
 
 ---
@@ -212,7 +210,7 @@ results = db.search(query, top_k=10, ann_search_list_size=128)
 
 Full results: **[BENCHMARKS.md](https://github.com/jyunming/TurboQuantDB/blob/main/BENCHMARKS.md)**
 
-**Windows 11 highlights (50k × 1536, top_k=10, DBpedia OpenAI embeddings):**
+**Highlights (50k × 1536, top_k=10, DBpedia OpenAI embeddings):**
 
 | Engine | Ingest | Disk | RAM | p50 | Recall@10 |
 |--------|--------|------|-----|-----|-----------|
