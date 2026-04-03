@@ -54,10 +54,10 @@ images   = Database.open("./mydb", dimension=512,  collection="images")
 ### High Quality — recall matters most
 
 ```python
-db = Database.open(path, dimension=DIM, bits=8, rerank=True)
+db = Database.open(path, dimension=DIM, bits=4, rerank=True, rerank_precision="f16")
 db.create_index(max_degree=32, ef_construction=200, n_refinements=8)
 results = db.search(query, top_k=10, ann_search_list_size=200)
-# ~97% Recall@10 at 50k×1536  |  119 MB disk  |  12ms p50
+# 100% Recall@10 at 100k×1536  |  401 MB disk  |  38ms p50 (brute-force)
 ```
 
 ### Balanced — default recommendation
@@ -65,8 +65,8 @@ results = db.search(query, top_k=10, ann_search_list_size=200)
 ```python
 db = Database.open(path, dimension=DIM, bits=4, rerank=True)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
-results = db.search(query, top_k=10, ann_search_list_size=128)
-# ~89% Recall@10 at 50k×1536  |  70 MB disk  |  10ms p50
+results = db.search(query, top_k=10, ann_search_list_size=200)
+# 99.4% Recall@5, 96% Recall@10 at 100k×1536  |  117 MB disk  |  8ms (ANN) / 45ms (brute+dequant)
 ```
 
 ### Fast Build — ingest speed is priority
@@ -74,11 +74,11 @@ results = db.search(query, top_k=10, ann_search_list_size=128)
 ```python
 db = Database.open(path, dimension=DIM, bits=4, fast_mode=True, rerank=False)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
-results = db.search(query, top_k=10, ann_search_list_size=128)
-# ~83% Recall@10 at 50k×1536  |  70 MB disk  |  5ms p50
+results = db.search(query, top_k=10, ann_search_list_size=200)
+# ~96% Recall@10 at 100k×1536  |  108 MB disk  |  8ms p50
 ```
 
-*Benchmarked at 50,000 vectors, dim=1536, top_k=10, brute-force ground truth.*
+*Benchmarked at 100,000 vectors, dim=1536, DBpedia OpenAI3 embeddings, brute-force ground truth.*
 
 ---
 
@@ -188,10 +188,10 @@ Build the index **after** loading your data. Rebuild after large batches of inse
 ```python
 db.create_index(
     max_degree=32,        # int — max neighbors per node; higher = better recall, larger graph (default 32)
-    ef_construction=200,  # int — beam size during build; higher = better quality, slower build (default 200)
-    n_refinements=5,      # int — refinement passes; higher = better graph, slower build (default 5)
-    search_list_size=128, # int — alias for ef_construction (default 128)
-    alpha=1.2,            # float — pruning aggressiveness (default 1.2)
+    ef_construction=200,  # int — beam size during graph build; higher = better quality, slower build (default 200)
+    n_refinements=5,      # int — refinement passes after build; higher = better graph, slower (default 5)
+    search_list_size=128, # int — beam width during index-time search (routing); separate from ef_construction (default 128)
+    alpha=1.2,            # float — edge pruning aggressiveness (default 1.2)
 )
 ```
 

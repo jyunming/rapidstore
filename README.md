@@ -5,7 +5,7 @@
 
 An embedded vector database written in Rust with Python bindings, implementing the **TurboQuant** algorithm ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) — zero training time, 2–4 bit compression, and provably unbiased inner product estimation.
 
-**Goal:** make massive embedding datasets practical on lightweight hardware. A 50k-vector, 1536-dim collection that would occupy 293 MB as raw float32 fits in **70 MB on disk and 488 MB of RAM** with TQDB b=4 — enabling laptop-scale RAG over millions of documents without a dedicated server.
+**Goal:** make massive embedding datasets practical on lightweight hardware. A 100k-vector, 1536-dim collection that would occupy 586 MB as raw float32 fits in **108 MB on disk** with TQDB b=4, or just **59 MB** with b=2 — enabling laptop-scale RAG over millions of documents without a dedicated server.
 
 Two deployment modes:
 - **Embedded** — `tqdb` Python package (`pip install tqdb`), runs in-process (no daemon)
@@ -16,7 +16,7 @@ Two deployment modes:
 ## Key Properties
 
 - **Zero training** — No `train()` step. Vectors are quantized and stored immediately on insert.
-- **4.2× compression** — Reduces float32 embeddings to 2–4 bits per coordinate; b=4 stores each vector in 1,466 bytes vs 6,144 bytes for float32.
+- **5–10× compression** — b=4 reduces 1536-dim float32 embeddings from 586 MB to 108 MB (5.4×); b=2 reaches 59 MB (9.9×) at 100k vectors.
 - **Unbiased scoring** — QJL transform guarantees unbiased inner product estimation.
 - **Optional ANN index** — Build an HNSW graph after loading data for fast approximate search.
 - **Metadata filtering** — MongoDB-style filter operators on any metadata field.
@@ -57,20 +57,23 @@ Three presets covering the main use cases — pick one and you're ready:
 ```python
 from turboquantdb import Database
 
-# High Quality — best recall (~97% at 50k×1536)
-db = Database.open(path, dimension=DIM, bits=8, rerank=True)
+# High Quality — best recall, exact reranking
+db = Database.open(path, dimension=DIM, bits=4, rerank=True, rerank_precision="f16")
 db.create_index(max_degree=32, ef_construction=200, n_refinements=8)
 results = db.search(query, top_k=10, ann_search_list_size=200)
+# ~100% Recall@10 at 100k×1536  |  401 MB disk  |  38ms p50 (brute-force)
 
-# Balanced — recommended default (~89% recall, 5.7× smaller than float32)
+# Balanced — recommended default (dequant reranking, zero extra disk)
 db = Database.open(path, dimension=DIM, bits=4, rerank=True)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
-results = db.search(query, top_k=10, ann_search_list_size=128)
+results = db.search(query, top_k=10, ann_search_list_size=200)
+# ~99.4% Recall@5 at 100k×1536  |  117 MB disk  |  59ms rerank / 8ms no-rerank
 
-# Fast Build — fastest ingest (~83% recall, same disk as Balanced)
-db = Database.open(path, dimension=DIM, bits=4, fast_mode=True, rerank=False)
+# Fast ANN — lowest latency, good recall
+db = Database.open(path, dimension=DIM, bits=4, rerank=False)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
-results = db.search(query, top_k=10, ann_search_list_size=128)
+results = db.search(query, top_k=10, ann_search_list_size=200)
+# ~96% Recall@10 at 100k×1536  |  117 MB disk  |  8ms p50
 ```
 
 Full parameter reference: [`docs/PYTHON_API.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md)
@@ -145,13 +148,13 @@ db.search(query, top_k=5, filter={"$and": [{"topic": "ml"}, {"year": {"$gte": 20
 
 ## Recommended Presets
 
-### High Quality — recall matters most
+### High Quality — exact reranking
 
 ```python
-db = Database.open(path, dimension=DIM, bits=8, rerank=True)
+db = Database.open(path, dimension=DIM, bits=4, rerank=True, rerank_precision="f16")
 db.create_index(max_degree=32, ef_construction=200, n_refinements=8)
 results = db.search(query, top_k=10, ann_search_list_size=200)
-# ~97% Recall@10 at 50k×1536  |  ~38s ingest  |  119 MB disk
+# 100% Recall@10 at 100k×1536  |  38ms p50 (brute-force)  |  401 MB disk
 ```
 
 ### Balanced — default recommendation
@@ -159,38 +162,44 @@ results = db.search(query, top_k=10, ann_search_list_size=200)
 ```python
 db = Database.open(path, dimension=DIM, bits=4, rerank=True)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
-results = db.search(query, top_k=10, ann_search_list_size=128)
-# ~89% Recall@10 at 50k×1536  |  ~26s ingest  |  70 MB disk
+results = db.search(query, top_k=10, ann_search_list_size=200)
+# 99.4% Recall@5, 96% Recall@10 at 100k×1536  |  117 MB disk  |  8ms (ANN) / 45ms (brute+dequant)
 ```
 
-### Fast Build — ingest speed is priority
+### Minimum Disk — compress aggressively
 
 ```python
-db = Database.open(path, dimension=DIM, bits=4, fast_mode=True, rerank=False)
+db = Database.open(path, dimension=DIM, bits=2, rerank=True)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
-results = db.search(query, top_k=10, ann_search_list_size=128)
-# ~83% Recall@10 at 50k×1536  |  ~22s ingest  |  70 MB disk
+results = db.search(query, top_k=10, ann_search_list_size=200)
+# 96.4% Recall@10 at 100k×1536  |  68 MB disk (8.7× smaller than float32)  |  7ms p50
 ```
 
 ---
 
 ## Benchmarks
 
-Full results: **[BENCHMARKS.md](https://github.com/jyunming/TurboQuantDB/blob/main/BENCHMARKS.md)**
+Measured on **DBpedia OpenAI3 embeddings** ([Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-1M](https://huggingface.co/datasets/Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-1M)) — real 1536-dim embeddings, n=100k vectors, 500 queries, Recall@1@k metric. HNSW uses M=32, ef_construction=200.
 
-**Highlights (50k × 1536, top_k=10, DBpedia OpenAI embeddings):**
+![Benchmark plots](docs/benchmark_plot.png)
 
-| Engine | Ingest | Disk | RAM | p50 | Recall@10 |
-|--------|--------|------|-----|-----|-----------|
-| Engine-A (HNSW) | 30.6s | 398 MB | 865 MB | 1.73ms | 99.75% |
-| Engine-B (IVF-PQ) | 77.6s | 318 MB | 526 MB | 9.17ms | 79.50% |
-| **TQDB b=8 HQ** | **59.2s** | **119 MB** | **537 MB** | 12.42ms | **97.25%** |
-| **TQDB b=4 Balanced** | **37.8s** | **70 MB** | **488 MB** | 9.98ms | **89.15%** |
-| **TQDB b=4 FastBuild** | **28.2s** | **70 MB** | **487 MB** | 5.30ms | **83.35%** |
+**n=100k × 1536-dim, brute-force Recall@1@k:**
 
-*Engines identified by index algorithm. Reproduction scripts in `benchmarks/`.*
+| Mode | Recall@1 | Recall@10 | Disk | Compression | p50 latency |
+|------|----------|-----------|------|-------------|-------------|
+| b=4 brute, no-rerank | 93.6% | 100% | 108 MB | **5.4×** | 54ms |
+| b=4 brute, dequant-rerank | 93.2% | 100% | 108 MB | **5.4×** | 45ms |
+| b=4 brute, f16-rerank | **100%** | 100% | 401 MB | 1.5× | 38ms |
+| b=2 brute, no-rerank | 81.4% | 100% | 59 MB | **9.9×** | 41ms |
+| b=2 brute, dequant-rerank | 84.4% | 100% | 59 MB | **9.9×** | 46ms |
+| b=4 HNSW M=32, no-rerank | 89.8% | 96.0% | 117 MB | 5.0× | **8ms** |
+| b=4 HNSW M=32, dequant-rerank | 92.6% | 99.4% | 117 MB | 5.0× | 59ms |
+| b=2 HNSW M=32, no-rerank | 78.6% | 96.4% | 68 MB | 8.7× | **7ms** |
+| float32 brute (reference) | 100% | 100% | 586 MB | 1× | ~120ms |
 
-TQDB b=4 is **5.7× smaller** than Engine-A and uses **44% less RAM**, within 11pp of recall.
+*dequant-rerank = rerank from codebook (zero extra disk). f16-rerank = store float16 raw vectors (+293 MB).*
+
+**Reproduction:** `python _tmp/disk_size.py` — requires `pip install datasets tqdb`
 
 ---
 
