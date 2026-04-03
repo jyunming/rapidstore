@@ -29,7 +29,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: auto
-          args: --release --out dist --find-interpreter
+          args: --release --out dist -i 3.10 -i 3.11 -i 3.12 -i 3.13
           sccache: "true"
 
       - uses: actions/upload-artifact@v4
