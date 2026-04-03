@@ -73,6 +73,8 @@ db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
 results = db.search(query, top_k=10, ann_search_list_size=128)
 ```
 
+*Ingest times measured on Windows 11, 12-core. Linux native is ~35% faster — see [BENCHMARKS.md](https://github.com/jyunming/TurboQuantDB/blob/main/BENCHMARKS.md).*
+
 Full parameter reference: [`docs/PYTHON_API.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md)
 
 ---
@@ -97,17 +99,18 @@ for r in results:
 
 ## Python API
 
-### `Database.open(path, dimension, bits=4, seed=42, metric="ip", rerank=True, fast_mode=False)`
+### `Database.open(path, dimension, bits=4, seed=42, metric="ip", rerank=True, fast_mode=False, rerank_precision=None)`
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `path` | `str` | Directory path for database files |
 | `dimension` | `int` | Vector dimension (must match on reopen) |
-| `bits` | `int` | Quantization bits: `4` (4.2× compression) or `8` (2.5× compression, higher recall) |
+| `bits` | `int` | Quantization bits: `4` (4.2× compression) or `8` (2.47× compression, higher recall) |
 | `seed` | `int` | RNG seed for quantizer — must match across sessions |
 | `metric` | `str` | `"ip"`, `"cosine"`, or `"l2"` |
-| `rerank` | `bool` | Store dequantized vectors for final reranking; improves recall |
-| `fast_mode` | `bool` | Skip QJL stage — ~2× faster ingest, ~3pp recall loss |
+| `rerank` | `bool` | Enable reranking of ANN candidates. Default `True`. Precision controlled by `rerank_precision`. |
+| `fast_mode` | `bool` | Skip QJL stage — ~30% faster ingest, ~5pp recall loss. Default `False`. |
+| `rerank_precision` | `str\|None` | `None` (default) — dequantization reranking, no extra storage; `"f16"` — float16 exact reranking (+n×d×2 bytes); `"f32"` — float32 exact reranking (+n×d×4 bytes) |
 
 ### Insert / Update / Delete
 
@@ -249,7 +252,7 @@ TurboQuantDB is an embedded database — it runs in-process with no daemon.
 ├── manifest.json        — DB config (dimension, bits, seed, metric)
 ├── quantizer.bin        — Serialized quantizer state
 ├── live_codes.bin       — Memory-mapped quantized vectors (hot path)
-├── live_vectors.bin     — Raw float32 vectors (only if rerank=True)
+├── live_vectors.bin     — Raw vectors for exact reranking (only if rerank_precision="f16" or "f32")
 ├── wal.log              — Write-ahead log
 ├── metadata.bin         — Per-vector metadata and documents
 ├── live_ids.bin         — ID → slot index

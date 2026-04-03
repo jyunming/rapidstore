@@ -20,13 +20,16 @@ Requires Python 3.10+. Pre-built wheels available for Linux, Windows, and macOS.
 from turboquantdb import Database
 
 db = Database.open(
-    path,           # str — directory path, created if it doesn't exist
-    dimension,      # int — vector dimension, must match on every reopen
-    bits=4,         # int — quantization bits: 4 (4.2× compression) or 8 (2.5×, higher recall)
-    seed=42,        # int — RNG seed for quantizer, must stay the same across sessions
-    metric="ip",    # str — "ip" (inner product), "cosine", or "l2"
-    rerank=True,    # bool — store dequantized vectors for final reranking; improves recall
-    fast_mode=False # bool — skip QJL stage: ~2× faster ingest, ~3pp recall loss
+    path,                    # str — directory path, created if it doesn't exist
+    dimension,               # int — vector dimension, must match on every reopen
+    bits=4,                  # int — quantization bits: 4 (4.2× compression) or 8 (2.47×, higher recall)
+    seed=42,                 # int — RNG seed for quantizer, must stay the same across sessions
+    metric="ip",             # str — "ip" (inner product), "cosine", or "l2"
+    rerank=True,             # bool — enable reranking of ANN candidates; precision via rerank_precision
+    fast_mode=False,         # bool — skip QJL stage: ~30% faster ingest, ~5pp recall loss
+    rerank_precision=None,   # str|None — None = dequant reranking (no extra storage)
+                             #            "f16" = float16 exact reranking (+n×d×2 bytes)
+                             #            "f32" = float32 exact reranking (+n×d×4 bytes)
 )
 ```
 
@@ -42,7 +45,7 @@ db = Database.open(
 db = Database.open(path, dimension=DIM, bits=8, rerank=True)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=8)
 results = db.search(query, top_k=10, ann_search_list_size=200)
-# ~97% Recall@10 at 50k×1536  |  ~59s ingest  |  119 MB disk  |  12ms p50
+# ~97% Recall@10 at 50k×1536  |  ~59s ingest (Windows)  |  119 MB disk  |  12ms p50
 ```
 
 ### Balanced — default recommendation
@@ -51,7 +54,7 @@ results = db.search(query, top_k=10, ann_search_list_size=200)
 db = Database.open(path, dimension=DIM, bits=4, rerank=True)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
 results = db.search(query, top_k=10, ann_search_list_size=128)
-# ~89% Recall@10 at 50k×1536  |  ~38s ingest  |  70 MB disk  |  10ms p50
+# ~89% Recall@10 at 50k×1536  |  ~38s ingest (Windows)  |  70 MB disk  |  10ms p50
 ```
 
 ### Fast Build — ingest speed is priority
@@ -60,10 +63,10 @@ results = db.search(query, top_k=10, ann_search_list_size=128)
 db = Database.open(path, dimension=DIM, bits=4, fast_mode=True, rerank=False)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
 results = db.search(query, top_k=10, ann_search_list_size=128)
-# ~83% Recall@10 at 50k×1536  |  ~28s ingest  |  70 MB disk  |  5ms p50
+# ~83% Recall@10 at 50k×1536  |  ~28s ingest (Windows)  |  70 MB disk  |  5ms p50
 ```
 
-*Benchmarked at 50,000 vectors, dim=1536, top_k=10, brute-force ground truth.*
+*Benchmarked at 50,000 vectors, dim=1536, top_k=10, brute-force ground truth. Linux native is ~35% faster — see [BENCHMARKS.md](https://github.com/jyunming/TurboQuantDB/blob/main/BENCHMARKS.md).*
 
 ---
 
@@ -216,7 +219,7 @@ for r in results:
 ├── manifest.json        — DB config (dimension, bits, seed, metric)
 ├── quantizer.bin        — Serialized quantizer state
 ├── live_codes.bin       — Memory-mapped quantized vectors (hot path)
-├── live_vectors.bin     — Dequantized vectors for reranking (if rerank=True)
+├── live_vectors.bin     — Raw vectors for exact reranking (only if rerank_precision="f16" or "f32")
 ├── wal.log              — Write-ahead log (crash recovery)
 ├── metadata.bin         — Per-vector metadata and documents
 ├── live_ids.bin         — ID → slot index
