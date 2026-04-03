@@ -1,4 +1,4 @@
-# RapidStore Compatibility Matrix
+# TurboQuantDB Compatibility Matrix
 
 This matrix tracks practical API/behavior parity against common embedded RAG vector-store expectations.
 
@@ -9,7 +9,7 @@ This matrix tracks practical API/behavior parity against common embedded RAG vec
 
 ## Feature Matrix
 
-| Area | RapidStore | Notes |
+| Area | TurboQuantDB | Notes |
 |---|---|---|
 | Collection create/get/list/delete | Yes | Embedded + service (`tenant/database/collection` in service mode). |
 | Add / Upsert / Update / Delete | Yes | Batch paths and report-mode partial failures are available. |

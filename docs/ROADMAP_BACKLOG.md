@@ -1,6 +1,6 @@
-# RapidStore GitHub Roadmap Backlog
+# TurboQuantDB GitHub Roadmap Backlog
 
-This backlog is ordered by urgency for making RapidStore comparable to ChromaDB/LanceDB as an embedded RAG vector store.
+This backlog is ordered by urgency for making TurboQuantDB comparable to embedded RAG vector stores as an embedded RAG vector store.
 
 ## Milestones
 
@@ -142,7 +142,7 @@ This backlog is ordered by urgency for making RapidStore comparable to ChromaDB/
 ### Issue: Collection-First Python API
 - Labels: `high-priority`, `python-sdk`, `api`
 - Milestone: `M4-Python-API-Ergonomics`
-- Status: `completed` (collection-first API + migration examples documented in README and docs/PYTHON_MIGRATION.md)
+- Status: `completed` (collection-first API + migration examples documented in README and README.md)
 - Scope:
   - `client.get_or_create_collection(...)`
   - `collection.add/upsert/update/delete/get/query`
@@ -182,7 +182,7 @@ This backlog is ordered by urgency for making RapidStore comparable to ChromaDB/
 
 1. [x] Publish migration examples for Collection-first Python API in README/docs.
 2. [x] Add benchmark quality gates (recall/latency regression thresholds) in CI.
-3. [x] Start M5 design doc: tenant/database hierarchy and auth/RBAC boundaries. See `docs/M5_MULTITENANT_SERVICE_DESIGN.md`.
+3. [x] Start M5 design doc: tenant/database hierarchy and auth/RBAC boundaries. See `docs/SERVER_DESIGN.md`.
 4. [x] Scaffold server crate with routing, auth middleware, and request context.
 5. [x] Implement tenant/database path resolver and catalog helpers in storage layer.
 

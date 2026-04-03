@@ -1,0 +1,77 @@
+name: benchmark-artifacts
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> $GITHUB_PATH
+          echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
+          .venv/bin/pip install numpy maturin
+
+      - name: Build Python extension
+        run: maturin develop --release
+
+      - name: Run Python recall benchmark (artifact emitter)
+        run: |
+          python benchmarks/run_recall_bench.py \
+            --n 10000 \
+            --d 128 \
+            --queries 50 \
+            --bits 4 \
+            --artifact-dir benchmarks/artifacts \
+            --artifact-prefix ci \
+            --recall-threshold 0.75
+
+      - name: Build Rust bench target
+        run: cargo test --test bench_search --no-run
+
+      - name: Run Rust bench artifact emitter
+        env:
+          TQ_BENCH_TOTAL_VECTORS: "1000"
+          TQ_BENCH_BATCHES: "10"
+          TQ_BENCH_ARTIFACT_DIR: "target/benchmarks"
+        run: cargo test --test bench_search -- --nocapture
+
+
+      - name: Enforce benchmark quality gates
+        run: |
+          python benchmarks/ci_quality_gate.py \
+            --python-artifacts-dir benchmarks/artifacts \
+            --python-prefix ci_ \
+            --rust-artifact target/benchmarks/bench_search.json \
+            --min-recall 0.75 \
+            --max-tq-latency-ms 20.0 \
+            --min-speedup-vs-numpy 0.03 \
+            --max-ann-to-bruteforce-ratio 0.60
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-artifacts-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            benchmarks/artifacts/*
+            target/benchmarks/*.json

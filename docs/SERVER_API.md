@@ -1,8 +1,8 @@
-# M5 API Spec (Draft v1)
+# Server API Reference
 
 ## Purpose
 
-Define the HTTP/JSON contract for multi-tenant RapidStore service mode.
+Define the HTTP/JSON contract for multi-tenant TurboQuantDB service mode.
 
 Base path: `/v1`
 

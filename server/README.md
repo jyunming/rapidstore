@@ -1,14 +1,32 @@
-# rapidstore-server (crate: turboquantdb-server)
+# turboquantdb-server
 
-Service mode currently includes:
+Optional Axum HTTP service providing TurboQuantDB in multi-tenant server mode. Use this when you need REST API access, multi-tenancy, authentication, quotas, or async job management. For single-process Python use, the embedded `turboquantdb` package is simpler.
 
-- Collection CRUD (tenant/database scoped)
-- Persisted auth store (`auth_store.json`) with API keys + RBAC bindings
-- Persisted quota store (`quota_store.json`) with collection-count admission checks
-- Persisted job store (`job_store.json`) with async lifecycle, restart-safe recovery, and real compact/index/snapshot worker execution
+## Build & Run
 
-## Endpoints
+```bash
+cd server
+cargo build --release
 
+# Configure via environment variables (see below), then run:
+./target/release/turboquantdb-server
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TQ_SERVER_ADDR` | `127.0.0.1:8080` | Listen address |
+| `TQ_LOCAL_ROOT` | `./data` | Root directory for all data files |
+| `TQ_STORAGE_URI` | `TQ_LOCAL_ROOT` | Storage URI (file:// path) |
+| `TQ_AUTH_STORE_PATH` | `<TQ_LOCAL_ROOT>/auth_store.json` | API key + RBAC store |
+| `TQ_QUOTA_STORE_PATH` | `<TQ_LOCAL_ROOT>/quota_store.json` | Quota limits store |
+| `TQ_JOB_STORE_PATH` | `<TQ_LOCAL_ROOT>/job_store.json` | Async job state store |
+| `TQ_JOB_WORKERS` | `2` | Concurrent async job workers |
+
+## API Endpoints
+
+### Health
 - `GET /healthz`
 - `GET/POST /v1/tenants/:tenant/databases/:database/collections`
 - `DELETE /v1/tenants/:tenant/databases/:database/collections/:collection`
@@ -26,17 +44,33 @@ Service mode currently includes:
 - `POST /v1/jobs/:job_id/cancel`
 - `POST /v1/jobs/:job_id/retry`
 
-## Env Vars
+### Collection Management
+- `GET /v1/tenants/:tenant/databases/:database/collections` — List collections
+- `POST /v1/tenants/:tenant/databases/:database/collections` — Create collection
+- `DELETE /v1/tenants/:tenant/databases/:database/collections/:collection` — Delete collection
 
-- `TQ_SERVER_ADDR` (default `127.0.0.1:8080`)
-- `TQ_LOCAL_ROOT` (default `./data`)
-- `TQ_STORAGE_URI` (default `TQ_LOCAL_ROOT`)
-- `TQ_AUTH_STORE_PATH` (default `<TQ_LOCAL_ROOT>/auth_store.json`)
-- `TQ_QUOTA_STORE_PATH` (default `<TQ_LOCAL_ROOT>/quota_store.json`)
-- `TQ_JOB_STORE_PATH` (default `<TQ_LOCAL_ROOT>/job_store.json`)
-- `TQ_JOB_WORKERS` (default `2`)
+### Data Plane
+- `POST .../add` — Batch insert; supports `report=true` for partial-failure reporting
+- `POST .../upsert` — Batch insert-or-update; supports `report=true`
+- `POST .../delete` — Delete vectors by IDs
+- `POST .../get` — Fetch vectors by IDs; supports `include` (`ids`, `metadatas`, `documents`), `offset`, `limit`
+- `POST .../query` — Vector similarity search; supports `include` (`ids`, `scores`, `metadatas`, `documents`), `offset`
 
+### Async Jobs
+- `POST .../compact` — Start background compaction
+- `POST .../index` — Start background HNSW index build
+- `POST .../snapshot` — Start background snapshot
+- `GET .../jobs` — List jobs for a collection
+- `GET /v1/jobs/:job_id` — Get job status
+- `POST /v1/jobs/:job_id/cancel` — Cancel a job
+- `POST /v1/jobs/:job_id/retry` — Retry a failed job
 
+## Features
+
+- **Authentication** — API keys with RBAC scoped to tenant/database/collection level, persisted in `auth_store.json`
+- **Quotas** — Per-collection limits on vector count, disk bytes, and concurrent jobs, persisted in `quota_store.json`
+- **Async jobs** — Compaction, index build, and snapshots run in background workers; restart-safe with up to 3 retry attempts, state persisted in `job_store.json`
+- **Partial-failure reporting** — `add` and `upsert` with `report=true` return `{applied: N, failed: [...]}` instead of fail-fast
 
 ### Data-Plane Request Notes
 
@@ -45,6 +79,8 @@ Service mode currently includes:
 - `POST .../query` supports `top_k` (or alias `n_results`), `filter` (or alias `where_filter`), optional `include`, and `offset`.
 - `include` defaults to all allowed fields for each endpoint.
 
+## Request Notes
 
-
-
+- `include` defaults to all allowed fields if omitted
+- `offset` and `limit` in `get` enable pagination
+- Job state survives server restarts (job store is persisted to disk)
