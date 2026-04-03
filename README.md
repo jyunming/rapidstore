@@ -119,16 +119,27 @@ db.insert_batch(ids, vectors, metadatas=None, documents=None, mode="insert")
 
 db.upsert(id, vector, metadata=None, document=None)
 db.update(id, vector, metadata=None, document=None)
-db.delete(id)
+db.delete(id)                                        # → bool
+db.delete_batch(ids)                                 # delete multiple ids at once
+
+# Metadata-only update — no re-upload of vector needed
+db.update_metadata(id, metadata=None, document=None)
 ```
 
 ### Retrieve
 
 ```python
-db.get(id)             # → {id, metadata, document} or None
-db.get_many(ids)       # → list (None for missing)
-db.list_all()          # → list of all ids
-db.stats()             # → {vector_count, disk_bytes, has_index, …}
+db.get(id)                              # → {id, metadata, document} or None
+db.get_many(ids)                        # → list (None for missing)
+db.list_all()                           # → list of all ids
+db.list_ids(where_filter=None,          # → filtered, paginated id list
+            limit=None, offset=0)
+db.count(filter=None)                   # → int — number of matching vectors
+db.stats()                              # → {vector_count, disk_bytes, has_index, …}
+
+# Python container protocol
+len(db)                                 # → int
+"my-id" in db                           # → bool
 ```
 
 ### Search
@@ -140,8 +151,18 @@ results = db.search(
     filter=None,                # metadata filter (see below)
     _use_ann=True,              # use HNSW index if available
     ann_search_list_size=None,  # HNSW ef_search (default: max_degree × 2)
+    include=None,               # list[str] | None — fields to include in results
+                                #   valid: "id", "score", "metadata", "document"
 )
 # Each result: {"id": str, "score": float, "metadata": dict, "document": str | None}
+
+# Batch multi-query
+all_results = db.query(
+    query_embeddings,           # np.ndarray shape (N, D)
+    n_results=10,
+    where_filter=None,
+)
+# Returns list[list[dict]] — one inner list per query vector
 ```
 
 ### Index (HNSW)
@@ -166,6 +187,13 @@ db.search(query, top_k=5, filter={"topic": "ml"})
 
 # Comparison operators: $eq $ne $gt $gte $lt $lte
 db.search(query, top_k=5, filter={"year": {"$gte": 2023}})
+
+# Set operators: $in $nin
+db.search(query, top_k=5, filter={"status": {"$in": ["published", "featured"]}})
+
+# Field presence / string substring
+db.search(query, top_k=5, filter={"tags": {"$exists": True}})
+db.search(query, top_k=5, filter={"title": {"$contains": "neural"}})
 
 # Logical: $and $or
 db.search(query, top_k=5, filter={

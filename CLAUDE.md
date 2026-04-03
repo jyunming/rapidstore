@@ -88,18 +88,26 @@ Database.open(path, dimension, bits=4, seed=42, metric="ip", rerank=True)
 db.insert(id, vector, metadata=None, document=None)
 db.insert_batch(ids, vectors, metadatas=None, documents=None, mode="insert")
 db.upsert(id, vector, ...) / db.update(id, vector, ...)
-db.delete(id)
+db.update_metadata(id, metadata=None, document=None)  # metadata-only; no re-quantise
+db.delete(id) / db.delete_batch(ids)
 db.get(id) / db.get_many(ids) / db.list_all()
-db.search(query, top_k, filter=None, _use_ann=True, ann_search_list_size=None)
+db.list_ids(where_filter=None, limit=None, offset=0)  # paginated, filtered id list
+db.count(filter=None)
+db.search(query, top_k, filter=None, _use_ann=True, ann_search_list_size=None, include=None)
+db.query(query_embeddings, n_results=10, where_filter=None)  # batch multi-query (2-D array)
 db.create_index(max_degree=16, search_list_size=64, alpha=1.2)
 db.stats()
+len(db)  /  "id" in db      # container protocol
 ```
 
 **Metadata filter syntax:**
 ```python
-{"field": "value"}                                  # simple equality
-{"field": {"$gte": 2023}}                           # comparison: $eq $ne $gt $gte $lt $lte
-{"$and": [{"topic": "ml"}, {"year": {"$gte": 2023}}]}  # logical: $and $or
+{"field": "value"}                                         # simple equality
+{"field": {"$gte": 2023}}                                  # comparison: $eq $ne $gt $gte $lt $lte
+{"field": {"$in": ["a", "b"]}} / {"field": {"$nin": […]}} # set membership
+{"field": {"$exists": True}}                               # field presence
+{"field": {"$contains": "substr"}}                         # string substring
+{"$and": [{"topic": "ml"}, {"year": {"$gte": 2023}}]}      # logical: $and $or
 ```
 
 ### Key Design Points

@@ -102,13 +102,31 @@ db.update(id, vector, metadata=None, document=None)  # error if id not found
 ## Delete & Retrieve
 
 ```python
-db.delete(id)          # bool — True if id existed
+db.delete(id)                    # bool — True if id existed
+db.delete_batch(ids)             # deletes multiple ids at once
 
-db.get(id)             # dict | None — {id, metadata, document}
-db.get_many(ids)       # list[dict | None]
-db.list_all()          # list[str] — all ids
+db.get(id)                       # dict | None — {id, metadata, document}
+db.get_many(ids)                 # list[dict | None]
+db.list_all()                    # list[str] — all active ids
+db.list_ids(                     # paginated id list with optional filter
+    where_filter=None,           # dict | None — same filter syntax as search
+    limit=None,                  # int | None — max results (None = all)
+    offset=0,                    # int — skip this many results
+)
+db.count(filter=None)            # int — number of matching vectors
 
-db.stats()             # dict — vector_count, disk_bytes, has_index, ram_estimate_bytes, …
+# Update metadata without re-uploading the vector
+db.update_metadata(
+    id,                          # str — must exist; raises KeyError otherwise
+    metadata=None,               # dict | None — replaces metadata; None = keep existing
+    document=None,               # str | None — replaces document; None = keep existing
+)
+
+db.stats()                       # dict — vector_count, disk_bytes, has_index, …
+
+# Python container protocol
+len(db)                          # int — number of active vectors
+"my-id" in db                    # bool — True if id exists
 ```
 
 ---
@@ -122,11 +140,28 @@ results = db.search(
     filter=None,                 # dict | None  (see Metadata Filtering below)
     _use_ann=True,               # bool — use HNSW index if available
     ann_search_list_size=None,   # int | None — HNSW ef_search (default: max_degree × 2)
+    include=None,                # list[str] | None — fields to return; default all
+                                 #   valid values: "id", "score", "metadata", "document"
 )
 # Returns list of dicts: {"id": str, "score": float, "metadata": dict, "document": str | None}
 ```
 
 `ann_search_list_size` trades recall for latency — higher values find better results but take longer. Values between 64 and 256 cover the practical range.
+
+### Batch query
+
+Search with multiple vectors in one call:
+
+```python
+all_results = db.query(
+    query_embeddings,            # np.ndarray shape (N, D), float32 or float64
+    n_results=10,                # int — results per query
+    where_filter=None,           # dict | None
+    _use_ann=True,
+    ann_search_list_size=None,
+)
+# Returns list[list[dict]] — one inner list per query vector
+```
 
 ---
 
@@ -168,6 +203,17 @@ db.search(query, top_k=5, filter={"topic": "ml", "year": 2024})
 # Comparison operators: $eq  $ne  $gt  $gte  $lt  $lte
 db.search(query, top_k=5, filter={"year": {"$gte": 2023}})
 
+# Set operators: $in  $nin
+db.search(query, top_k=5, filter={"status": {"$in": ["published", "featured"]}})
+db.search(query, top_k=5, filter={"status": {"$nin": ["draft", "archived"]}})
+
+# Field presence: $exists
+db.search(query, top_k=5, filter={"tags": {"$exists": True}})   # field must be present
+db.search(query, top_k=5, filter={"tags": {"$exists": False}})  # field must be absent
+
+# Substring match: $contains (strings only)
+db.search(query, top_k=5, filter={"title": {"$contains": "neural"}})
+
 # Logical: $and  $or
 db.search(query, top_k=5, filter={
     "$and": [
@@ -181,8 +227,10 @@ db.search(query, top_k=5, filter={"profile.region": "eu"})
 ```
 
 Filter semantics:
-- `$ne` matches documents where the field is missing
+- `$ne` and `$nin` match documents where the field is missing
 - `$eq`, range operators, and `$in` do not match missing fields
+- `$exists: true` matches documents that have the field; `$exists: false` matches those that don't
+- `$contains` does substring matching on string fields only
 - No implicit type coercion — `{"year": "2023"}` will not match `{"year": 2023}`
 
 ---
