@@ -1,14 +1,14 @@
 # TurboQuantDB
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/jyunming/TurboQuantDB/blob/main/LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/turboquantdb)](https://pypi.org/project/turboquantdb/)
+[![PyPI](https://img.shields.io/pypi/v/tqdb)](https://pypi.org/project/tqdb/)
 
 An embedded vector database written in Rust with Python bindings, implementing the **TurboQuant** algorithm ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) — zero training time, 2–4 bit compression, and provably unbiased inner product estimation.
 
 **Goal:** make massive embedding datasets practical on lightweight hardware. A 50k-vector, 1536-dim collection that would occupy 293 MB as raw float32 fits in **70 MB on disk and 488 MB of RAM** with TQDB b=4 — enabling laptop-scale RAG over millions of documents without a dedicated server.
 
 Two deployment modes:
-- **Embedded** — `turboquantdb` Python package, runs in-process (no daemon)
+- **Embedded** — `tqdb` Python package (`pip install tqdb`), runs in-process (no daemon)
 - **Server** — Axum HTTP service in `server/`, with multi-tenancy, RBAC, quotas, and async jobs
 
 ---
@@ -45,7 +45,7 @@ maturin develop --release
 ### Install pre-built wheel
 
 ```bash
-pip install turboquantdb
+pip install tqdb
 ```
 
 ---
@@ -268,7 +268,7 @@ The brute-force search path (`_use_ann=False`) is the paper-conformant mode — 
 
 ## Server Mode
 
-> **Status: experimental.** The server crate compiles and the core endpoints work, but it has not been hardened for production use. The embedded library (`turboquantdb` Python package) is the primary supported interface.
+> **Status: experimental.** The server crate compiles and the core endpoints work, but it has not been hardened for production use. The embedded library (`tqdb` Python package, `from turboquantdb import Database`) is the primary supported interface.
 
 An optional Axum-based HTTP server is available in `server/` for multi-tenant deployments. It adds API key authentication, quota enforcement, and async job management (compaction, index building, snapshots).
 
