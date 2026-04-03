@@ -97,7 +97,7 @@ for r in results:
 
 ## Python API
 
-> Full reference: **[`docs/PYTHON_API.md`](docs/PYTHON_API.md)**
+> Full reference: **[`docs/PYTHON_API.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md)**
 
 ```python
 # Open / create
