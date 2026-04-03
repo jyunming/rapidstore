@@ -450,6 +450,139 @@ class TestPersistence:
 
 
 # ---------------------------------------------------------------------------
+# count()
+# ---------------------------------------------------------------------------
+
+class TestCount:
+    def test_count_no_filter_returns_total(self, tmp_path):
+        db = open_db(str(tmp_path / "db"), d=8)
+        assert db.count() == 0
+        db.insert("a", np.ones(8, dtype=np.float32))
+        db.insert("b", np.ones(8, dtype=np.float32) * 0.5)
+        assert db.count() == 2
+
+    def test_count_after_delete(self, tmp_path):
+        db = open_db(str(tmp_path / "db"), d=8)
+        db.insert("a", np.ones(8, dtype=np.float32))
+        db.insert("b", np.ones(8, dtype=np.float32))
+        db.delete("a")
+        assert db.count() == 1
+
+    def test_count_with_filter(self, tmp_path):
+        db = open_db(str(tmp_path / "db"), d=8)
+        db.insert("a", np.ones(8, dtype=np.float32), metadata={"topic": "ml"})
+        db.insert("b", np.ones(8, dtype=np.float32), metadata={"topic": "nlp"})
+        db.insert("c", np.ones(8, dtype=np.float32), metadata={"topic": "ml"})
+        assert db.count(filter={"topic": "ml"}) == 2
+        assert db.count(filter={"topic": "nlp"}) == 1
+        assert db.count(filter={"topic": "cv"}) == 0
+
+    def test_count_with_comparison_filter(self, tmp_path):
+        db = open_db(str(tmp_path / "db"), d=8)
+        for i in range(5):
+            db.insert(str(i), np.ones(8, dtype=np.float32), metadata={"year": 2020 + i})
+        assert db.count(filter={"year": {"$gte": 2023}}) == 2  # 2023, 2024
+
+
+# ---------------------------------------------------------------------------
+# delete_batch()
+# ---------------------------------------------------------------------------
+
+class TestDeleteBatch:
+    def test_delete_batch_returns_count(self, tmp_path):
+        db = open_db(str(tmp_path / "db"), d=8)
+        db.insert("a", np.ones(8, dtype=np.float32))
+        db.insert("b", np.ones(8, dtype=np.float32))
+        db.insert("c", np.ones(8, dtype=np.float32))
+        deleted = db.delete_batch(["a", "c", "missing"])
+        assert deleted == 2
+        assert db.count() == 1
+        assert db.get("b") is not None
+
+    def test_delete_batch_empty_list(self, tmp_path):
+        db = open_db(str(tmp_path / "db"), d=8)
+        db.insert("a", np.ones(8, dtype=np.float32))
+        assert db.delete_batch([]) == 0
+        assert db.count() == 1
+
+    def test_delete_batch_all_missing(self, tmp_path):
+        db = open_db(str(tmp_path / "db"), d=8)
+        assert db.delete_batch(["x", "y", "z"]) == 0
+
+    def test_delete_batch_persists_across_reopen(self, tmp_path):
+        path = str(tmp_path / "db")
+        db = open_db(path, d=8)
+        for i in range(5):
+            db.insert(str(i), np.ones(8, dtype=np.float32))
+        db.delete_batch(["0", "2", "4"])
+        del db
+        db2 = open_db(path, d=8)
+        assert db2.count() == 2
+        assert db2.get("1") is not None
+        assert db2.get("3") is not None
+        assert db2.get("0") is None
+
+
+# ---------------------------------------------------------------------------
+# multi-collection (collection= parameter)
+# ---------------------------------------------------------------------------
+
+class TestMultiCollection:
+    def test_collection_creates_subdirectory(self, tmp_path):
+        base = str(tmp_path / "base")
+        db = Database.open(base, 8, bits=4, collection="col1")
+        assert os.path.isdir(os.path.join(base, "col1"))
+
+    def test_two_collections_are_isolated(self, tmp_path):
+        base = str(tmp_path / "base")
+        col1 = Database.open(base, 8, bits=4, collection="col1")
+        col2 = Database.open(base, 8, bits=4, collection="col2")
+        col1.insert("shared-id", np.ones(8, dtype=np.float32))
+        assert col1.count() == 1
+        assert col2.count() == 0  # isolated
+
+    def test_no_collection_uses_base_path(self, tmp_path):
+        base = str(tmp_path / "base")
+        db = Database.open(base, 8, bits=4)
+        db.insert("v0", np.ones(8, dtype=np.float32))
+        assert db.count() == 1
+
+    def test_collection_persists_across_reopen(self, tmp_path):
+        base = str(tmp_path / "base")
+        db = Database.open(base, 8, bits=4, collection="docs")
+        db.insert("v0", np.ones(8, dtype=np.float32))
+        del db
+        db2 = Database.open(base, 8, bits=4, collection="docs")
+        assert db2.get("v0") is not None
+
+
+# ---------------------------------------------------------------------------
+# flush() and close()
+# ---------------------------------------------------------------------------
+
+class TestFlushClose:
+    def test_flush_is_callable(self, tmp_path):
+        db = open_db(str(tmp_path / "db"), d=8)
+        db.insert("a", np.ones(8, dtype=np.float32))
+        db.flush()  # should not raise
+
+    def test_close_is_callable(self, tmp_path):
+        db = open_db(str(tmp_path / "db"), d=8)
+        db.insert("a", np.ones(8, dtype=np.float32))
+        db.close()  # should not raise
+
+    def test_flush_data_readable_after_reopen(self, tmp_path):
+        path = str(tmp_path / "db")
+        db = open_db(path, d=8)
+        for i in range(10):
+            db.insert(str(i), np.ones(8, dtype=np.float32))
+        db.flush()
+        del db
+        db2 = open_db(path, d=8)
+        assert db2.count() == 10
+
+
+# ---------------------------------------------------------------------------
 # TurboQuantRetriever (RAG wrapper) tests
 # ---------------------------------------------------------------------------
 
@@ -591,6 +724,221 @@ class TestTurboQuantRetrieverOps:
         results = retriever.similarity_search(query, k=1)
         assert len(results) == 1
         assert results[0]["metadata"].get("tag") == "important"
+
+class TestNewFilterOps:
+    def test_in_operator(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(5, 32)
+        for i in range(5):
+            db.insert(f"v{i}", vecs[i], metadata={"tag": chr(ord("A") + i)})
+        results = db.search(vecs[0], 10, filter={"tag": {"$in": ["A", "C"]}})
+        ids = {r["id"] for r in results}
+        assert "v0" in ids and "v2" in ids
+        assert "v1" not in ids and "v3" not in ids
+
+    def test_nin_operator(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(4, 32)
+        for i in range(4):
+            db.insert(f"v{i}", vecs[i], metadata={"tag": chr(ord("A") + i)})
+        results = db.search(vecs[0], 10, filter={"tag": {"$nin": ["B", "C"]}})
+        ids = {r["id"] for r in results}
+        assert "v0" in ids and "v3" in ids
+        assert "v1" not in ids and "v2" not in ids
+
+    def test_exists_operator(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(4, 32)
+        db.insert("with", vecs[0], metadata={"extra": "yes"})
+        db.insert("without", vecs[1], metadata={"other": "val"})
+        db.insert("with2", vecs[2], metadata={"extra": "no"})
+        results = db.search(vecs[0], 10, filter={"extra": {"$exists": True}})
+        ids = {r["id"] for r in results}
+        assert "with" in ids and "with2" in ids
+        assert "without" not in ids
+
+    def test_contains_operator(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(4, 32)
+        db.insert("a", vecs[0], metadata={"text": "hello world"})
+        db.insert("b", vecs[1], metadata={"text": "goodbye"})
+        db.insert("c", vecs[2], metadata={"text": "hello again"})
+        results = db.search(vecs[0], 10, filter={"text": {"$contains": "hello"}})
+        ids = {r["id"] for r in results}
+        assert "a" in ids and "c" in ids
+        assert "b" not in ids
+
+
+# ---------------------------------------------------------------------------
+# update_metadata
+# ---------------------------------------------------------------------------
+
+class TestUpdateMetadata:
+    def test_update_metadata_only(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vec = random_unit_vecs(1, 32)[0]
+        db.insert("x", vec, metadata={"k": "old"}, document="orig")
+        db.update_metadata("x", metadata={"k": "new"})
+        rec = db.get("x")
+        assert rec["metadata"]["k"] == "new"
+        assert rec["document"] == "orig"
+
+    def test_update_document_only(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vec = random_unit_vecs(1, 32)[0]
+        db.insert("x", vec, metadata={"k": "v"}, document="old")
+        db.update_metadata("x", document="new doc")
+        rec = db.get("x")
+        assert rec["document"] == "new doc"
+        assert rec["metadata"]["k"] == "v"
+
+    def test_update_metadata_missing_id_raises(self, tmp_path):
+        db = open_db(str(tmp_path))
+        with pytest.raises(Exception):
+            db.update_metadata("nonexistent", metadata={"k": "v"})
+
+    def test_update_metadata_does_not_affect_search(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(3, 32)
+        for i in range(3):
+            db.insert(f"v{i}", vecs[i], metadata={"cat": "A"})
+        db.update_metadata("v1", metadata={"cat": "B"})
+        results = db.search(vecs[0], 10, filter={"cat": "A"})
+        ids = {r["id"] for r in results}
+        assert "v0" in ids and "v2" in ids
+        assert "v1" not in ids
+
+
+# ---------------------------------------------------------------------------
+# query (batch multi-query)
+# ---------------------------------------------------------------------------
+
+class TestQueryBatch:
+    def test_basic_batch(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(10, 32)
+        for i in range(10):
+            db.insert(f"v{i}", vecs[i])
+        queries = np.stack([vecs[0], vecs[1], vecs[2]])
+        all_results = db.query(queries, n_results=3)
+        assert len(all_results) == 3
+        for res in all_results:
+            assert len(res) <= 3
+
+    def test_batch_with_filter(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(6, 32)
+        for i in range(6):
+            db.insert(f"v{i}", vecs[i], metadata={"grp": "A" if i < 3 else "B"})
+        queries = np.stack([vecs[0], vecs[3]])
+        all_results = db.query(queries, n_results=5, where_filter={"grp": "A"})
+        for res in all_results:
+            for r in res:
+                assert r["metadata"]["grp"] == "A"
+
+    def test_batch_float64(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(5, 32)
+        for i in range(5):
+            db.insert(f"v{i}", vecs[i])
+        queries = np.stack([vecs[0], vecs[1]]).astype(np.float64)
+        all_results = db.query(queries, n_results=2)
+        assert len(all_results) == 2
+
+
+# ---------------------------------------------------------------------------
+# list_ids (paginated, filtered)
+# ---------------------------------------------------------------------------
+
+class TestListIds:
+    def test_list_all_ids(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(5, 32)
+        for i in range(5):
+            db.insert(f"v{i}", vecs[i])
+        ids = db.list_ids()
+        assert set(ids) == {f"v{i}" for i in range(5)}
+
+    def test_list_ids_with_filter(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(6, 32)
+        for i in range(6):
+            db.insert(f"v{i}", vecs[i], metadata={"cat": "A" if i < 3 else "B"})
+        ids = db.list_ids(where_filter={"cat": "A"})
+        assert set(ids) == {"v0", "v1", "v2"}
+
+    def test_list_ids_pagination(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(10, 32)
+        for i in range(10):
+            db.insert(f"v{i}", vecs[i])
+        page1 = db.list_ids(limit=5, offset=0)
+        page2 = db.list_ids(limit=5, offset=5)
+        assert len(page1) == 5
+        assert len(page2) == 5
+        assert set(page1).isdisjoint(set(page2))
+        assert set(page1) | set(page2) == {f"v{i}" for i in range(10)}
+
+    def test_list_ids_offset_beyond_end(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(3, 32)
+        for i in range(3):
+            db.insert(f"v{i}", vecs[i])
+        ids = db.list_ids(offset=10)
+        assert ids == []
+
+
+# ---------------------------------------------------------------------------
+# Python dunders: __len__, __contains__
+# ---------------------------------------------------------------------------
+
+class TestDunders:
+    def test_len(self, tmp_path):
+        db = open_db(str(tmp_path))
+        assert len(db) == 0
+        vecs = random_unit_vecs(5, 32)
+        for i in range(5):
+            db.insert(f"v{i}", vecs[i])
+        assert len(db) == 5
+        db.delete("v0")
+        assert len(db) == 4
+
+    def test_contains(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(3, 32)
+        db.insert("exists", vecs[0])
+        assert "exists" in db
+        assert "missing" not in db
+
+
+# ---------------------------------------------------------------------------
+# search include= parameter
+# ---------------------------------------------------------------------------
+
+class TestSearchIncludeParam:
+    def test_include_id_only(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(3, 32)
+        for i in range(3):
+            db.insert(f"v{i}", vecs[i], metadata={"k": "v"}, document="doc")
+        results = db.search(vecs[0], 3, include=["id"])
+        assert len(results) > 0
+        for r in results:
+            assert "id" in r
+            assert "score" not in r
+            assert "metadata" not in r
+            assert "document" not in r
+
+    def test_include_defaults_all_fields(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(3, 32)
+        for i in range(3):
+            db.insert(f"v{i}", vecs[i], metadata={"k": "v"}, document="doc")
+        results = db.search(vecs[0], 3)
+        for r in results:
+            assert "id" in r
+            assert "score" in r
+            assert "metadata" in r
 
 
 # ---------------------------------------------------------------------------

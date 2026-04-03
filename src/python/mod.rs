@@ -49,7 +49,7 @@ impl Database {
     ///
     ///     db = Database.open("mydb", dimension=1536, bits=4, metric="cosine")
     #[staticmethod]
-    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None))]
+    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None))]
     fn open(
         path: String,
         dimension: usize,
@@ -59,7 +59,18 @@ impl Database {
         rerank: bool,
         fast_mode: bool,
         rerank_precision: Option<&str>,
+        collection: Option<&str>,
     ) -> PyResult<Self> {
+        let engine_path = match collection {
+            Some(col) if !col.is_empty() => {
+                let p = std::path::Path::new(&path).join(col);
+                p.to_string_lossy().into_owned()
+            }
+            _ => path.clone(),
+        };
+        std::fs::create_dir_all(&engine_path)
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+
         let dist_metric = match metric.to_lowercase().as_str() {
             "ip" => DistanceMetric::Ip,
             "cosine" => DistanceMetric::Cosine,
@@ -88,8 +99,8 @@ impl Database {
         };
 
         let engine = TurboQuantEngine::open_with_options(
-            &path,
-            &path,
+            &engine_path,
+            &engine_path,
             dimension,
             bits,
             seed,
@@ -264,6 +275,56 @@ impl Database {
         })
     }
 
+    /// Delete multiple vectors in a single call.
+    ///
+    /// Args:
+    ///     ids: List of IDs to delete. IDs not present are silently skipped.
+    ///
+    /// Returns:
+    ///     The number of vectors that were found and deleted.
+    ///
+    /// Example::
+    ///
+    ///     deleted = db.delete_batch(["id1", "id2", "id3"])
+    fn delete_batch(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<usize> {
+        py.allow_threads(|| {
+            let mut engine = self.engine.write().unwrap();
+            engine.delete_batch(ids).map_err(to_py_runtime)
+        })
+    }
+
+    /// Count vectors matching an optional metadata filter.
+    ///
+    /// When called without a filter this is O(1) and equivalent to
+    /// ``db.stats()["vector_count"]``. With a filter it performs an O(n)
+    /// scan and returns the number of matching active vectors.
+    ///
+    /// Args:
+    ///     filter: Optional metadata filter dict using the same syntax as
+    ///             :meth:`search`.
+    ///
+    /// Returns:
+    ///     Integer count of matching vectors.
+    ///
+    /// Example::
+    ///
+    ///     total = db.count()
+    ///     ml_docs = db.count(filter={"topic": "ml"})
+    ///     recent = db.count(filter={"year": {"$gte": 2023}})
+    #[pyo3(signature = (filter=None))]
+    fn count(&self, py: Python<'_>, filter: Option<&Bound<'_, PyDict>>) -> PyResult<usize> {
+        let parsed_filter = parse_pydict(filter)?;
+        let filter_ref = if parsed_filter.is_empty() {
+            None
+        } else {
+            Some(&parsed_filter)
+        };
+        py.allow_threads(|| {
+            let engine = self.engine.read().unwrap();
+            engine.count_with_filter(filter_ref).map_err(to_py_runtime)
+        })
+    }
+
     fn get(&self, py: Python<'_>, id: String) -> PyResult<Option<PyObject>> {
         let got = py.allow_threads(|| {
             let engine = self.engine.read().unwrap();
@@ -295,7 +356,7 @@ impl Database {
         Ok(engine.list_all())
     }
 
-    #[pyo3(signature = (query, top_k, filter=None, _use_ann=true, ann_search_list_size=None))]
+    #[pyo3(signature = (query, top_k, filter=None, _use_ann=true, ann_search_list_size=None, include=None))]
     fn search(
         &self,
         py: Python<'_>,
@@ -304,6 +365,7 @@ impl Database {
         filter: Option<&Bound<'_, PyDict>>,
         _use_ann: bool,
         ann_search_list_size: Option<usize>,
+        include: Option<Vec<String>>,
     ) -> PyResult<PyObject> {
         let q = if let Ok(v) = query.extract::<PyReadonlyArray1<f32>>(py) {
             v.as_array().mapv(|x| x as f64)
@@ -320,6 +382,8 @@ impl Database {
             Some(&parsed_filter)
         };
 
+        let inc = parse_include_set(include, &["id", "score", "metadata", "document"]);
+
         let results = py.allow_threads(|| {
             let engine = self.engine.read().unwrap();
             engine
@@ -330,15 +394,23 @@ impl Database {
         let py_list = PyList::empty_bound(py);
         for r in results {
             let dict = PyDict::new_bound(py);
-            dict.set_item("id", r.id)?;
-            dict.set_item("score", r.score)?;
-            let meta_dict = PyDict::new_bound(py);
-            for (k, v) in r.metadata {
-                meta_dict.set_item(k, json_to_py(py, &v)?)?;
+            if inc.contains("id") {
+                dict.set_item("id", &r.id)?;
             }
-            dict.set_item("metadata", meta_dict)?;
-            if let Some(doc) = r.document {
-                dict.set_item("document", doc)?;
+            if inc.contains("score") {
+                dict.set_item("score", r.score)?;
+            }
+            if inc.contains("metadata") {
+                let meta_dict = PyDict::new_bound(py);
+                for (k, v) in r.metadata {
+                    meta_dict.set_item(k, json_to_py(py, &v)?)?;
+                }
+                dict.set_item("metadata", meta_dict)?;
+            }
+            if inc.contains("document") {
+                if let Some(doc) = r.document {
+                    dict.set_item("document", doc)?;
+                }
             }
             py_list.append(dict)?;
         }
@@ -414,6 +486,168 @@ impl Database {
         py.allow_threads(|| {
             let mut engine = self.engine.write().unwrap();
             engine.close().map_err(to_py_runtime)
+        })
+    }
+
+    /// `len(db)` — total number of active vectors.
+    fn __len__(&self) -> PyResult<usize> {
+        let engine = self.engine.read().unwrap();
+        engine.count_with_filter(None).map_err(to_py_runtime)
+    }
+
+    /// `id in db` — True if the ID exists in the database.
+    fn __contains__(&self, py: Python<'_>, id: String) -> PyResult<bool> {
+        py.allow_threads(|| {
+            let engine = self.engine.read().unwrap();
+            engine.get(&id).map(|r| r.is_some()).map_err(to_py_runtime)
+        })
+    }
+
+    /// Update metadata and/or document for an existing ID without re-uploading
+    /// the vector.  The quantised representation is untouched.
+    ///
+    /// Args:
+    ///     id: ID to update. Raises ``KeyError`` if not found.
+    ///     metadata: New metadata dict, or ``None`` to preserve existing.
+    ///     document: New document string, or ``None`` to preserve existing.
+    ///
+    /// Example::
+    ///
+    ///     db.update_metadata("doc-1", metadata={"status": "published"})
+    ///     db.update_metadata("doc-1", document="updated text")
+    #[pyo3(signature = (id, metadata=None, document=None))]
+    fn update_metadata(
+        &self,
+        py: Python<'_>,
+        id: String,
+        metadata: Option<&Bound<'_, PyDict>>,
+        document: Option<String>,
+    ) -> PyResult<()> {
+        let props = parse_pydict(metadata)?;
+        py.allow_threads(|| {
+            let mut engine = self.engine.write().unwrap();
+            engine
+                .update_metadata_only(&id, props, document)
+                .map_err(to_py_runtime)
+        })
+    }
+
+    /// Search with multiple query vectors in one call.
+    ///
+    /// Args:
+    ///     query_embeddings: 2-D array of shape ``(N, D)``.
+    ///     n_results: Number of results per query. Default 10.
+    ///     where_filter: Optional metadata filter (same syntax as :meth:`search`).
+    ///     _use_ann: Use HNSW index if available. Default ``True``.
+    ///     ann_search_list_size: HNSW ef_search override.
+    ///
+    /// Returns:
+    ///     List of N result lists, each in the same format as :meth:`search`.
+    ///
+    /// Example::
+    ///
+    ///     all_results = db.query(
+    ///         query_embeddings=np.stack([q1, q2, q3]),
+    ///         n_results=5,
+    ///     )
+    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=true, ann_search_list_size=None))]
+    fn query(
+        &self,
+        py: Python<'_>,
+        query_embeddings: PyObject,
+        n_results: usize,
+        where_filter: Option<&Bound<'_, PyDict>>,
+        _use_ann: bool,
+        ann_search_list_size: Option<usize>,
+    ) -> PyResult<PyObject> {
+        let queries: Vec<ndarray::Array1<f64>> =
+            if let Ok(m) = query_embeddings.extract::<PyReadonlyArray2<f32>>(py) {
+                m.as_array()
+                    .rows()
+                    .into_iter()
+                    .map(|r| r.mapv(|x| x as f64))
+                    .collect()
+            } else if let Ok(m) = query_embeddings.extract::<PyReadonlyArray2<f64>>(py) {
+                m.as_array()
+                    .rows()
+                    .into_iter()
+                    .map(|r| r.to_owned())
+                    .collect()
+            } else {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "query_embeddings must be a 2-D numpy array (float32 or float64)",
+                ));
+            };
+
+        let parsed_filter = parse_pydict(where_filter)?;
+        let filter_ref = if parsed_filter.is_empty() {
+            None
+        } else {
+            Some(&parsed_filter)
+        };
+
+        let batch = py.allow_threads(|| {
+            let engine = self.engine.read().unwrap();
+            engine
+                .search_batch(&queries, n_results, filter_ref, ann_search_list_size)
+                .map_err(to_py_runtime)
+        })?;
+
+        let outer = PyList::empty_bound(py);
+        for results in batch {
+            let inner = PyList::empty_bound(py);
+            for r in results {
+                let dict = PyDict::new_bound(py);
+                dict.set_item("id", r.id)?;
+                dict.set_item("score", r.score)?;
+                let meta_dict = PyDict::new_bound(py);
+                for (k, v) in r.metadata {
+                    meta_dict.set_item(k, json_to_py(py, &v)?)?;
+                }
+                dict.set_item("metadata", meta_dict)?;
+                if let Some(doc) = r.document {
+                    dict.set_item("document", doc)?;
+                }
+                inner.append(dict)?;
+            }
+            outer.append(inner)?;
+        }
+        Ok(outer.into())
+    }
+
+    /// Return IDs with optional metadata filter and pagination.
+    ///
+    /// Args:
+    ///     where_filter: Optional metadata filter dict.
+    ///     limit: Maximum number of IDs to return. ``None`` returns all matching.
+    ///     offset: Number of IDs to skip. Default 0.
+    ///
+    /// Returns:
+    ///     List of matching IDs.
+    ///
+    /// Example::
+    ///
+    ///     # All IDs for a given category, page 2
+    ///     ids = db.list_ids(where_filter={"kind": "A"}, limit=50, offset=50)
+    #[pyo3(signature = (where_filter=None, limit=None, offset=0))]
+    fn list_ids(
+        &self,
+        py: Python<'_>,
+        where_filter: Option<&Bound<'_, PyDict>>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> PyResult<Vec<String>> {
+        let parsed_filter = parse_pydict(where_filter)?;
+        let filter_ref = if parsed_filter.is_empty() {
+            None
+        } else {
+            Some(&parsed_filter)
+        };
+        py.allow_threads(|| {
+            let engine = self.engine.read().unwrap();
+            engine
+                .list_with_filter_page(filter_ref, limit, offset)
+                .map_err(to_py_runtime)
         })
     }
 }
@@ -561,7 +795,6 @@ fn to_py_runtime(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
 }
 
-#[allow(dead_code)]
 fn parse_include_set(
     include: Option<Vec<String>>,
     defaults: &[&str],
