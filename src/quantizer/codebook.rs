@@ -186,7 +186,7 @@ mod tests {
         // → log_gamma(z) + log_gamma(1-z) = ln(π) - ln(sin(πz))
         use std::f64::consts::PI;
         for &z in &[0.1_f64, 0.2, 0.3, 0.4, 0.49] {
-            let lg_z = log_gamma(z);        // triggers reflection branch
+            let lg_z = log_gamma(z); // triggers reflection branch
             let lg_1mz = log_gamma(1.0 - z); // normal branch
             let expected = (PI / (PI * z).sin()).ln();
             let actual = lg_z + lg_1mz;

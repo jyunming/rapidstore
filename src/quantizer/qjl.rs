@@ -388,7 +388,13 @@ mod tests {
         let sign_ip = |a: &[f32], b: &[f32]| -> f64 {
             a.iter()
                 .zip(b.iter())
-                .map(|(&x, &y)| if x.signum() == y.signum() { 1.0_f64 } else { -1.0_f64 })
+                .map(|(&x, &y)| {
+                    if x.signum() == y.signum() {
+                        1.0_f64
+                    } else {
+                        -1.0_f64
+                    }
+                })
                 .sum::<f64>()
                 / a.len() as f64
         };

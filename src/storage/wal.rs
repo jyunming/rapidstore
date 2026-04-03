@@ -570,6 +570,9 @@ mod tests {
         // No set_quantizer() call → self.quantizer=None → else branch at line 117
         wal.append_batch(&[tombstone_entry("x")], false).unwrap();
         let file_size = std::fs::metadata(&path).unwrap().len();
-        assert!(file_size > 8, "WAL should have data after append: size={file_size}");
+        assert!(
+            file_size > 8,
+            "WAL should have data after append: size={file_size}"
+        );
     }
 }

@@ -523,9 +523,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_backend(dir: &tempfile::TempDir) -> Arc<StorageBackend> {
-        Arc::new(
-            StorageBackend::from_uri(dir.path().to_str().unwrap()).unwrap(),
-        )
+        Arc::new(StorageBackend::from_uri(dir.path().to_str().unwrap()).unwrap())
     }
 
     /// A simple identity scorer used in build() calls below.
@@ -551,7 +549,11 @@ mod tests {
         assert_eq!(mgr.node_count(), 0);
         // Call parse_layout directly (accessible because we're in the same module)
         mgr.parse_layout();
-        assert_eq!(mgr.node_count(), 0, "parse_layout with no mmap must set node_count=0");
+        assert_eq!(
+            mgr.node_count(),
+            0,
+            "parse_layout with no mmap must set node_count=0"
+        );
     }
 
     // ── parse_layout V3 magic but header too short (line 149) ─────────────────
@@ -569,8 +571,8 @@ mod tests {
         let mut fake: Vec<u8> = Vec::new();
         fake.extend_from_slice(b"TQG3");
         fake.extend_from_slice(&100u32.to_le_bytes()); // n=100
-        fake.extend_from_slice(&0u32.to_le_bytes());   // entry_point
-        fake.extend_from_slice(&0u32.to_le_bytes());   // max_level
+        fake.extend_from_slice(&0u32.to_le_bytes()); // entry_point
+        fake.extend_from_slice(&0u32.to_le_bytes()); // max_level
 
         // Write directly to local cache path and also to backend
         let local_path = format!("{}/graph.bin", cache);
@@ -597,7 +599,10 @@ mod tests {
         let results = mgr
             .search(0, 5, 32, |_| 1.0, None::<fn(u32) -> bool>)
             .unwrap();
-        assert!(results.is_empty(), "empty graph search must return empty vec");
+        assert!(
+            results.is_empty(),
+            "empty graph search must return empty vec"
+        );
     }
 
     // ── get_neighbors_at_level: node_id >= node_count (line 156) ─────────────
@@ -666,10 +671,13 @@ mod tests {
         // max_degree=4 → level_mult≈0.721 → ~50 nodes at level≥1 > EF_UPPER=32
         // This guarantees beam saturation: lines 257, 259, 272, 277, 279 covered.
         mgr.build(n, 4, 64, 1, 1.2, |from, candidates| {
-            candidates.iter().map(|&to| {
-                let diff = (from as f64) - (to as f64);
-                (to, -(diff * diff))
-            }).collect()
+            candidates
+                .iter()
+                .map(|&to| {
+                    let diff = (from as f64) - (to as f64);
+                    (to, -(diff * diff))
+                })
+                .collect()
         })
         .unwrap();
 
@@ -679,9 +687,18 @@ mod tests {
         );
 
         let results = mgr
-            .search(mgr.entry_point, 10, 64, |n| -(n as f64), None::<fn(u32) -> bool>)
+            .search(
+                mgr.entry_point,
+                10,
+                64,
+                |n| -(n as f64),
+                None::<fn(u32) -> bool>,
+            )
             .unwrap();
-        assert!(!results.is_empty(), "multilevel search should return results");
+        assert!(
+            !results.is_empty(),
+            "multilevel search should return results"
+        );
     }
 
     // ── Corrupt graph records: get_neighbors_at_level error paths ─────────────

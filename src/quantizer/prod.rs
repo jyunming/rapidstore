@@ -878,10 +878,16 @@ mod tests {
         let query = Array1::from_iter(x.iter().map(|&v| v as f64));
         let prep_lite = pq.prepare_ip_query_lite(&query);
         let score = pq.score_ip_encoded_lite(&prep_lite, &idx, &qjl, gamma);
-        assert!(score.is_finite(), "d=4 scalar-tail score must be finite: {score}");
+        assert!(
+            score.is_finite(),
+            "d=4 scalar-tail score must be finite: {score}"
+        );
         // Also test with non-zero gamma to exercise the full QJL scalar tail
         let score_g = pq.score_ip_encoded_lite(&prep_lite, &idx, &qjl, 1.0);
-        assert!(score_g.is_finite(), "d=4 scalar-tail with gamma=1 must be finite: {score_g}");
+        assert!(
+            score_g.is_finite(),
+            "d=4 scalar-tail with gamma=1 must be finite: {score_g}"
+        );
     }
 
     // ── score_ip_encoded with d=4: MSE+QJL scalar tails (lines 390-394, 414-423) ──
@@ -900,9 +906,15 @@ mod tests {
         // With d=4 (n=4): SIMD main loop `while i+7 < 4` never runs → MSE scalar tail
         // (lines 390-394); QJL base_i=0, 0+7=7>=4 → QJL scalar tail (lines 414-423)
         let score = pq.score_ip_encoded(&prep, &idx, &qjl, gamma);
-        assert!(score.is_finite(), "d=4 score_ip_encoded must be finite: {score}");
+        assert!(
+            score.is_finite(),
+            "d=4 score_ip_encoded must be finite: {score}"
+        );
         let score_g = pq.score_ip_encoded(&prep, &idx, &qjl, 1.0);
-        assert!(score_g.is_finite(), "d=4 score_ip_encoded with gamma=1 must be finite: {score_g}");
+        assert!(
+            score_g.is_finite(),
+            "d=4 score_ip_encoded with gamma=1 must be finite: {score_g}"
+        );
     }
 
     #[test]

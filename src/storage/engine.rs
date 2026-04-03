@@ -701,7 +701,6 @@ impl TurboQuantEngine {
             .collect()
     }
 
-
     ///
     /// When `filter` is `None` this is equivalent to `stats().vector_count` but
     /// faster (no disk I/O). When a filter is supplied it performs an O(n) scan
@@ -3017,7 +3016,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let p = dir.path().to_str().unwrap();
         let mut e = open_default(p, 8);
-        e.insert("dup".into(), &make_vec(8, 0.5), no_meta()).unwrap();
+        e.insert("dup".into(), &make_vec(8, 0.5), no_meta())
+            .unwrap();
         let result = e.insert("dup".into(), &make_vec(8, 0.6), no_meta());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
@@ -3033,7 +3033,10 @@ mod tests {
             "vector_count": 0, "storage_uri": ""
         }"#;
         let m: Manifest = serde_json::from_str(json).unwrap();
-        assert!(m.rerank_enabled, "default_rerank_enabled() must return true");
+        assert!(
+            m.rerank_enabled,
+            "default_rerank_enabled() must return true"
+        );
     }
 
     #[test]
@@ -3044,7 +3047,10 @@ mod tests {
             "alpha": 1.2, "indexed_nodes": 0
         }"#;
         let s: IndexState = serde_json::from_str(json).unwrap();
-        assert_eq!(s.ef_construction, 200, "default_ef_construction() must return 200");
+        assert_eq!(
+            s.ef_construction, 200,
+            "default_ef_construction() must return 200"
+        );
     }
 
     // ── WAL recovery without live_ids.bin ───────────────────────────────────
@@ -3080,12 +3086,15 @@ mod tests {
         let mut e = TurboQuantEngine::open(p, p, d, 2, 42).unwrap();
         // Fill up to wal_flush_threshold (100) to ensure next delete pushes over
         for i in 0..100 {
-            e.insert(format!("v{i}"), &make_vec(d, 0.5), no_meta()).unwrap();
+            e.insert(format!("v{i}"), &make_vec(d, 0.5), no_meta())
+                .unwrap();
         }
         // This delete should trigger flush_wal_to_segment
         e.delete("v0".to_string()).unwrap();
         // Engine must remain functional after the flush
-        let results = e.search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None).unwrap();
+        let results = e
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None)
+            .unwrap();
         assert!(results.len() <= 5);
     }
 
@@ -3209,13 +3218,14 @@ mod tests {
         // build_scorer L2 without vraw → !precomputed_l2.is_empty() path (lines 812-822)
         e.create_index_with_params(8, 32, 32, 1.2, 1).unwrap();
         let q = Array1::from_vec(vec![0.0f64; d]);
-        let results = e
-            .search_with_filter_and_ann(&q, 5, None, None)
-            .unwrap();
+        let results = e.search_with_filter_and_ann(&q, 5, None, None).unwrap();
         assert!(!results.is_empty());
         // L2 scores are negative distances
         for r in &results {
-            assert!(r.score <= 0.0, "L2 score should be <= 0 (negative distance)");
+            assert!(
+                r.score <= 0.0,
+                "L2 score should be <= 0 (negative distance)"
+            );
         }
     }
 
@@ -3240,17 +3250,19 @@ mod tests {
             RerankPrecision::F32,
         )
         .unwrap();
-        e.insert("origin".into(), &Array1::from_vec(vec![0.0f64; d]), no_meta())
-            .unwrap();
+        e.insert(
+            "origin".into(),
+            &Array1::from_vec(vec![0.0f64; d]),
+            no_meta(),
+        )
+        .unwrap();
         let mut far = vec![0.0f64; d];
         far[0] = 10.0;
         e.insert("far".into(), &Array1::from_vec(far), no_meta())
             .unwrap();
         // Exhaustive search (no ANN index) → exercises L2 dequant path + raw rerank
         let q = Array1::from_vec(vec![0.0f64; d]);
-        let results = e
-            .search_with_filter_and_ann(&q, 2, None, None)
-            .unwrap();
+        let results = e.search_with_filter_and_ann(&q, 2, None, None).unwrap();
         assert_eq!(results.len(), 2);
         // "origin" should score 0 (no distance), "far" should score -10 (negative distance)
         assert_eq!(results[0].id, "origin", "origin should be closest for L2");
@@ -3319,9 +3331,7 @@ mod tests {
         e.insert("b".into(), &Array1::from_vec(b), no_meta())
             .unwrap();
         let q = Array1::from_vec(vec![0.0f64; d]);
-        let results = e
-            .search_with_filter_and_ann(&q, 2, None, None)
-            .unwrap();
+        let results = e.search_with_filter_and_ann(&q, 2, None, None).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, "a");
     }
@@ -3362,7 +3372,10 @@ mod tests {
         let results = e
             .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
             .unwrap();
-        assert!(results.is_empty(), "non-object $and condition should match nothing");
+        assert!(
+            results.is_empty(),
+            "non-object $and condition should match nothing"
+        );
     }
 
     #[test]
@@ -3398,7 +3411,10 @@ mod tests {
         let results = e
             .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
             .unwrap();
-        assert!(results.is_empty(), "non-object $or condition should match nothing");
+        assert!(
+            results.is_empty(),
+            "non-object $or condition should match nothing"
+        );
     }
 
     // ── Nested dotted-path filter false branches ──────────────────────────────
@@ -3420,7 +3436,10 @@ mod tests {
         let results = e
             .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
             .unwrap();
-        assert!(results.is_empty(), "dotted path through scalar should not match");
+        assert!(
+            results.is_empty(),
+            "dotted path through scalar should not match"
+        );
     }
 
     #[test]
@@ -3439,7 +3458,10 @@ mod tests {
         let results = e
             .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
             .unwrap();
-        assert!(results.is_empty(), "deeply nested path through scalar should not match");
+        assert!(
+            results.is_empty(),
+            "deeply nested path through scalar should not match"
+        );
     }
 
     // ── String comparison operators in apply_comparison_op ────────────────────
@@ -3614,7 +3636,10 @@ mod tests {
         let results = e
             .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
             .unwrap();
-        assert!(results.is_empty(), "filter matching nothing should return empty via ANN path");
+        assert!(
+            results.is_empty(),
+            "filter matching nothing should return empty via ANN path"
+        );
     }
 
     // ── Cosine ANN search (line 1042 — else branch of IP/else) ───────────────
@@ -3673,7 +3698,10 @@ mod tests {
         let results = e
             .search_with_filter_and_ann(&Array1::from_vec(q), 10, None, None)
             .unwrap();
-        assert!(!results.is_empty(), "large ANN search should return results");
+        assert!(
+            !results.is_empty(),
+            "large ANN search should return results"
+        );
     }
 
     // ── L2 ANN with rerank + raw vectors (lines 823-845 in build_scorer) ──────
@@ -3685,9 +3713,13 @@ mod tests {
         let d = 16;
         // rerank=true + L2 → has_vraw=true → precomputed_l2 is empty → lines 823-845
         let mut e = TurboQuantEngine::open_with_metric_and_rerank(
-            p, p, d, 4, 42,
+            p,
+            p,
+            d,
+            4,
+            42,
             DistanceMetric::L2,
-            true,  // rerank → live_vraw exists → has_vraw=true
+            true, // rerank → live_vraw exists → has_vraw=true
             false,
         )
         .unwrap();
@@ -3720,7 +3752,10 @@ mod tests {
         let results = e
             .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
             .unwrap();
-        assert!(results.is_empty(), "filter matching nothing in exhaustive search should return empty");
+        assert!(
+            results.is_empty(),
+            "filter matching nothing in exhaustive search should return empty"
+        );
     }
 
     // ── Cosine ANN rerank via dequantized vectors (lines 1075-1076) ──────────
@@ -3732,11 +3767,15 @@ mod tests {
         let d = 16;
         // Cosine + rerank=true but Disabled precision → live_vraw=None → deq_vecs path (line 1076)
         let mut e = TurboQuantEngine::open_with_options(
-            p, p, d, 4, 42,
+            p,
+            p,
+            d,
+            4,
+            42,
             DistanceMetric::Cosine,
-            true,   // rerank_enabled=true
+            true, // rerank_enabled=true
             false,
-            RerankPrecision::Disabled,  // no raw vecs → live_vraw=None
+            RerankPrecision::Disabled, // no raw vecs → live_vraw=None
         )
         .unwrap();
         for i in 0..30u32 {
@@ -3836,10 +3875,7 @@ mod tests {
         let p = dir.path().to_str().unwrap();
         let d = 8;
         let mut e = open_default(p, d);
-        assert_eq!(
-            e.delete_batch(vec!["x".into(), "y".into()]).unwrap(),
-            0
-        );
+        assert_eq!(e.delete_batch(vec!["x".into(), "y".into()]).unwrap(), 0);
     }
 
     // ── pub fn search / search_with_filter wrappers (lines 933-948) ──────────
@@ -3877,8 +3913,12 @@ mod tests {
         {
             let mut e = open_default(p, d);
             for i in 0..5u32 {
-                e.insert(format!("id{i}"), &make_vec(d, i as f64 * 0.1 + 0.1), no_meta())
-                    .unwrap();
+                e.insert(
+                    format!("id{i}"),
+                    &make_vec(d, i as f64 * 0.1 + 0.1),
+                    no_meta(),
+                )
+                .unwrap();
             }
             // close() covers lines 1434-1440; persists live_ids.bin
             e.close().unwrap();
@@ -3914,11 +3954,14 @@ mod tests {
         let d = 8;
         let mut e = TurboQuantEngine::open(p, p, d, 2, 42).unwrap();
         for i in 0..99u32 {
-            e.insert(format!("w{i}"), &make_vec(d, 0.5), no_meta()).unwrap();
+            e.insert(format!("w{i}"), &make_vec(d, 0.5), no_meta())
+                .unwrap();
         }
         // This delete brings buffer to 100 → flush (line 568)
         e.delete("w0".to_string()).unwrap();
-        let results = e.search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None).unwrap();
+        let results = e
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None)
+            .unwrap();
         assert!(results.len() <= 5);
     }
 
@@ -3931,7 +3974,8 @@ mod tests {
         let d = 8;
         let mut e = TurboQuantEngine::open(p, p, d, 2, 42).unwrap();
         for i in 0..99u32 {
-            e.insert(format!("b{i}"), &make_vec(d, 0.5), no_meta()).unwrap();
+            e.insert(format!("b{i}"), &make_vec(d, 0.5), no_meta())
+                .unwrap();
         }
         // delete_batch brings buffer to 100 → flush (line 685)
         e.delete_batch(vec!["b0".to_string()]).unwrap();
@@ -3970,11 +4014,19 @@ mod tests {
         // fast_mode=true → cached_qjl_len=0 → &[] branch (line 863)
         // rerank=false → uses stored norm path in build_scorer
         let mut e = TurboQuantEngine::open_with_metric_and_rerank(
-            p, p, d, 4, 42, DistanceMetric::Cosine, false, true,
+            p,
+            p,
+            d,
+            4,
+            42,
+            DistanceMetric::Cosine,
+            false,
+            true,
         )
         .unwrap();
         // Insert zero vector → norm=0 → line 871 in build_scorer
-        e.insert("zero".into(), &Array1::zeros(d), no_meta()).unwrap();
+        e.insert("zero".into(), &Array1::zeros(d), no_meta())
+            .unwrap();
         for i in 1..15u32 {
             let mut v = vec![0.0f64; d];
             v[i as usize % d] = 1.0;
@@ -3984,7 +4036,9 @@ mod tests {
         e.create_index_with_params(4, 16, 16, 1.2, 0).unwrap();
         // Search with zero query → query_norm=0 → line 1072
         let zero_q = Array1::<f64>::zeros(d);
-        let _results = e.search_with_filter_and_ann(&zero_q, 5, None, None).unwrap();
+        let _results = e
+            .search_with_filter_and_ann(&zero_q, 5, None, None)
+            .unwrap();
     }
 
     // ── $and filter with Object conditions (lines 1955-1957) ─────────────────
@@ -4003,10 +4057,8 @@ mod tests {
                 .unwrap();
         }
         // $and with Object conditions — covers lines 1955-1957
-        let filter: HashMap<String, serde_json::Value> = serde_json::from_str(
-            r#"{"$and": [{"score": {"$gte": 2}}, {"tag": "good"}]}"#,
-        )
-        .unwrap();
+        let filter: HashMap<String, serde_json::Value> =
+            serde_json::from_str(r#"{"$and": [{"score": {"$gte": 2}}, {"tag": "good"}]}"#).unwrap();
         let results = e
             .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
             .unwrap();
@@ -4138,8 +4190,12 @@ mod tests {
         {
             let mut e = open_default(p, d);
             for i in 0..5u32 {
-                e.insert(format!("x{i}"), &make_vec(d, 0.1 * i as f64 + 0.1), no_meta())
-                    .unwrap();
+                e.insert(
+                    format!("x{i}"),
+                    &make_vec(d, 0.1 * i as f64 + 0.1),
+                    no_meta(),
+                )
+                .unwrap();
             }
             let deleted = e
                 .delete_batch(vec!["x0".into(), "x2".into(), "x4".into()])
@@ -4190,7 +4246,8 @@ mod tests {
         let p = dir.path().to_str().unwrap();
         let d = 8;
         let mut e = open_default(p, d);
-        e.insert("no-tag".into(), &make_vec(d, 0.1), no_meta()).unwrap();
+        e.insert("no-tag".into(), &make_vec(d, 0.1), no_meta())
+            .unwrap();
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"tag": {"$in": ["ml"]}}"#).unwrap();
         let results = e
@@ -4231,7 +4288,8 @@ mod tests {
         let p = dir.path().to_str().unwrap();
         let d = 8;
         let mut e = open_default(p, d);
-        e.insert("no-tag".into(), &make_vec(d, 0.1), no_meta()).unwrap();
+        e.insert("no-tag".into(), &make_vec(d, 0.1), no_meta())
+            .unwrap();
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"tag": {"$nin": ["ml"]}}"#).unwrap();
         let results = e
@@ -4249,7 +4307,8 @@ mod tests {
         let mut with_tag = no_meta();
         with_tag.insert("tag".into(), json!("ml"));
         e.insert("has".into(), &make_vec(d, 0.1), with_tag).unwrap();
-        e.insert("missing".into(), &make_vec(d, 0.2), no_meta()).unwrap();
+        e.insert("missing".into(), &make_vec(d, 0.2), no_meta())
+            .unwrap();
 
         let filter_true: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"tag": {"$exists": true}}"#).unwrap();
@@ -4279,9 +4338,12 @@ mod tests {
             h.insert("title".into(), json!(s));
             h
         };
-        e.insert("a".into(), &make_vec(d, 0.1), m("GPU acceleration tips")).unwrap();
-        e.insert("b".into(), &make_vec(d, 0.2), m("CPU optimization guide")).unwrap();
-        e.insert("c".into(), &make_vec(d, 0.3), m("GPU memory management")).unwrap();
+        e.insert("a".into(), &make_vec(d, 0.1), m("GPU acceleration tips"))
+            .unwrap();
+        e.insert("b".into(), &make_vec(d, 0.2), m("CPU optimization guide"))
+            .unwrap();
+        e.insert("c".into(), &make_vec(d, 0.3), m("GPU memory management"))
+            .unwrap();
 
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"title": {"$contains": "GPU"}}"#).unwrap();
@@ -4308,7 +4370,10 @@ mod tests {
         let results = e
             .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
             .unwrap();
-        assert!(results.is_empty(), "$contains on non-string field should not match");
+        assert!(
+            results.is_empty(),
+            "$contains on non-string field should not match"
+        );
     }
 
     // ── update_metadata_only ──────────────────────────────────────────────────
@@ -4350,7 +4415,11 @@ mod tests {
 
         let got = e.get("x").unwrap().unwrap();
         assert_eq!(got.document.as_deref(), Some("new doc"));
-        assert_eq!(got.metadata["cat"], json!("a"), "metadata should be preserved");
+        assert_eq!(
+            got.metadata["cat"],
+            json!("a"),
+            "metadata should be preserved"
+        );
     }
 
     #[test]
@@ -4394,7 +4463,8 @@ mod tests {
         let d = 8;
         let mut e = open_default(p, d);
         for i in 0..5u32 {
-            e.insert(format!("id{i}"), &make_vec(d, 0.1), no_meta()).unwrap();
+            e.insert(format!("id{i}"), &make_vec(d, 0.1), no_meta())
+                .unwrap();
         }
         let ids = e.list_with_filter_page(None, None, 0).unwrap();
         assert_eq!(ids.len(), 5);
@@ -4424,9 +4494,12 @@ mod tests {
         m_a.insert("kind".into(), json!("A"));
         let mut m_b = no_meta();
         m_b.insert("kind".into(), json!("B"));
-        e.insert("a1".into(), &make_vec(d, 0.1), m_a.clone()).unwrap();
-        e.insert("b1".into(), &make_vec(d, 0.2), m_b.clone()).unwrap();
-        e.insert("a2".into(), &make_vec(d, 0.3), m_a.clone()).unwrap();
+        e.insert("a1".into(), &make_vec(d, 0.1), m_a.clone())
+            .unwrap();
+        e.insert("b1".into(), &make_vec(d, 0.2), m_b.clone())
+            .unwrap();
+        e.insert("a2".into(), &make_vec(d, 0.3), m_a.clone())
+            .unwrap();
 
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"kind": "A"}"#).unwrap();
@@ -4444,8 +4517,12 @@ mod tests {
         let d = 8;
         let mut e = open_default(p, d);
         for i in 0..5u32 {
-            e.insert(format!("v{i}"), &make_vec(d, 0.1 * i as f64 + 0.1), no_meta())
-                .unwrap();
+            e.insert(
+                format!("v{i}"),
+                &make_vec(d, 0.1 * i as f64 + 0.1),
+                no_meta(),
+            )
+            .unwrap();
         }
         let q1 = make_vec(d, 0.1);
         let q2 = make_vec(d, 0.9);
@@ -4465,4 +4542,3 @@ mod tests {
         assert!(results.is_empty());
     }
 }
-
