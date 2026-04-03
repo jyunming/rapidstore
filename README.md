@@ -180,7 +180,7 @@ results = db.search(query, top_k=10, ann_search_list_size=128)
 
 ## Benchmarks
 
-Full results: **[BENCHMARKS.md](https://github.com/jyunmitch/TurboQuantDB/blob/main/BENCHMARKS.md)**
+Full results: **[BENCHMARKS.md](https://github.com/jyunming/TurboQuantDB/blob/main/BENCHMARKS.md)**
 
 **Windows 11 highlights (50k × 1536, top_k=10, DBpedia OpenAI embeddings):**
 
@@ -267,7 +267,7 @@ cd server && cargo build --release
 TQ_SERVER_ADDR=0.0.0.0:8080 TQ_LOCAL_ROOT=./data ./target/release/turboquantdb-server
 ```
 
-See [`server/README.md`](https://github.com/jyunmitch/TurboQuantDB/blob/main/server/README.md) for endpoints and environment variables. Key env vars:
+See [`server/README.md`](https://github.com/jyunming/TurboQuantDB/blob/main/server/README.md) for endpoints and environment variables. Key env vars:
 
 | Variable | Default | Description |
 |----------|---------|-------------|

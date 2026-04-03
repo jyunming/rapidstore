@@ -27,9 +27,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jyunmitch/TurboQuantDB"
-Repository = "https://github.com/jyunmitch/TurboQuantDB"
-Issues = "https://github.com/jyunmitch/TurboQuantDB/issues"
+Homepage = "https://github.com/jyunming/TurboQuantDB"
+Repository = "https://github.com/jyunming/TurboQuantDB"
+Issues = "https://github.com/jyunming/TurboQuantDB/issues"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
