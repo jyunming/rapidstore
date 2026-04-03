@@ -11,16 +11,19 @@ permissions:
 jobs:
   # ── Linux (manylinux) ───────────────────────────────────────────────────────
   # manylinux containers ship CPython 3.10–3.13; no setup-python needed.
+  # aarch64 uses manylinux_2_28 (GCC 12) because manylinux2014's GCC 4.8 does
+  # not recognise -Wdate-time, which causes libmimalloc-sys to fail to compile.
   linux:
     name: Linux wheels (${{ matrix.target }})
     runs-on: ubuntu-latest
-    # aarch64 cross-compile can fail on mimalloc/GCC manylinux incompatibility;
-    # allow it without blocking the release — x86_64 is the critical target.
-    continue-on-error: ${{ matrix.target == 'aarch64' }}
     strategy:
       fail-fast: false
       matrix:
-        target: [x86_64, aarch64]
+        include:
+          - target: x86_64
+            manylinux: auto
+          - target: aarch64
+            manylinux: "2_28"
     steps:
       - uses: actions/checkout@v4
 
@@ -28,12 +31,11 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          manylinux: auto
+          manylinux: ${{ matrix.manylinux }}
           args: --release --out dist -i 3.10 -i 3.11 -i 3.12 -i 3.13
           sccache: "true"
 
       - uses: actions/upload-artifact@v4
-        if: success()
         with:
           name: wheels-linux-${{ matrix.target }}
           path: dist
