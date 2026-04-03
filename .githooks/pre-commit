@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# TurboQuantDB pre-commit hook
+# Runs fast validation gates before every commit.
+#
+# Install once:
+#   git config core.hooksPath .githooks
+#
+# Or use the pre-commit framework:
+#   pip install pre-commit && pre-commit install
+
+set -euo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+
+pass() { echo -e "${GREEN}✔${NC} $1"; }
+fail() { echo -e "${RED}✗${NC} $1"; exit 1; }
+info() { echo -e "${YELLOW}→${NC} $1"; }
+
+info "Running pre-commit checks..."
+
+# 1. Rust formatting
+info "cargo fmt --check"
+cargo fmt --all -- --check 2>&1 || fail "Rust formatting check failed. Run: cargo fmt --all"
+pass "cargo fmt"
+
+# 2. Rust compile check
+info "cargo check -q"
+cargo check -q 2>&1 || fail "Rust compile check failed."
+pass "cargo check"
+
+# 3. Rust unit tests
+info "cargo test -q --lib"
+cargo test -q --lib 2>&1 || fail "Rust unit tests failed."
+pass "cargo test --lib"
+
+echo -e "\n${GREEN}All pre-commit checks passed.${NC}"

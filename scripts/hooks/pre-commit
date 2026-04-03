@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# TurboQuantDB pre-commit hook
+# Runs fast checks on every commit; runs a performance check when src/ changes.
+#
+# Install once with:  bash scripts/install_hooks.sh
+# Or on Windows:      pwsh scripts/install_hooks.ps1
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+pass() { echo -e "${GREEN}[pre-commit] $*${NC}"; }
+warn() { echo -e "${YELLOW}[pre-commit] $*${NC}"; }
+fail() { echo -e "${RED}[pre-commit] FAIL — $*${NC}"; exit 1; }
+
+# ── 1. Formatting ──────────────────────────────────────────────────────────────
+echo -n "[pre-commit] cargo fmt check ... "
+if ! cargo fmt --all -- --check 2>/dev/null; then
+    echo ""
+    fail "unformatted Rust code. Run: cargo fmt --all"
+fi
+pass "fmt ok"
+
+# ── 2. Compile check ───────────────────────────────────────────────────────────
+echo -n "[pre-commit] cargo check ... "
+if ! cargo check -q 2>/dev/null; then
+    echo ""
+    fail "compilation error"
+fi
+pass "compile ok"
+
+# ── 3. Unit tests ──────────────────────────────────────────────────────────────
+echo -n "[pre-commit] cargo test --lib ... "
+if ! cargo test -q --lib 2>/dev/null; then
+    echo ""
+    fail "unit tests failed"
+fi
+pass "unit tests ok"
+
+# ── 4. Performance check (only when src/ is touched) ─────────────────────────
+SRC_CHANGED=$(git diff --cached --name-only | grep -c '^src/' || true)
+
+if [ "${SRC_CHANGED}" -gt 0 ]; then
+    # Detect python executable
+    PYTHON=""
+    for py in python python3; do
+        if command -v "$py" &>/dev/null && $py -c "import turboquantdb" &>/dev/null 2>&1; then
+            PYTHON="$py"
+            break
+        fi
+    done
+
+    if [ -n "$PYTHON" ]; then
+        echo -n "[pre-commit] perf check (${SRC_CHANGED} src/ file(s) changed) ... "
+        if ! "$PYTHON" benchmarks/precommit_perf_check.py \
+                --baseline benchmarks/perf_baseline.json 2>&1; then
+            exit 1
+        fi
+    else
+        warn "skipping perf check — turboquantdb not installed (run: maturin develop --release)"
+    fi
+else
+    warn "skipping perf check — no src/ files staged"
+fi
+
+pass "all checks passed"

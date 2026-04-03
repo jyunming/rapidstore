@@ -1,1 +1,73 @@
+# Rust build artifacts
 /target
+/target_*/
+
+# Python environments and caches
+/.venv
+/.venv*/
+/.venv311/
+/.hf_home
+/.pydeps
+/.tmp_pip/
+/benchmarks/__pycache__/
+**/__pycache__/
+
+# Wheel builds
+/dist/
+
+# Compiled Python extension (local maturin develop artifacts)
+python/turboquantdb/*.pyd
+python/turboquantdb/*.so
+python/turboquantdb/*.pdb
+
+# Secrets and local config
+.env
+/.claude/
+
+# Temporary probe and test directories
+/tmp/
+/tmp_*/
+/rq_fix_*/
+
+# Benchmark artifacts and result data
+/benchmarks/artifacts*/
+/benchmarks/store_compare_work*/
+/benchmarks/tmp*/
+/benchmarks/*_results*.json
+/benchmarks/*_results_*.json
+/recall_results.json
+
+# Server data
+/server/tenants/
+
+# Test database artifacts
+/.tmp_db/
+/tmp_bench_temp/
+/t/
+
+# Misc
+/build_error.txt
+/C：/
+BENCHMARK_ENGINE_MAP.md
+
+# Internal / local-only docs (not for public repo)
+ASSESSMENT_PAPER_CONFORMANCE.md
+PERF_PLAN.md
+RAM_PLAN.md
+RAM_DIAGNOSTIC_AND_FIX_PLAN.md
+BENCHMARK_GUIDEBOOK.md
+docs/PYTHON_MIGRATION.md
+docs/ROADMAP_BACKLOG.md
+
+# Local benchmark scripts (require external deps / local data paths)
+benchmarks/real_world_bench_v2.py
+benchmarks/scale_matrix_bench.py
+
+# Benchmark output artifacts
+bench_results_*.json
+bench_plots.png
+/dist_tmp/
+coverage.lcov
+.coverage
+
+/test_bench_tmp/

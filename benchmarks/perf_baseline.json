@@ -1,0 +1,11 @@
+{
+  "n": 500,
+  "d": 128,
+  "bits": 4,
+  "k": 10,
+  "queries": 20,
+  "seed": 42,
+  "ingest_vec_per_sec": 12249.6,
+  "search_p50_ms": 2.5621,
+  "recall_at_10": 0.87
+}

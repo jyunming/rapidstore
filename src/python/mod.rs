@@ -1,52 +1,115 @@
 #![allow(unsafe_op_in_unsafe_fn)]
-use numpy::PyReadonlyArray1;
-use pyo3::exceptions::PyValueError;
+use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString};
+use pyo3::types::{PyDict, PyList};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::storage::engine::{BatchWriteItem, DistanceMetric, TurboQuantEngine};
+use crate::storage::engine::{
+    BatchWriteItem, BatchWriteMode, DistanceMetric, GetResult, RerankPrecision, TurboQuantEngine,
+};
 
-/// Thread-safe Python-accessible database handle.
-/// RwLock allows concurrent reads (search) with exclusive writes (insert).
-/// GIL is released during heavy Rust computation via py.allow_threads().
+/// Thread-safe handle to a TurboQuantDB database.
+///
+/// All operations are safe to call from multiple Python threads simultaneously.
+/// Reads are concurrent; writes (insert/delete/index) are serialised by an internal
+/// `RwLock`.
+///
+/// Open or create a database with :meth:`Database.open`.
 #[pyclass]
 pub struct Database {
     engine: Arc<RwLock<TurboQuantEngine>>,
 }
 
-#[pyclass]
-pub struct Client {
-    uri: String,
-    local_dir: String,
-    dimension: usize,
-    bits: usize,
-    seed: u64,
-    metric: DistanceMetric,
-}
-
 #[pymethods]
 impl Database {
-    /// Open or create a RapidStore at the given path.
-    /// `uri` can be a local directory path: "/data/my_db" or cloud URI
-    /// `local_dir` is used for caching remote data and storing local artifacts.
+    /// Open (or create) a TurboQuantDB database at the given directory path.
+    ///
+    /// Args:
+    ///     path: Directory where database files are stored.
+    ///     dimension: Vector dimensionality. Must match on reopen.
+    ///     bits: Quantization bits per coordinate — ``4`` (8× compression, good recall)
+    ///           or ``8`` (4× compression, better recall). Default ``4``.
+    ///     seed: Random seed for the quantizer. Must match on reopen. Default ``42``.
+    ///     metric: Distance metric — ``"ip"`` (inner product), ``"cosine"``,
+    ///             or ``"l2"`` (Euclidean). Fixed at creation. Default ``"ip"``.
+    ///     rerank: Enable reranking of HNSW candidates. Default ``True``.
+    ///     fast_mode: Skip QJL residual quantization (~30 % faster ingest, slightly
+    ///                lower recall). Default ``False``.
+    ///     rerank_precision: Raw-vector reranking precision:
+    ///         - ``None`` (default): dequantization reranking — no extra disk/RAM.
+    ///         - ``"f16"``: store raw vectors as float16 (+n×d×2 bytes), exact reranking.
+    ///         - ``"f32"``: store raw vectors as float32 (+n×d×4 bytes), maximum precision.
+    ///
+    /// Returns:
+    ///     An open :class:`Database` instance.
+    ///
+    /// Example::
+    ///
+    ///     db = Database.open("mydb", dimension=1536, bits=4, metric="cosine")
     #[staticmethod]
-    #[pyo3(signature = (uri, dimension, bits, seed=42, local_dir=None, metric="ip"))]
+    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None))]
     fn open(
-        uri: &str,
+        path: String,
         dimension: usize,
         bits: usize,
         seed: u64,
-        local_dir: Option<&str>,
         metric: &str,
+        rerank: bool,
+        fast_mode: bool,
+        rerank_precision: Option<&str>,
+        collection: Option<&str>,
     ) -> PyResult<Self> {
-        let actual_local = local_dir.unwrap_or(uri);
-        let metric = parse_metric(metric)?;
-        let engine =
-            TurboQuantEngine::open_with_metric(uri, actual_local, dimension, bits, seed, metric)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let engine_path = match collection {
+            Some(col) if !col.is_empty() => {
+                let p = std::path::Path::new(&path).join(col);
+                p.to_string_lossy().into_owned()
+            }
+            _ => path.clone(),
+        };
+        std::fs::create_dir_all(&engine_path)
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+
+        let dist_metric = match metric.to_lowercase().as_str() {
+            "ip" => DistanceMetric::Ip,
+            "cosine" => DistanceMetric::Cosine,
+            "l2" => DistanceMetric::L2,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid metric: {}",
+                    metric
+                )));
+            }
+        };
+
+        let precision = match rerank_precision.map(|s| s.to_lowercase()) {
+            None => RerankPrecision::Disabled,
+            Some(ref s) if s == "none" || s == "disabled" || s == "dequant" => {
+                RerankPrecision::Disabled
+            }
+            Some(ref s) if s == "f16" || s == "half" => RerankPrecision::F16,
+            Some(ref s) if s == "f32" || s == "float" || s == "full" => RerankPrecision::F32,
+            Some(ref s) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid rerank_precision: '{}'. Use 'f16', 'f32', or None (dequant reranking).",
+                    s
+                )));
+            }
+        };
+
+        let engine = TurboQuantEngine::open_with_options(
+            &engine_path,
+            &engine_path,
+            dimension,
+            bits,
+            seed,
+            dist_metric,
+            rerank,
+            fast_mode,
+            precision,
+        )
+        .map_err(to_py_runtime)?;
         Ok(Self {
             engine: Arc::new(RwLock::new(engine)),
         })
@@ -58,293 +121,295 @@ impl Database {
         &self,
         py: Python<'_>,
         id: String,
-        vector: PyReadonlyArray1<f64>,
+        vector: PyObject,
         metadata: Option<&Bound<'_, PyDict>>,
         document: Option<String>,
     ) -> PyResult<()> {
-        let vec = vector.as_array().to_owned();
-        let props = parse_pydict(py, metadata)?;
-
+        let vec = if let Ok(v) = vector.extract::<PyReadonlyArray1<f32>>(py) {
+            v.as_array().mapv(|x| x as f64)
+        } else {
+            vector
+                .extract::<PyReadonlyArray1<f64>>(py)?
+                .as_array()
+                .to_owned()
+        };
+        let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
             let mut engine = self.engine.write().unwrap();
             engine
                 .insert_with_document(id, &vec, props, document)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+                .map_err(to_py_runtime)
         })
     }
 
-    /// Batch insert vectors. Lengths of ids/vectors/metadatas/documents must match.
-    #[pyo3(signature = (ids, vectors, metadatas=None, documents=None))]
-    fn insert_many(
+    #[pyo3(signature = (ids, vectors, metadatas=None, documents=None, mode="insert"))]
+    fn insert_batch(
         &self,
         py: Python<'_>,
         ids: Vec<String>,
-        vectors: Vec<PyReadonlyArray1<f64>>,
-        metadatas: Option<Vec<Bound<'_, PyDict>>>,
-        documents: Option<Vec<Option<String>>>,
+        vectors: PyObject,
+        metadatas: Option<&Bound<'_, PyAny>>,
+        documents: Option<&Bound<'_, PyAny>>,
+        mode: &str,
     ) -> PyResult<()> {
-        let items = build_batch_items(py, ids, vectors, metadatas, documents)?;
-        py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
-            engine
-                .insert_many(items)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-        })
+        let b_mode = match mode.to_lowercase().as_str() {
+            "insert" => BatchWriteMode::Insert,
+            "update" => BatchWriteMode::Update,
+            "upsert" => BatchWriteMode::Upsert,
+            _ => return Err(pyo3::exceptions::PyValueError::new_err("Invalid mode")),
+        };
+
+        if let Ok(v32) = vectors.extract::<PyReadonlyArray2<f32>>(py) {
+            let matrix = v32.as_array();
+            if ids.len() != matrix.nrows() {
+                return Err(pyo3::exceptions::PyValueError::new_err("mismatch"));
+            }
+            let metas = parse_metadata_rows(metadatas, ids.len())?;
+            let docs = parse_document_rows(documents, ids.len())?;
+
+            let chunk_size = 2000;
+            for i in (0..ids.len()).step_by(chunk_size) {
+                let end = (i + chunk_size).min(ids.len());
+                let mut chunk_items = Vec::with_capacity(end - i);
+                for j in i..end {
+                    chunk_items.push(BatchWriteItem {
+                        id: ids[j].clone(),
+                        vector: matrix.row(j).to_vec(),
+                        metadata: metas[j].clone(),
+                        document: docs[j].clone(),
+                    });
+                }
+                py.allow_threads(|| {
+                    let mut engine = self.engine.write().unwrap();
+                    engine
+                        .insert_many_with_mode(chunk_items, b_mode)
+                        .map_err(to_py_runtime)
+                })?;
+            }
+        } else {
+            let v64 = vectors.extract::<PyReadonlyArray2<f64>>(py)?;
+            let matrix = v64.as_array();
+            if ids.len() != matrix.nrows() {
+                return Err(pyo3::exceptions::PyValueError::new_err("mismatch"));
+            }
+            let metas = parse_metadata_rows(metadatas, ids.len())?;
+            let docs = parse_document_rows(documents, ids.len())?;
+
+            let chunk_size = 2000;
+            for i in (0..ids.len()).step_by(chunk_size) {
+                let end = (i + chunk_size).min(ids.len());
+                let mut chunk_items = Vec::with_capacity(end - i);
+                for j in i..end {
+                    chunk_items.push(BatchWriteItem {
+                        id: ids[j].clone(),
+                        vector: matrix.row(j).iter().map(|&x| x as f32).collect(),
+                        metadata: metas[j].clone(),
+                        document: docs[j].clone(),
+                    });
+                }
+                py.allow_threads(|| {
+                    let mut engine = self.engine.write().unwrap();
+                    engine
+                        .insert_many_with_mode(chunk_items, b_mode)
+                        .map_err(to_py_runtime)
+                })?;
+            }
+        }
+        Ok(())
     }
 
-    /// Batch insert with per-item failure reporting (continues on errors).
-    #[pyo3(signature = (ids, vectors, metadatas=None, documents=None))]
-    fn insert_many_report(
-        &self,
-        py: Python<'_>,
-        ids: Vec<String>,
-        vectors: Vec<PyReadonlyArray1<f64>>,
-        metadatas: Option<Vec<Bound<'_, PyDict>>>,
-        documents: Option<Vec<Option<String>>>,
-    ) -> PyResult<PyObject> {
-        let items = build_batch_items(py, ids, vectors, metadatas, documents)?;
-        let report = py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
-            engine.insert_many_report(items)
-        });
-        batch_report_to_py(py, report)
-    }
-
-    /// Collection-first alias: add many embeddings/documents by IDs.
-    #[pyo3(signature = (ids, embeddings, metadatas=None, documents=None))]
-    fn add(
-        &self,
-        py: Python<'_>,
-        ids: Vec<String>,
-        embeddings: Vec<PyReadonlyArray1<f64>>,
-        metadatas: Option<Vec<Bound<'_, PyDict>>>,
-        documents: Option<Vec<Option<String>>>,
-    ) -> PyResult<()> {
-        let items = build_batch_items(py, ids, embeddings, metadatas, documents)?;
-        py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
-            engine
-                .insert_many(items)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-        })
-    }
-
-    /// Upsert a single vector with optional metadata and document.
-    #[pyo3(signature = (id, vector, metadata=None, document=None))]
     fn upsert(
         &self,
         py: Python<'_>,
         id: String,
-        vector: PyReadonlyArray1<f64>,
+        vector: PyObject,
         metadata: Option<&Bound<'_, PyDict>>,
         document: Option<String>,
     ) -> PyResult<()> {
-        let vec = vector.as_array().to_owned();
-        let props = parse_pydict(py, metadata)?;
-
+        let vec = if let Ok(v) = vector.extract::<PyReadonlyArray1<f32>>(py) {
+            v.as_array().mapv(|x| x as f64)
+        } else {
+            vector
+                .extract::<PyReadonlyArray1<f64>>(py)?
+                .as_array()
+                .to_owned()
+        };
+        let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
             let mut engine = self.engine.write().unwrap();
             engine
                 .upsert_with_document(id, &vec, props, document)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+                .map_err(to_py_runtime)
         })
     }
 
-    /// Batch upsert vectors. Lengths of ids/vectors/metadatas/documents must match.
-    #[pyo3(signature = (ids, vectors, metadatas=None, documents=None))]
-    fn upsert_many(
-        &self,
-        py: Python<'_>,
-        ids: Vec<String>,
-        vectors: Vec<PyReadonlyArray1<f64>>,
-        metadatas: Option<Vec<Bound<'_, PyDict>>>,
-        documents: Option<Vec<Option<String>>>,
-    ) -> PyResult<()> {
-        let items = build_batch_items(py, ids, vectors, metadatas, documents)?;
-        py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
-            engine
-                .upsert_many(items)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-        })
-    }
-
-    /// Batch upsert with per-item failure reporting (continues on errors).
-    #[pyo3(signature = (ids, vectors, metadatas=None, documents=None))]
-    fn upsert_many_report(
-        &self,
-        py: Python<'_>,
-        ids: Vec<String>,
-        vectors: Vec<PyReadonlyArray1<f64>>,
-        metadatas: Option<Vec<Bound<'_, PyDict>>>,
-        documents: Option<Vec<Option<String>>>,
-    ) -> PyResult<PyObject> {
-        let items = build_batch_items(py, ids, vectors, metadatas, documents)?;
-        let report = py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
-            engine.upsert_many_report(items)
-        });
-        batch_report_to_py(py, report)
-    }
-
-    /// Update an existing vector, metadata, and optional document.
-    #[pyo3(signature = (id, vector, metadata=None, document=None))]
     fn update(
         &self,
         py: Python<'_>,
         id: String,
-        vector: PyReadonlyArray1<f64>,
+        vector: PyObject,
         metadata: Option<&Bound<'_, PyDict>>,
         document: Option<String>,
     ) -> PyResult<()> {
-        let vec = vector.as_array().to_owned();
-        let props = parse_pydict(py, metadata)?;
-
+        let vec = if let Ok(v) = vector.extract::<PyReadonlyArray1<f32>>(py) {
+            v.as_array().mapv(|x| x as f64)
+        } else {
+            vector
+                .extract::<PyReadonlyArray1<f64>>(py)?
+                .as_array()
+                .to_owned()
+        };
+        let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
             let mut engine = self.engine.write().unwrap();
             engine
                 .update_with_document(id, &vec, props, document)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+                .map_err(to_py_runtime)
         })
     }
 
-    /// Batch update vectors. Lengths of ids/vectors/metadatas/documents must match.
-    #[pyo3(signature = (ids, vectors, metadatas=None, documents=None))]
-    fn update_many(
-        &self,
-        py: Python<'_>,
-        ids: Vec<String>,
-        vectors: Vec<PyReadonlyArray1<f64>>,
-        metadatas: Option<Vec<Bound<'_, PyDict>>>,
-        documents: Option<Vec<Option<String>>>,
-    ) -> PyResult<()> {
-        let items = build_batch_items(py, ids, vectors, metadatas, documents)?;
-        py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
-            engine
-                .update_many(items)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-        })
-    }
-
-    /// Batch update with per-item failure reporting (continues on errors).
-    #[pyo3(signature = (ids, vectors, metadatas=None, documents=None))]
-    fn update_many_report(
-        &self,
-        py: Python<'_>,
-        ids: Vec<String>,
-        vectors: Vec<PyReadonlyArray1<f64>>,
-        metadatas: Option<Vec<Bound<'_, PyDict>>>,
-        documents: Option<Vec<Option<String>>>,
-    ) -> PyResult<PyObject> {
-        let items = build_batch_items(py, ids, vectors, metadatas, documents)?;
-        let report = py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
-            engine.update_many_report(items)
-        });
-        batch_report_to_py(py, report)
-    }
-
-    /// Delete by ID, returning True when a live record was deleted.
     fn delete(&self, py: Python<'_>, id: String) -> PyResult<bool> {
         py.allow_threads(|| {
             let mut engine = self.engine.write().unwrap();
-            engine
-                .delete(id)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            engine.delete(id).map_err(to_py_runtime)
         })
     }
 
-    /// Fetch one record by ID.
-    /// `include` supports: ids, metadatas, documents.
-    #[pyo3(signature = (id, include_document=true, include=None))]
-    fn get(
-        &self,
-        py: Python<'_>,
-        id: String,
-        include_document: bool,
-        include: Option<Vec<String>>,
-    ) -> PyResult<PyObject> {
-        let result = py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
-            engine
-                .get(&id)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-        })?;
-        let include_set = parse_include_set(include, &["ids", "metadatas", "documents"]);
-        let include_documents = include_document && include_set.contains("documents");
-
-        if let Some(r) = result {
-            let dict = PyDict::new_bound(py);
-            if include_set.contains("ids") {
-                dict.set_item("id", r.id)?;
-            }
-            if include_set.contains("metadatas") {
-                let meta_dict = PyDict::new_bound(py);
-                for (k, v) in &r.metadata {
-                    meta_dict.set_item(k, json_to_py(py, v)?)?;
-                }
-                dict.set_item("metadata", meta_dict)?;
-            }
-            if include_documents {
-                if let Some(doc) = r.document {
-                    dict.set_item("document", doc)?;
-                } else {
-                    dict.set_item("document", py.None())?;
-                }
-            }
-            Ok(dict.into())
-        } else {
-            Ok(py.None())
-        }
+    /// Delete multiple vectors in a single call.
+    ///
+    /// Args:
+    ///     ids: List of IDs to delete. IDs not present are silently skipped.
+    ///
+    /// Returns:
+    ///     The number of vectors that were found and deleted.
+    ///
+    /// Example::
+    ///
+    ///     deleted = db.delete_batch(["id1", "id2", "id3"])
+    fn delete_batch(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<usize> {
+        py.allow_threads(|| {
+            let mut engine = self.engine.write().unwrap();
+            engine.delete_batch(ids).map_err(to_py_runtime)
+        })
     }
 
-    /// Fetch multiple IDs and return found records.
-    /// Deterministic pagination is applied over the input ID order.
-    /// `include` supports: ids, metadatas, documents.
-    #[pyo3(signature = (ids, include_document=true, offset=0, limit=None, include=None))]
-    fn get_many(
+    /// Count vectors matching an optional metadata filter.
+    ///
+    /// When called without a filter this is O(1) and equivalent to
+    /// ``db.stats()["vector_count"]``. With a filter it performs an O(n)
+    /// scan and returns the number of matching active vectors.
+    ///
+    /// Args:
+    ///     filter: Optional metadata filter dict using the same syntax as
+    ///             :meth:`search`.
+    ///
+    /// Returns:
+    ///     Integer count of matching vectors.
+    ///
+    /// Example::
+    ///
+    ///     total = db.count()
+    ///     ml_docs = db.count(filter={"topic": "ml"})
+    ///     recent = db.count(filter={"year": {"$gte": 2023}})
+    #[pyo3(signature = (filter=None))]
+    fn count(&self, py: Python<'_>, filter: Option<&Bound<'_, PyDict>>) -> PyResult<usize> {
+        let parsed_filter = parse_pydict(filter)?;
+        let filter_ref = if parsed_filter.is_empty() {
+            None
+        } else {
+            Some(&parsed_filter)
+        };
+        py.allow_threads(|| {
+            let engine = self.engine.read().unwrap();
+            engine.count_with_filter(filter_ref).map_err(to_py_runtime)
+        })
+    }
+
+    fn get(&self, py: Python<'_>, id: String) -> PyResult<Option<PyObject>> {
+        let got = py.allow_threads(|| {
+            let engine = self.engine.read().unwrap();
+            engine.get(&id).map_err(to_py_runtime)
+        })?;
+        Ok(match got {
+            Some(g) => Some(get_result_to_py(py, &g)?),
+            None => None,
+        })
+    }
+
+    fn get_many(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<PyObject> {
+        let results = py.allow_threads(|| {
+            let engine = self.engine.read().unwrap();
+            engine.get_many(&ids).map_err(to_py_runtime)
+        })?;
+        let py_list = PyList::empty_bound(py);
+        for r in results {
+            match r {
+                Some(g) => py_list.append(get_result_to_py(py, &g)?)?,
+                None => py_list.append(py.None())?,
+            }
+        }
+        Ok(py_list.into())
+    }
+
+    fn list_all(&self, _py: Python<'_>) -> PyResult<Vec<String>> {
+        let engine = self.engine.read().unwrap();
+        Ok(engine.list_all())
+    }
+
+    #[pyo3(signature = (query, top_k, filter=None, _use_ann=true, ann_search_list_size=None, include=None))]
+    fn search(
         &self,
         py: Python<'_>,
-        ids: Vec<String>,
-        include_document: bool,
-        offset: usize,
-        limit: Option<usize>,
+        query: PyObject,
+        top_k: usize,
+        filter: Option<&Bound<'_, PyDict>>,
+        _use_ann: bool,
+        ann_search_list_size: Option<usize>,
         include: Option<Vec<String>>,
     ) -> PyResult<PyObject> {
-        let mut result = py.allow_threads(|| {
+        let q = if let Ok(v) = query.extract::<PyReadonlyArray1<f32>>(py) {
+            v.as_array().mapv(|x| x as f64)
+        } else {
+            query
+                .extract::<PyReadonlyArray1<f64>>(py)?
+                .as_array()
+                .to_owned()
+        };
+        let parsed_filter = parse_pydict(filter)?;
+        let filter_ref = if parsed_filter.is_empty() {
+            None
+        } else {
+            Some(&parsed_filter)
+        };
+
+        let inc = parse_include_set(include, &["id", "score", "metadata", "document"]);
+
+        let results = py.allow_threads(|| {
             let engine = self.engine.read().unwrap();
             engine
-                .get_many(&ids)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+                .search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size)
+                .map_err(to_py_runtime)
         })?;
-        if offset > 0 {
-            result = result.into_iter().skip(offset).collect();
-        }
-        if let Some(lim) = limit {
-            result.truncate(lim);
-        }
-        let include_set = parse_include_set(include, &["ids", "metadatas", "documents"]);
-        let include_documents = include_document && include_set.contains("documents");
 
         let py_list = PyList::empty_bound(py);
-        for r in result {
+        for r in results {
             let dict = PyDict::new_bound(py);
-            if include_set.contains("ids") {
-                dict.set_item("id", r.id)?;
+            if inc.contains("id") {
+                dict.set_item("id", &r.id)?;
             }
-            if include_set.contains("metadatas") {
+            if inc.contains("score") {
+                dict.set_item("score", r.score)?;
+            }
+            if inc.contains("metadata") {
                 let meta_dict = PyDict::new_bound(py);
-                for (k, v) in &r.metadata {
-                    meta_dict.set_item(k, json_to_py(py, v)?)?;
+                for (k, v) in r.metadata {
+                    meta_dict.set_item(k, json_to_py(py, &v)?)?;
                 }
                 dict.set_item("metadata", meta_dict)?;
             }
-            if include_documents {
+            if inc.contains("document") {
                 if let Some(doc) = r.document {
                     dict.set_item("document", doc)?;
-                } else {
-                    dict.set_item("document", py.None())?;
                 }
             }
             py_list.append(dict)?;
@@ -352,351 +417,30 @@ impl Database {
         Ok(py_list.into())
     }
 
-    /// Delete multiple IDs, returns number of deleted live records.
-    fn delete_many(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<usize> {
-        py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
-            engine
-                .delete_many(&ids)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-        })
-    }
-
-    /// Create a Vamana ANN index for fast retrieval.
-    #[pyo3(signature = (max_degree=64, search_list_size=100, alpha=1.2))]
+    #[pyo3(signature = (max_degree=None, ef_construction=None, search_list_size=None, alpha=None, n_refinements=None))]
     fn create_index(
         &self,
         py: Python<'_>,
-        max_degree: usize,
-        search_list_size: usize,
-        alpha: f64,
+        max_degree: Option<usize>,
+        ef_construction: Option<usize>,
+        search_list_size: Option<usize>,
+        alpha: Option<f64>,
+        n_refinements: Option<usize>,
     ) -> PyResult<()> {
         py.allow_threads(|| {
             let mut engine = self.engine.write().unwrap();
             engine
-                .create_index_with_params(max_degree, search_list_size, alpha)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-        })
-    }
-
-    /// Search for the top_k most similar vectors. Returns a list of dicts.
-    #[pyo3(signature = (query, top_k, where_filter=None, include_document=true, ann_search_list_size=None))]
-    fn search(
-        &self,
-        py: Python<'_>,
-        query: PyReadonlyArray1<f64>,
-        top_k: usize,
-        where_filter: Option<&Bound<'_, PyDict>>,
-        include_document: bool,
-        ann_search_list_size: Option<usize>,
-    ) -> PyResult<PyObject> {
-        let q = query.as_array().to_owned();
-        let where_props = parse_pydict(py, where_filter)?;
-
-        let results = py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
-            let filter_ref = if where_props.is_empty() {
-                None
-            } else {
-                Some(&where_props)
-            };
-            engine
-                .search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-        })?;
-
-        let py_list = PyList::empty_bound(py);
-        for r in results {
-            let dict = PyDict::new_bound(py);
-            dict.set_item("id", &r.id)?;
-            dict.set_item("score", r.score)?;
-            let meta_dict = PyDict::new_bound(py);
-            for (k, v) in &r.metadata {
-                meta_dict.set_item(k, json_to_py(py, v)?)?;
-            }
-            dict.set_item("metadata", meta_dict)?;
-            if include_document {
-                if let Some(doc) = r.document {
-                    dict.set_item("document", doc)?;
-                } else {
-                    dict.set_item("document", py.None())?;
-                }
-            }
-            py_list.append(dict)?;
-        }
-        Ok(py_list.into())
-    }
-
-    /// Hybrid search with dense vector similarity + sparse BM25-like text relevance.
-    #[pyo3(signature = (query, query_text, top_k, where_filter=None, dense_weight=0.7, sparse_weight=0.3, include_document=true))]
-    fn search_hybrid(
-        &self,
-        py: Python<'_>,
-        query: PyReadonlyArray1<f64>,
-        query_text: String,
-        top_k: usize,
-        where_filter: Option<&Bound<'_, PyDict>>,
-        dense_weight: f64,
-        sparse_weight: f64,
-        include_document: bool,
-    ) -> PyResult<PyObject> {
-        let q = query.as_array().to_owned();
-        let where_props = parse_pydict(py, where_filter)?;
-
-        let results = py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
-            let filter_ref = if where_props.is_empty() {
-                None
-            } else {
-                Some(&where_props)
-            };
-            engine
-                .search_hybrid_with_filter(
-                    &q,
-                    &query_text,
-                    top_k,
-                    filter_ref,
-                    dense_weight,
-                    sparse_weight,
+                .create_index_with_params(
+                    max_degree.unwrap_or(32),
+                    ef_construction.unwrap_or(200),
+                    search_list_size.unwrap_or(128),
+                    alpha.unwrap_or(1.2),
+                    n_refinements.unwrap_or(5),
                 )
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-        })?;
-
-        let py_list = PyList::empty_bound(py);
-        for r in results {
-            let dict = PyDict::new_bound(py);
-            dict.set_item("id", &r.id)?;
-            dict.set_item("score", r.score)?;
-            let meta_dict = PyDict::new_bound(py);
-            for (k, v) in &r.metadata {
-                meta_dict.set_item(k, json_to_py(py, v)?)?;
-            }
-            dict.set_item("metadata", meta_dict)?;
-            if include_document {
-                if let Some(doc) = r.document {
-                    dict.set_item("document", doc)?;
-                } else {
-                    dict.set_item("document", py.None())?;
-                }
-            }
-            py_list.append(dict)?;
-        }
-        Ok(py_list.into())
-    }
-
-    /// Dense search followed by user-provided reranker callback on top-N candidates.
-    /// Callback receives a result dict and must return a numeric score.
-    #[pyo3(signature = (query, top_k, reranker, rerank_top_n=None, where_filter=None, include_document=true, ann_search_list_size=None))]
-    fn search_rerank(
-        &self,
-        py: Python<'_>,
-        query: PyReadonlyArray1<f64>,
-        top_k: usize,
-        reranker: &Bound<'_, PyAny>,
-        rerank_top_n: Option<usize>,
-        where_filter: Option<&Bound<'_, PyDict>>,
-        include_document: bool,
-        ann_search_list_size: Option<usize>,
-    ) -> PyResult<PyObject> {
-        let q = query.as_array().to_owned();
-        let where_props = parse_pydict(py, where_filter)?;
-        let n = rerank_top_n.unwrap_or(top_k.max(10));
-
-        let mut results = {
-            let engine = self.engine.read().unwrap();
-            let filter_ref = if where_props.is_empty() {
-                None
-            } else {
-                Some(&where_props)
-            };
-            engine
-                .search_with_filter_and_ann(&q, n, filter_ref, ann_search_list_size)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
-        };
-
-        for r in &mut results {
-            let dict = PyDict::new_bound(py);
-            dict.set_item("id", &r.id)?;
-            dict.set_item("score", r.score)?;
-            let meta_dict = PyDict::new_bound(py);
-            for (k, v) in &r.metadata {
-                meta_dict.set_item(k, json_to_py(py, v)?)?;
-            }
-            dict.set_item("metadata", meta_dict)?;
-            if include_document {
-                if let Some(doc) = &r.document {
-                    dict.set_item("document", doc)?;
-                } else {
-                    dict.set_item("document", py.None())?;
-                }
-            }
-            let out = reranker.call1((dict,))?;
-            let new_score: f64 = out.extract()?;
-            r.score = new_score;
-        }
-
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        results.truncate(top_k);
-
-        let py_list = PyList::empty_bound(py);
-        for r in results {
-            let dict = PyDict::new_bound(py);
-            dict.set_item("id", &r.id)?;
-            dict.set_item("score", r.score)?;
-            let meta_dict = PyDict::new_bound(py);
-            for (k, v) in &r.metadata {
-                meta_dict.set_item(k, json_to_py(py, v)?)?;
-            }
-            dict.set_item("metadata", meta_dict)?;
-            if include_document {
-                if let Some(doc) = r.document {
-                    dict.set_item("document", doc)?;
-                } else {
-                    dict.set_item("document", py.None())?;
-                }
-            }
-            py_list.append(dict)?;
-        }
-
-        Ok(py_list.into())
-    }
-
-    /// Collection-first query API.
-    /// Returns a dict with list-per-query fields, similar to common vector DB clients.
-    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, include=None, offset=0, ann_search_list_size=None))]
-    fn query(
-        &self,
-        py: Python<'_>,
-        query_embeddings: Vec<PyReadonlyArray1<f64>>,
-        n_results: usize,
-        where_filter: Option<&Bound<'_, PyDict>>,
-        include: Option<Vec<String>>,
-        offset: usize,
-        ann_search_list_size: Option<usize>,
-    ) -> PyResult<PyObject> {
-        let queries: Vec<_> = query_embeddings
-            .into_iter()
-            .map(|q| q.as_array().to_owned())
-            .collect();
-        let where_props = parse_pydict(py, where_filter)?;
-        let include_set = parse_include_set(include, &["ids", "scores", "metadatas", "documents"]);
-        let candidate_n = n_results.saturating_add(offset);
-
-        let results_per_query = py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
-            let mut out = Vec::with_capacity(queries.len());
-            for q in &queries {
-                let hits = if where_props.is_empty() {
-                    engine.search_with_filter_and_ann(q, candidate_n, None, ann_search_list_size)
-                } else {
-                    engine.search_with_filter_and_ann(
-                        q,
-                        candidate_n,
-                        Some(&where_props),
-                        ann_search_list_size,
-                    )
-                }
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-                let mut page: Vec<_> = hits.into_iter().skip(offset).collect();
-                page.truncate(n_results);
-                out.push(page);
-            }
-            Ok::<_, PyErr>(out)
-        })?;
-
-        let out = PyDict::new_bound(py);
-        if include_set.contains("ids") {
-            let ids_outer = PyList::empty_bound(py);
-            for hits in &results_per_query {
-                let ids = PyList::empty_bound(py);
-                for h in hits {
-                    ids.append(&h.id)?;
-                }
-                ids_outer.append(ids)?;
-            }
-            out.set_item("ids", ids_outer)?;
-        }
-        if include_set.contains("scores") {
-            let scores_outer = PyList::empty_bound(py);
-            for hits in &results_per_query {
-                let scores = PyList::empty_bound(py);
-                for h in hits {
-                    scores.append(h.score)?;
-                }
-                scores_outer.append(scores)?;
-            }
-            out.set_item("scores", scores_outer)?;
-        }
-        if include_set.contains("metadatas") {
-            let metas_outer = PyList::empty_bound(py);
-            for hits in &results_per_query {
-                let metas = PyList::empty_bound(py);
-                for h in hits {
-                    let d = PyDict::new_bound(py);
-                    for (k, v) in &h.metadata {
-                        d.set_item(k, json_to_py(py, v)?)?;
-                    }
-                    metas.append(d)?;
-                }
-                metas_outer.append(metas)?;
-            }
-            out.set_item("metadatas", metas_outer)?;
-        }
-        if include_set.contains("documents") {
-            let docs_outer = PyList::empty_bound(py);
-            for hits in &results_per_query {
-                let docs = PyList::empty_bound(py);
-                for h in hits {
-                    if let Some(doc) = &h.document {
-                        docs.append(doc)?;
-                    } else {
-                        docs.append(py.None())?;
-                    }
-                }
-                docs_outer.append(docs)?;
-            }
-            out.set_item("documents", docs_outer)?;
-        }
-
-        Ok(out.into())
-    }
-
-    /// Flush all buffered WAL entries to disk segments.
-    fn flush(&self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
-            engine
-                .flush_wal_to_segment()
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+                .map_err(to_py_runtime)
         })
     }
 
-    /// Close the database, flushing remaining buffers.
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
-            engine
-                .close()
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-        })
-    }
-
-    /// Consolidate segments for better performance.
-    fn compact(&self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
-            engine
-                .compact()
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-        })
-    }
-
-    /// Return database statistics as a dict.
     fn stats(&self, py: Python<'_>) -> PyResult<PyObject> {
         let stats = {
             let engine = self.engine.read().unwrap();
@@ -704,153 +448,357 @@ impl Database {
         };
         let dict = PyDict::new_bound(py);
         dict.set_item("vector_count", stats.vector_count)?;
-        dict.set_item("physical_record_count", stats.physical_record_count)?;
-        dict.set_item("deleted_record_count", stats.deleted_record_count)?;
         dict.set_item("segment_count", stats.segment_count)?;
         dict.set_item("buffered_vectors", stats.buffered_vectors)?;
         dict.set_item("dimension", stats.d)?;
         dict.set_item("bits", stats.b)?;
         dict.set_item("total_disk_bytes", stats.total_disk_bytes)?;
-        match stats.segment_min_bytes {
-            Some(v) => dict.set_item("segment_min_bytes", v)?,
-            None => dict.set_item("segment_min_bytes", py.None())?,
-        }
-        match stats.segment_max_bytes {
-            Some(v) => dict.set_item("segment_max_bytes", v)?,
-            None => dict.set_item("segment_max_bytes", py.None())?,
-        }
-        match stats.segment_avg_bytes {
-            Some(v) => dict.set_item("segment_avg_bytes", v)?,
-            None => dict.set_item("segment_avg_bytes", py.None())?,
-        }
-        match stats.segment_skew_ratio {
-            Some(v) => dict.set_item("segment_skew_ratio", v)?,
-            None => dict.set_item("segment_skew_ratio", py.None())?,
-        }
         dict.set_item("has_index", stats.has_index)?;
         dict.set_item("index_nodes", stats.index_nodes)?;
-        dict.set_item("compaction_runs", stats.compaction_runs)?;
-        dict.set_item("compaction_recovery_runs", stats.compaction_recovery_runs)?;
-        dict.set_item("last_reclaimed_segments", stats.last_reclaimed_segments)?;
-        if let Some(v) = stats.index_search_list_size {
-            dict.set_item("index_search_list_size", v)?;
-        } else {
-            dict.set_item("index_search_list_size", py.None())?;
-        }
-        if let Some(v) = stats.index_alpha {
-            dict.set_item("index_alpha", v)?;
-        } else {
-            dict.set_item("index_alpha", py.None())?;
-        }
+        dict.set_item("live_codes_bytes", stats.live_codes_bytes)?;
+        dict.set_item("live_slot_count", stats.live_slot_count)?;
+        dict.set_item("live_id_count", stats.live_id_count)?;
+        dict.set_item("live_vectors_count", stats.live_vectors_count)?;
+        dict.set_item(
+            "live_vectors_bytes_estimate",
+            stats.live_vectors_bytes_estimate,
+        )?;
+        dict.set_item("metadata_entries", stats.metadata_entries)?;
+        dict.set_item("metadata_bytes_estimate", stats.metadata_bytes_estimate)?;
+        dict.set_item("ann_slot_count", stats.ann_slot_count)?;
+        dict.set_item("graph_nodes", stats.graph_nodes)?;
+        // Computed estimate: in-memory footprint across all major buffers.
+        let ram_estimate_bytes = stats.live_codes_bytes
+            + stats.live_vectors_bytes_estimate
+            + stats.metadata_bytes_estimate;
+        dict.set_item("ram_estimate_bytes", ram_estimate_bytes)?;
         Ok(dict.into())
     }
 
-    fn __len__(&self) -> PyResult<usize> {
-        let count = self.engine.read().unwrap().vector_count();
-        Ok(count as usize)
-    }
-
-    fn __repr__(&self) -> PyResult<String> {
-        let engine = self.engine.read().unwrap();
-        Ok(format!(
-            "RapidStore(d={}, b={}, vectors={})",
-            engine.d,
-            engine.b,
-            engine.vector_count()
-        ))
-    }
-}
-
-#[pymethods]
-impl Client {
-    #[new]
-    #[pyo3(signature = (uri, dimension, bits, seed=42, local_dir=None, metric="ip"))]
-    fn new(
-        uri: String,
-        dimension: usize,
-        bits: usize,
-        seed: u64,
-        local_dir: Option<String>,
-        metric: &str,
-    ) -> PyResult<Self> {
-        Ok(Self {
-            local_dir: local_dir.unwrap_or_else(|| uri.clone()),
-            uri,
-            dimension,
-            bits,
-            seed,
-            metric: parse_metric(metric)?,
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| {
+            let mut engine = self.engine.write().unwrap();
+            engine.flush_wal_to_segment().map_err(to_py_runtime)
         })
     }
 
-    fn create_collection(&self, name: String) -> PyResult<Database> {
-        TurboQuantEngine::create_collection_with_uri(&self.uri, &self.local_dir, &name)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        self.open_collection(name)
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| {
+            let mut engine = self.engine.write().unwrap();
+            engine.close().map_err(to_py_runtime)
+        })
     }
 
-    fn get_collection(&self, name: String) -> PyResult<Option<Database>> {
-        let exists = TurboQuantEngine::get_collection_with_uri(&self.uri, &self.local_dir, &name)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
-            .is_some();
-        if !exists {
-            Ok(None)
+    /// `len(db)` — total number of active vectors.
+    fn __len__(&self) -> PyResult<usize> {
+        let engine = self.engine.read().unwrap();
+        engine.count_with_filter(None).map_err(to_py_runtime)
+    }
+
+    /// `id in db` — True if the ID exists in the database.
+    fn __contains__(&self, py: Python<'_>, id: String) -> PyResult<bool> {
+        py.allow_threads(|| {
+            let engine = self.engine.read().unwrap();
+            engine.get(&id).map(|r| r.is_some()).map_err(to_py_runtime)
+        })
+    }
+
+    /// Update metadata and/or document for an existing ID without re-uploading
+    /// the vector.  The quantised representation is untouched.
+    ///
+    /// Args:
+    ///     id: ID to update. Raises ``RuntimeError`` if not found.
+    ///     metadata: New metadata dict, or ``None`` to preserve existing.
+    ///     document: New document string, or ``None`` to preserve existing.
+    ///
+    /// Example::
+    ///
+    ///     db.update_metadata("doc-1", metadata={"status": "published"})
+    ///     db.update_metadata("doc-1", document="updated text")
+    #[pyo3(signature = (id, metadata=None, document=None))]
+    fn update_metadata(
+        &self,
+        py: Python<'_>,
+        id: String,
+        metadata: Option<&Bound<'_, PyDict>>,
+        document: Option<String>,
+    ) -> PyResult<()> {
+        let props = parse_pydict(metadata)?;
+        py.allow_threads(|| {
+            let mut engine = self.engine.write().unwrap();
+            engine
+                .update_metadata_only(&id, props, document)
+                .map_err(to_py_runtime)
+        })
+    }
+
+    /// Search with multiple query vectors in one call.
+    ///
+    /// Args:
+    ///     query_embeddings: 2-D array of shape ``(N, D)``.
+    ///     n_results: Number of results per query. Default 10.
+    ///     where_filter: Optional metadata filter (same syntax as :meth:`search`).
+    ///     _use_ann: Use HNSW index if available. Default ``True``.
+    ///     ann_search_list_size: HNSW ef_search override.
+    ///
+    /// Returns:
+    ///     List of N result lists, each in the same format as :meth:`search`.
+    ///
+    /// Example::
+    ///
+    ///     all_results = db.query(
+    ///         query_embeddings=np.stack([q1, q2, q3]),
+    ///         n_results=5,
+    ///     )
+    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=true, ann_search_list_size=None))]
+    fn query(
+        &self,
+        py: Python<'_>,
+        query_embeddings: PyObject,
+        n_results: usize,
+        where_filter: Option<&Bound<'_, PyDict>>,
+        _use_ann: bool,
+        ann_search_list_size: Option<usize>,
+    ) -> PyResult<PyObject> {
+        let queries: Vec<ndarray::Array1<f64>> =
+            if let Ok(m) = query_embeddings.extract::<PyReadonlyArray2<f32>>(py) {
+                m.as_array()
+                    .rows()
+                    .into_iter()
+                    .map(|r| r.mapv(|x| x as f64))
+                    .collect()
+            } else if let Ok(m) = query_embeddings.extract::<PyReadonlyArray2<f64>>(py) {
+                m.as_array()
+                    .rows()
+                    .into_iter()
+                    .map(|r| r.to_owned())
+                    .collect()
+            } else {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "query_embeddings must be a 2-D numpy array (float32 or float64)",
+                ));
+            };
+
+        let parsed_filter = parse_pydict(where_filter)?;
+        let filter_ref = if parsed_filter.is_empty() {
+            None
         } else {
-            self.open_collection(name).map(Some)
+            Some(&parsed_filter)
+        };
+
+        let batch = py.allow_threads(|| {
+            let engine = self.engine.read().unwrap();
+            engine
+                .search_batch(&queries, n_results, filter_ref, ann_search_list_size)
+                .map_err(to_py_runtime)
+        })?;
+
+        let outer = PyList::empty_bound(py);
+        for results in batch {
+            let inner = PyList::empty_bound(py);
+            for r in results {
+                let dict = PyDict::new_bound(py);
+                dict.set_item("id", r.id)?;
+                dict.set_item("score", r.score)?;
+                let meta_dict = PyDict::new_bound(py);
+                for (k, v) in r.metadata {
+                    meta_dict.set_item(k, json_to_py(py, &v)?)?;
+                }
+                dict.set_item("metadata", meta_dict)?;
+                if let Some(doc) = r.document {
+                    dict.set_item("document", doc)?;
+                }
+                inner.append(dict)?;
+            }
+            outer.append(inner)?;
         }
+        Ok(outer.into())
     }
 
-    fn get_or_create_collection(&self, name: String) -> PyResult<Database> {
-        TurboQuantEngine::create_collection_with_uri(&self.uri, &self.local_dir, &name)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        self.open_collection(name)
-    }
-
-    fn list_collections(&self) -> PyResult<Vec<String>> {
-        TurboQuantEngine::list_collections(&self.local_dir)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-    }
-
-    fn delete_collection(&self, name: String) -> PyResult<bool> {
-        TurboQuantEngine::delete_collection_with_uri(&self.uri, &self.local_dir, &name)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-    }
-
-    fn snapshot_collection(&self, name: String, snapshot_dir: String) -> PyResult<()> {
-        TurboQuantEngine::snapshot_collection(&self.local_dir, &name, &snapshot_dir)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-    }
-
-    fn restore_collection(&self, name: String, snapshot_dir: String) -> PyResult<()> {
-        TurboQuantEngine::restore_collection(&self.local_dir, &name, &snapshot_dir)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-    }
-
-    fn __repr__(&self) -> PyResult<String> {
-        Ok(format!(
-            "RapidStoreClient(uri={}, d={}, b={})",
-            self.uri, self.dimension, self.bits
-        ))
+    /// Return IDs with optional metadata filter and pagination.
+    ///
+    /// Args:
+    ///     where_filter: Optional metadata filter dict.
+    ///     limit: Maximum number of IDs to return. ``None`` returns all matching.
+    ///     offset: Number of IDs to skip. Default 0.
+    ///
+    /// Returns:
+    ///     List of matching IDs.
+    ///
+    /// Example::
+    ///
+    ///     # All IDs for a given category, page 2
+    ///     ids = db.list_ids(where_filter={"kind": "A"}, limit=50, offset=50)
+    #[pyo3(signature = (where_filter=None, limit=None, offset=0))]
+    fn list_ids(
+        &self,
+        py: Python<'_>,
+        where_filter: Option<&Bound<'_, PyDict>>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> PyResult<Vec<String>> {
+        let parsed_filter = parse_pydict(where_filter)?;
+        let filter_ref = if parsed_filter.is_empty() {
+            None
+        } else {
+            Some(&parsed_filter)
+        };
+        py.allow_threads(|| {
+            let engine = self.engine.read().unwrap();
+            engine
+                .list_with_filter_page(filter_ref, limit, offset)
+                .map_err(to_py_runtime)
+        })
     }
 }
 
-/// Parse an optional Python dict into HashMap<String, JsonValue>
-fn parse_pydict(
-    py: Python<'_>,
-    dict: Option<&Bound<'_, PyDict>>,
-) -> PyResult<HashMap<String, JsonValue>> {
-    let mut props = HashMap::new();
+fn get_result_to_py(py: Python<'_>, g: &GetResult) -> PyResult<PyObject> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("id", &g.id)?;
+    let meta_dict = PyDict::new_bound(py);
+    for (k, v) in &g.metadata {
+        meta_dict.set_item(k, json_to_py(py, v)?)?;
+    }
+    dict.set_item("metadata", meta_dict)?;
+    if let Some(doc) = &g.document {
+        dict.set_item("document", doc)?;
+    }
+    Ok(dict.into())
+}
+
+fn json_to_py(py: Python<'_>, v: &JsonValue) -> PyResult<PyObject> {
+    match v {
+        JsonValue::Null => Ok(py.None()),
+        JsonValue::Bool(b) => Ok(b.to_object(py)),
+        JsonValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(i.to_object(py))
+            } else if let Some(u) = n.as_u64() {
+                Ok(u.to_object(py))
+            } else if let Some(f) = n.as_f64() {
+                Ok(f.to_object(py))
+            } else {
+                // Extreme values outside f64 range — fall back to string
+                Ok(n.to_string().to_object(py))
+            }
+        }
+        JsonValue::String(s) => Ok(s.to_object(py)),
+        JsonValue::Array(arr) => {
+            let list = PyList::empty_bound(py);
+            for item in arr {
+                list.append(json_to_py(py, item)?)?;
+            }
+            Ok(list.into())
+        }
+        JsonValue::Object(obj) => {
+            let dict = PyDict::new_bound(py);
+            for (k, val) in obj {
+                dict.set_item(k, json_to_py(py, val)?)?;
+            }
+            Ok(dict.into())
+        }
+    }
+}
+
+fn py_to_json(obj: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
+    if obj.is_none() {
+        Ok(JsonValue::Null)
+    } else if let Ok(b) = obj.extract::<bool>() {
+        Ok(JsonValue::Bool(b))
+    } else if let Ok(i) = obj.extract::<i64>() {
+        Ok(JsonValue::from(i))
+    } else if let Ok(f) = obj.extract::<f64>() {
+        Ok(JsonValue::from(f))
+    } else if let Ok(s) = obj.extract::<String>() {
+        Ok(JsonValue::String(s))
+    } else if let Ok(list) = obj.downcast::<PyList>() {
+        let mut arr = Vec::new();
+        for item in list {
+            arr.push(py_to_json(&item)?);
+        }
+        Ok(JsonValue::Array(arr))
+    } else if let Ok(dict) = obj.downcast::<PyDict>() {
+        let mut map = serde_json::Map::new();
+        for (k, v) in dict {
+            map.insert(k.extract::<String>()?, py_to_json(&v)?);
+        }
+        Ok(JsonValue::Object(map))
+    } else {
+        Ok(JsonValue::Null)
+    }
+}
+
+fn parse_pydict(dict: Option<&Bound<'_, PyDict>>) -> PyResult<HashMap<String, JsonValue>> {
+    let mut map = HashMap::new();
     if let Some(d) = dict {
-        for (k, v) in d.iter() {
-            let key: String = k.extract()?;
-            let val = py_to_json(py, &v)?;
-            props.insert(key, val);
+        for (k, v) in d {
+            map.insert(k.extract::<String>()?, py_to_json(&v)?);
         }
     }
-    Ok(props)
+    Ok(map)
 }
 
-fn parse_include_set(include: Option<Vec<String>>, defaults: &[&str]) -> std::collections::HashSet<String> {
+fn parse_metadata_rows(
+    metadatas: Option<&Bound<'_, PyAny>>,
+    n: usize,
+) -> PyResult<Vec<HashMap<String, JsonValue>>> {
+    if let Some(m) = metadatas {
+        if let Ok(list) = m.downcast::<PyList>() {
+            if list.len() != n {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "metadatas length {} does not match ids/vectors length {}",
+                    list.len(),
+                    n
+                )));
+            }
+            let mut out = Vec::with_capacity(n);
+            for item in list {
+                let dict = item.downcast::<PyDict>()?;
+                out.push(parse_pydict(Some(dict))?);
+            }
+            Ok(out)
+        } else {
+            Ok(vec![HashMap::new(); n])
+        }
+    } else {
+        Ok(vec![HashMap::new(); n])
+    }
+}
+
+fn parse_document_rows(
+    documents: Option<&Bound<'_, PyAny>>,
+    n: usize,
+) -> PyResult<Vec<Option<String>>> {
+    if let Some(d) = documents {
+        if let Ok(list) = d.downcast::<PyList>() {
+            if list.len() != n {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "documents length {} does not match ids/vectors length {}",
+                    list.len(),
+                    n
+                )));
+            }
+            let mut out = Vec::with_capacity(n);
+            for item in list {
+                out.push(item.extract::<Option<String>>()?);
+            }
+            Ok(out)
+        } else {
+            Ok(vec![None; n])
+        }
+    } else {
+        Ok(vec![None; n])
+    }
+}
+
+fn to_py_runtime(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+}
+
+fn parse_include_set(
+    include: Option<Vec<String>>,
+    defaults: &[&str],
+) -> std::collections::HashSet<String> {
     include
         .unwrap_or_else(|| defaults.iter().map(|s| s.to_string()).collect())
         .into_iter()
@@ -858,175 +806,9 @@ fn parse_include_set(include: Option<Vec<String>>, defaults: &[&str]) -> std::co
         .collect()
 }
 
-/// Convert a Python object to a serde_json Value (best-effort)
-fn py_to_json(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
-    // Order matters: bool before i64 since Python bool is a subtype of int
-    if let Ok(v) = obj.extract::<bool>() {
-        return Ok(JsonValue::Bool(v));
-    }
-    if let Ok(v) = obj.extract::<i64>() {
-        return Ok(JsonValue::Number(v.into()));
-    }
-    if let Ok(v) = obj.extract::<f64>() {
-        if let Some(n) = serde_json::Number::from_f64(v) {
-            return Ok(JsonValue::Number(n));
-        }
-    }
-    if let Ok(v) = obj.extract::<String>() {
-        return Ok(JsonValue::String(v));
-    }
-    if let Ok(v) = obj.downcast::<PyString>() {
-        return Ok(JsonValue::String(v.to_string()));
-    }
-    if let Ok(v) = obj.downcast::<PyDict>() {
-        let mut out = serde_json::Map::new();
-        for (k, val) in v.iter() {
-            let key: String = k.extract()?;
-            out.insert(key, py_to_json(py, &val)?);
-        }
-        return Ok(JsonValue::Object(out));
-    }
-    if let Ok(v) = obj.downcast::<PyList>() {
-        let mut out = Vec::with_capacity(v.len());
-        for item in v.iter() {
-            out.push(py_to_json(py, &item)?);
-        }
-        return Ok(JsonValue::Array(out));
-    }
-    // Fallback: store string representation
-    Ok(JsonValue::String(obj.str()?.to_string()))
-}
-
-/// Convert a serde_json Value to a Python object (pyo3 0.21 compatible)
-fn json_to_py(py: Python<'_>, val: &JsonValue) -> PyResult<PyObject> {
-    Ok(match val {
-        JsonValue::Null => py.None(),
-        JsonValue::Bool(b) => (*b).to_object(py),
-        JsonValue::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                i.to_object(py)
-            } else if let Some(f) = n.as_f64() {
-                f.to_object(py)
-            } else {
-                n.to_string().to_object(py)
-            }
-        }
-        JsonValue::String(s) => s.to_object(py),
-        JsonValue::Array(arr) => {
-            let list = PyList::empty_bound(py);
-            for v in arr {
-                list.append(json_to_py(py, v)?)?;
-            }
-            list.into()
-        }
-        JsonValue::Object(map) => {
-            let dict = PyDict::new_bound(py);
-            for (k, v) in map {
-                dict.set_item(k, json_to_py(py, v)?)?;
-            }
-            dict.into()
-        }
-    })
-}
-
-/// Register the Database class with the PyO3 module.
-pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn register(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Database>()?;
-    m.add_class::<Client>()?;
+    let db_cls = m.getattr("Database")?;
+    m.add("TurboQuantDB", db_cls)?;
     Ok(())
 }
-
-impl Client {
-    fn open_collection(&self, name: String) -> PyResult<Database> {
-        let engine = TurboQuantEngine::open_collection(
-            &self.uri,
-            &self.local_dir,
-            &name,
-            self.dimension,
-            self.bits,
-            self.seed,
-            self.metric.clone(),
-        )
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        Ok(Database {
-            engine: Arc::new(RwLock::new(engine)),
-        })
-    }
-}
-
-fn build_batch_items(
-    py: Python<'_>,
-    ids: Vec<String>,
-    vectors: Vec<PyReadonlyArray1<f64>>,
-    metadatas: Option<Vec<Bound<'_, PyDict>>>,
-    documents: Option<Vec<Option<String>>>,
-) -> PyResult<Vec<BatchWriteItem>> {
-    if ids.len() != vectors.len() {
-        return Err(PyValueError::new_err(
-            "ids and vectors must have the same length",
-        ));
-    }
-    let metas_len = metadatas.as_ref().map(|m| m.len()).unwrap_or(ids.len());
-    if metas_len != ids.len() {
-        return Err(PyValueError::new_err(
-            "metadatas length must match ids length",
-        ));
-    }
-    let docs_len = documents.as_ref().map(|d| d.len()).unwrap_or(ids.len());
-    if docs_len != ids.len() {
-        return Err(PyValueError::new_err(
-            "documents length must match ids length",
-        ));
-    }
-
-    let mut items = Vec::with_capacity(ids.len());
-    for (i, (id, vector)) in ids.into_iter().zip(vectors.into_iter()).enumerate() {
-        let metadata = if let Some(ref metas) = metadatas {
-            parse_pydict(py, Some(&metas[i]))?
-        } else {
-            HashMap::new()
-        };
-        let document = if let Some(ref docs) = documents {
-            docs[i].clone()
-        } else {
-            None
-        };
-        items.push(BatchWriteItem {
-            id,
-            vector: vector.as_array().to_owned(),
-            metadata,
-            document,
-        });
-    }
-    Ok(items)
-}
-
-fn batch_report_to_py(
-    py: Python<'_>,
-    report: crate::storage::engine::BatchWriteReport,
-) -> PyResult<PyObject> {
-    let out = PyDict::new_bound(py);
-    out.set_item("applied", report.applied)?;
-    let failed = PyList::empty_bound(py);
-    for f in report.failed {
-        let d = PyDict::new_bound(py);
-        d.set_item("index", f.index)?;
-        d.set_item("id", f.id)?;
-        d.set_item("error", f.error)?;
-        failed.append(d)?;
-    }
-    out.set_item("failed", failed)?;
-    Ok(out.into())
-}
-
-fn parse_metric(metric: &str) -> PyResult<DistanceMetric> {
-    match metric.to_ascii_lowercase().as_str() {
-        "ip" | "dot" | "inner_product" => Ok(DistanceMetric::Ip),
-        "cosine" => Ok(DistanceMetric::Cosine),
-        "l2" | "euclidean" => Ok(DistanceMetric::L2),
-        _ => Err(PyValueError::new_err(
-            "metric must be one of: ip, cosine, l2",
-        )),
-    }
-}
-

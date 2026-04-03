@@ -1,4 +1,4 @@
-# M5 Design Doc: Multi-Tenant Service Mode
+# Server Mode Design: Multi-Tenant Architecture
 
 ## Objective
 
@@ -8,7 +8,7 @@ Define an implementation-ready design for:
 - auth/RBAC and quota enforcement
 - service-mode APIs with background workers
 
-This is the target architecture for evolving RapidStore from embedded-only usage to a shared service while preserving the existing embedded engine as the storage core.
+This is the target architecture for evolving TurboQuantDB from embedded-only usage to a shared service while preserving the existing embedded engine as the storage core.
 
 ## Current Baseline (as of M1-M4)
 
