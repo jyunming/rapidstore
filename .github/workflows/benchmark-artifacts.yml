@@ -37,7 +37,7 @@ jobs:
 
       - name: Run Python recall benchmark (artifact emitter)
         run: |
-          python benchmarks/run_recall_bench.py \
+          python scripts/ci/run_recall_bench.py \
             --n 10000 \
             --d 128 \
             --queries 50 \
@@ -59,7 +59,7 @@ jobs:
 
       - name: Enforce benchmark quality gates
         run: |
-          python benchmarks/ci_quality_gate.py \
+          python scripts/ci/ci_quality_gate.py \
             --python-artifacts-dir benchmarks/artifacts \
             --python-prefix ci_ \
             --rust-artifact target/benchmarks/bench_search.json \

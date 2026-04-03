@@ -14,7 +14,11 @@ jobs:
   linux:
     name: Linux wheels (${{ matrix.target }})
     runs-on: ubuntu-latest
+    # aarch64 cross-compile can fail on mimalloc/GCC manylinux incompatibility;
+    # allow it without blocking the release — x86_64 is the critical target.
+    continue-on-error: ${{ matrix.target == 'aarch64' }}
     strategy:
+      fail-fast: false
       matrix:
         target: [x86_64, aarch64]
     steps:
@@ -29,6 +33,7 @@ jobs:
           sccache: "true"
 
       - uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: wheels-linux-${{ matrix.target }}
           path: dist
