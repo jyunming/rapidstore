@@ -25,6 +25,7 @@ python/turboquantdb/*.pdb
 /.claude/
 
 # Temporary probe and test directories
+/tmp/
 /tmp_*/
 /rq_fix_*/
 
