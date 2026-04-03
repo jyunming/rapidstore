@@ -36,7 +36,7 @@ features = ["pyo3/extension-module"]
 python-source = "python"
 
 [tool.pytest.ini_options]
-# Use a project-local temp dir to avoid Windows AppData permission issues.
-# tmp/ is gitignored; it will be created on first test run on any platform.
 tmp_path_retention_policy = "failed"
-addopts = ["--basetemp=tmp/pytest_tmp"]
+# --basetemp is set only on Windows locally via conftest, not here, so CI
+# (Linux) uses pytest's default temp dir and doesn't fail on missing tmp/.
+addopts = []
