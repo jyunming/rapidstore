@@ -7,7 +7,7 @@ Complete reference for the `turboquantdb` Python package.
 ## Installation
 
 ```bash
-pip install turboquantdb
+pip install tqdb
 ```
 
 Requires Python 3.10+. Pre-built wheels available for Linux, Windows, and macOS.
