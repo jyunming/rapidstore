@@ -262,12 +262,16 @@ The combination gives unbiased inner product estimates with near-optimal distort
 
 ## Server Mode
 
+> **Status: experimental.** The server crate compiles and the core endpoints work, but it has not been hardened for production use. The embedded library (`turboquantdb` Python package) is the primary supported interface.
+
+An optional Axum-based HTTP server is available in `server/` for multi-tenant deployments. It adds API key authentication, quota enforcement, and async job management (compaction, index building, snapshots).
+
 ```bash
 cd server && cargo build --release
 TQ_SERVER_ADDR=0.0.0.0:8080 TQ_LOCAL_ROOT=./data ./target/release/turboquantdb-server
 ```
 
-See [`server/README.md`](https://github.com/jyunming/TurboQuantDB/blob/main/server/README.md) for endpoints and environment variables. Key env vars:
+See [`server/README.md`](https://github.com/jyunming/TurboQuantDB/blob/main/server/README.md) for the full endpoint reference. Key env vars:
 
 | Variable | Default | Description |
 |----------|---------|-------------|

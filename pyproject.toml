@@ -7,7 +7,7 @@ name = "turboquantdb"
 version = "0.1.0"
 description = "Embedded vector database using the TurboQuant algorithm (arXiv:2504.19874) — zero training, 2-4 bit compression, fast inner-product search"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = { file = "LICENSE" }
 keywords = ["vector-database", "vector-search", "quantization", "embeddings", "rag"]
 classifiers = [
@@ -18,10 +18,10 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Database",
 ]
