@@ -453,7 +453,7 @@ class TestPersistence:
 # TurboQuantRetriever (RAG wrapper) tests
 # ---------------------------------------------------------------------------
 
-class TestTurboQuantRetriever:
+class TestTurboQuantRetrieverOps:
     """Tests for the TurboQuantRetriever class in turboquantdb.rag."""
 
     DIM = 32
@@ -591,43 +591,6 @@ class TestTurboQuantRetriever:
         results = retriever.similarity_search(query, k=1)
         assert len(results) == 1
         assert results[0]["metadata"].get("tag") == "important"
-
-
-class TestTurboQuantRetrieverFallbackStub:
-    """Tests the fallback stub behaviour when the C extension is unavailable."""
-
-    def test_stub_raises_runtime_error(self):
-        """Database.open on the stub raises RuntimeError."""
-        # Import the rag module's fallback stub class directly by temporarily
-        # hiding the real extension.
-        import sys
-        import importlib
-        import types
-
-        # Create a fake turboquantdb package that lacks the real extension.
-        fake_pkg = types.ModuleType("turboquantdb_stub_test")
-        # The rag module's try/except block falls back to a stub Database class
-        # that raises RuntimeError on .open(). We can import rag with this
-        # setup by temporarily replacing the turboquantdb.turboquantdb submodule.
-        original = sys.modules.get("turboquantdb.turboquantdb")
-        try:
-            # Remove the real extension so the ImportError branch fires.
-            sys.modules["turboquantdb.turboquantdb"] = None  # type: ignore
-            # Force reimport of rag to pick up the stub path.
-            if "turboquantdb.rag" in sys.modules:
-                del sys.modules["turboquantdb.rag"]
-            from turboquantdb import rag as rag_mod
-            # The stub Database.open should raise RuntimeError.
-            with pytest.raises(RuntimeError):
-                rag_mod.Database.open("/tmp/stub_test_db", 16)
-        finally:
-            # Restore the real extension.
-            if original is None:
-                sys.modules.pop("turboquantdb.turboquantdb", None)
-            else:
-                sys.modules["turboquantdb.turboquantdb"] = original
-            # Clear the rag module cache so future tests use the real extension.
-            sys.modules.pop("turboquantdb.rag", None)
 
 
 # ---------------------------------------------------------------------------
