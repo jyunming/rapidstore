@@ -29,6 +29,12 @@ python/turboquantdb/*.pdb
 /tmp_*/
 /rq_fix_*/
 
+# Benchmark artifacts and result data
+/benchmarks/artifacts*/
+/benchmarks/store_compare_work*/
+/benchmarks/tmp*/
+/benchmarks/*_results*.json
+/benchmarks/*_results_*.json
 /recall_results.json
 
 # Server data
@@ -42,6 +48,7 @@ python/turboquantdb/*.pdb
 # Misc
 /build_error.txt
 /C：/
+BENCHMARK_ENGINE_MAP.md
 
 # Internal / local-only docs (not for public repo)
 ASSESSMENT_PAPER_CONFORMANCE.md
@@ -49,21 +56,12 @@ PERF_PLAN.md
 RAM_PLAN.md
 RAM_DIAGNOSTIC_AND_FIX_PLAN.md
 BENCHMARK_GUIDEBOOK.md
-BENCHMARKS.md
-BENCHMARK_ENGINE_MAP.md
-CLAUDE.md
-GEMINI.md
-AGENTS.md
 docs/PYTHON_MIGRATION.md
 docs/ROADMAP_BACKLOG.md
 
-# Paper source files
-2504.19874v1.md
-2504.19874v1.pdf
-convert_pdf.py
-
-# Benchmark folder (local dev tooling, not for public repo)
-/benchmarks/
+# Local benchmark scripts (require external deps / local data paths)
+benchmarks/real_world_bench_v2.py
+benchmarks/scale_matrix_bench.py
 
 # Benchmark output artifacts
 bench_results_*.json
