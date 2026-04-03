@@ -4,8 +4,11 @@
 
 # Python environments and caches
 /.venv
+/.venv*/
+/.venv311/
 /.hf_home
 /.pydeps
+/.tmp_pip/
 /benchmarks/__pycache__/
 **/__pycache__/
 
@@ -34,6 +37,7 @@
 # Test database artifacts
 /.tmp_db/
 /tmp_bench_temp/
+/t/
 
 # Misc
 /build_error.txt

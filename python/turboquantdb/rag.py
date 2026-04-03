@@ -6,7 +6,16 @@ try:
 except ImportError:
     class Database:  # type: ignore
         @staticmethod
-        def open(path: str, dimension: int, bits: int = 4, seed: int = 42, metric: str = "ip"):
+        def open(
+            path: str,
+            dimension: int,
+            bits: int = 4,
+            seed: int = 42,
+            metric: str = "ip",
+            rerank: bool = True,
+            fast_mode: bool = False,
+            rerank_precision: Optional[str] = None,
+        ):
             raise RuntimeError("turboquantdb extension not available")
 
 
@@ -20,8 +29,12 @@ class TurboQuantRetriever:
         bits: int = 4,
         seed: int = 42,
         metric: str = "ip",
+        rerank_precision: Optional[str] = None,
     ):
-        self.db = Database.open(db_path, dimension, bits=bits, seed=seed, metric=metric)
+        self.db = Database.open(
+            db_path, dimension, bits=bits, seed=seed, metric=metric,
+            rerank_precision=rerank_precision,
+        )
         self.doc_store: Dict[str, Dict[str, Any]] = {}
 
     def add_texts(

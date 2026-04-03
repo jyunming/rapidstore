@@ -59,7 +59,7 @@ fn test_benchmark_compaction_and_search() -> Result<(), Box<dyn std::error::Erro
     // 2. Compaction
     println!("Compacting segments...");
     let start_compact = Instant::now();
-    engine.compact()?;
+    engine.flush_wal_to_segment()?;
     println!("Compaction took: {:?}", start_compact.elapsed());
     let compaction_ms = start_compact.elapsed().as_secs_f64() * 1000.0;
 
@@ -72,7 +72,7 @@ fn test_benchmark_compaction_and_search() -> Result<(), Box<dyn std::error::Erro
     // 4. Indexing
     println!("Building Vamana Index...");
     let start_index = Instant::now();
-    engine.create_index(32, 64)?;
+    engine.create_index_with_params(32, 64, 64, 1.2, 5)?;
     println!("Indexing took: {:?}", start_index.elapsed());
     let indexing_ms = start_index.elapsed().as_secs_f64() * 1000.0;
 
@@ -110,8 +110,6 @@ fn test_benchmark_compaction_and_search() -> Result<(), Box<dyn std::error::Erro
             "segment_count": stats.segment_count,
             "has_index": stats.has_index,
             "index_nodes": stats.index_nodes,
-            "index_search_list_size": stats.index_search_list_size,
-            "index_alpha": stats.index_alpha,
             "total_disk_bytes": stats.total_disk_bytes,
         }
     });

@@ -394,6 +394,11 @@ impl Database {
         dict.set_item("metadata_bytes_estimate", stats.metadata_bytes_estimate)?;
         dict.set_item("ann_slot_count", stats.ann_slot_count)?;
         dict.set_item("graph_nodes", stats.graph_nodes)?;
+        // Computed estimate: in-memory footprint across all major buffers.
+        let ram_estimate_bytes = stats.live_codes_bytes
+            + stats.live_vectors_bytes_estimate
+            + stats.metadata_bytes_estimate;
+        dict.set_item("ram_estimate_bytes", ram_estimate_bytes)?;
         Ok(dict.into())
     }
 

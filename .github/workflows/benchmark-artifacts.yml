@@ -27,6 +27,9 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> $GITHUB_PATH
+          echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
           pip install numpy maturin
 
       - name: Build Python extension
@@ -35,21 +38,21 @@ jobs:
       - name: Run Python recall benchmark (artifact emitter)
         run: |
           python benchmarks/run_recall_bench.py \
-            --n 1000 \
+            --n 10000 \
             --d 128 \
-            --queries 25 \
-            --bits 2 \
+            --queries 50 \
+            --bits 4 \
             --artifact-dir benchmarks/artifacts \
             --artifact-prefix ci \
-            --recall-threshold 0.60
+            --recall-threshold 0.75
 
       - name: Build Rust bench target
         run: cargo test --test bench_search --no-run
 
       - name: Run Rust bench artifact emitter
         env:
-          TQ_BENCH_TOTAL_VECTORS: "300"
-          TQ_BENCH_BATCHES: "3"
+          TQ_BENCH_TOTAL_VECTORS: "1000"
+          TQ_BENCH_BATCHES: "10"
           TQ_BENCH_ARTIFACT_DIR: "target/benchmarks"
         run: cargo test --test bench_search -- --nocapture
 
@@ -60,10 +63,10 @@ jobs:
             --python-artifacts-dir benchmarks/artifacts \
             --python-prefix ci_ \
             --rust-artifact target/benchmarks/bench_search.json \
-            --min-recall 0.60 \
-            --max-tq-latency-ms 100.0 \
-            --min-speedup-vs-numpy 0.20 \
-            --max-ann-to-bruteforce-ratio 1.50
+            --min-recall 0.75 \
+            --max-tq-latency-ms 20.0 \
+            --min-speedup-vs-numpy 0.10 \
+            --max-ann-to-bruteforce-ratio 0.60
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4
         with:

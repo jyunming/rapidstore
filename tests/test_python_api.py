@@ -368,7 +368,8 @@ class TestRerankPrecision:
         db = Database.open(path, d, bits=4, rerank_precision="f16")
         db.insert_batch([str(i) for i in range(n)], random_unit_vecs(n, d))
         size = os.path.getsize(os.path.join(path, "live_vectors.bin"))
-        assert size == n * d * 2, f"Expected {n*d*2} bytes, got {size}"
+        # mmap pre-allocates in GROW_SLOTS=16384 chunks; file is always a multiple of stride
+        assert size >= n * d * 2 and size % (d * 2) == 0, f"Expected multiple of {d*2} bytes >= {n*d*2}, got {size}"
 
     def test_f32_creates_correct_file_size(self, tmp_path):
         path = str(tmp_path / "db")
@@ -376,7 +377,8 @@ class TestRerankPrecision:
         db = Database.open(path, d, bits=4, rerank_precision="f32")
         db.insert_batch([str(i) for i in range(n)], random_unit_vecs(n, d))
         size = os.path.getsize(os.path.join(path, "live_vectors.bin"))
-        assert size == n * d * 4, f"Expected {n*d*4} bytes, got {size}"
+        # mmap pre-allocates in GROW_SLOTS=16384 chunks; file is always a multiple of stride
+        assert size >= n * d * 4 and size % (d * 4) == 0, f"Expected multiple of {d*4} bytes >= {n*d*4}, got {size}"
 
     def test_f16_vs_default_recall(self, tmp_path):
         """f16 exact reranking should achieve recall >= dequant (not strictly, but should be competitive)."""

@@ -175,12 +175,13 @@ impl Wal {
             if has_header && version == 3 {
                 // V3: packed MSE indices
                 if let Ok(packed) = bincode::deserialize::<WalEntryPacked>(&payload) {
-                    let quantized_indices = if let Some(q) = quantizer {
+                    let quantized_indices = if packed.is_deleted || packed.packed_mse.is_empty() {
+                        Vec::new()
+                    } else if let Some(q) = quantizer {
                         let mut idx = vec![0 as CodeIndex; q.n];
                         q.unpack_mse_indices(&packed.packed_mse, &mut idx);
                         idx
                     } else {
-                        // No quantizer: store raw packed bytes as zero-length (shouldn't happen)
                         Vec::new()
                     };
                     entries.push(WalEntry {
