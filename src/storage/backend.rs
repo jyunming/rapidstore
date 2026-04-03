@@ -129,7 +129,7 @@ pub struct StorageBackend {
 
 impl StorageBackend {
     pub fn from_uri(uri: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        if uri.starts_with("s3://") || uri.starts_with("gs://") {
+        if uri.starts_with("s3://") || uri.starts_with("gs://") || uri.starts_with("az://") {
             return Err("Cloud storage requires the 'cloud' feature. Phase 4 provides local-first stability.".into());
         }
 

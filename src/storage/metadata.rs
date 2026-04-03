@@ -119,6 +119,9 @@ impl MetadataStore {
         }
 
         writer.flush()?;
+        // On Windows, rename fails if the destination already exists.
+        #[cfg(target_os = "windows")]
+        let _ = std::fs::remove_file(&self.path);
         std::fs::rename(&tmp, &self.path)?;
         self.dirty = false;
         Ok(())

@@ -90,6 +90,12 @@ impl LiveCodesFile {
     }
 
     pub fn alloc_slot(&mut self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        // Re-establish mmap if handles were released (e.g. after release_handles())
+        // and we still have capacity — growth path already calls ensure_open + remap.
+        if self.mmap.is_none() && self.len < self.capacity {
+            self.ensure_open()?;
+            self.remap()?;
+        }
         if self.len >= self.capacity {
             let new_capacity = self.capacity + GROW_SLOTS;
             self.mmap = None; // mmap must be dropped before set_len on Windows

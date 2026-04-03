@@ -5,7 +5,7 @@
 //! 1. [`mse::MseQuantizer`] — Applies a seeded SRHT rotation, then encodes each
 //!    dimension using a Lloyd-Max scalar codebook (b-1 bits per dimension).
 //! 2. [`qjl::QjlQuantizer`] — Projects the MSE residual via a dense Gaussian
-//!    SRHT and stores the sign bit (1 bit per dimension, bit-packed).
+//!    matrix and stores the sign bit (1 bit per dimension, bit-packed).
 //! 3. [`prod::ProdQuantizer`] — Orchestrates both stages, manages lookup tables
 //!    for fast asymmetric inner-product scoring, and exposes batch encode/decode.
 //!
