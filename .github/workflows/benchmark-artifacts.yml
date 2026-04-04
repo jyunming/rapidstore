@@ -38,13 +38,13 @@ jobs:
       - name: Run Python recall benchmark (artifact emitter)
         run: |
           python scripts/ci/run_recall_bench.py \
-            --n 10000 \
-            --d 128 \
-            --queries 50 \
+            --n 50000 \
+            --d 384 \
+            --queries 100 \
             --bits 4 \
             --artifact-dir benchmarks/artifacts \
             --artifact-prefix ci \
-            --recall-threshold 0.75
+            --recall-threshold 0.88
 
       - name: Build Rust bench target
         run: cargo test --test bench_search --no-run
@@ -63,9 +63,9 @@ jobs:
             --python-artifacts-dir benchmarks/artifacts \
             --python-prefix ci_ \
             --rust-artifact target/benchmarks/bench_search.json \
-            --min-recall 0.75 \
-            --max-tq-latency-ms 20.0 \
-            --min-speedup-vs-numpy 0.03 \
+            --min-recall 0.88 \
+            --max-tq-latency-ms 150.0 \
+            --min-speedup-vs-numpy 0.20 \
             --max-ann-to-bruteforce-ratio 0.60
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4
