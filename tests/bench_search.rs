@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
-use turboquantdb::storage::engine::TurboQuantEngine;
+use tqdb::storage::engine::TurboQuantEngine;
 
 #[test]
 fn test_benchmark_compaction_and_search() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

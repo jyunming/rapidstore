@@ -1,6 +1,6 @@
-# turboquantdb-server
+# tqdb-server
 
-Optional Axum HTTP service providing TurboQuantDB in multi-tenant server mode. Use this when you need REST API access, multi-tenancy, authentication, quotas, or async job management. For single-process Python use, the embedded `turboquantdb` package is simpler.
+Optional Axum HTTP service providing TurboQuantDB in multi-tenant server mode. Use this when you need REST API access, multi-tenancy, authentication, quotas, or async job management. For single-process Python use, the embedded `tqdb` package is simpler.
 
 ## Build & Run
 
@@ -9,7 +9,7 @@ cd server
 cargo build --release
 
 # Configure via environment variables (see below), then run:
-./target/release/turboquantdb-server
+./target/release/tqdb-server
 ```
 
 ## Environment Variables
@@ -32,7 +32,6 @@ cargo build --release
 - `DELETE /v1/tenants/:tenant/databases/:database/collections/:collection`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/add`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/upsert`
-- `POST /v1/tenants/:tenant/databases/:database/collections/:collection/update`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/delete`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/get`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/query`

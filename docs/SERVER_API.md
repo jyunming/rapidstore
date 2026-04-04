@@ -4,25 +4,22 @@
 
 Define the HTTP/JSON contract for multi-tenant TurboQuantDB service mode.
 
-Base path: `/v1`
-
 ## Conventions
 
 - All endpoints require authentication (except `/healthz`).
 - IDs are ASCII strings unless stated otherwise.
-- Timestamps are ISO-8601 UTC strings.
+- Timestamps in job responses are Unix epoch seconds as strings (e.g., `"1743800000"`).
 - Error responses are stable and machine-readable.
 
 ## Headers
 
 Required:
 
-- `Authorization: Bearer <token>` or `Authorization: ApiKey <key>`
-- `X-Tenant-Id: <tenant_id>` (required when token does not bind tenant)
+- `Authorization: ApiKey <key>`
 
 Optional:
 
-- `X-Request-Id: <client-id>`
+- `X-Request-Id: <client-id>` — echoed back in error responses
 
 ## Error Model
 
@@ -32,33 +29,27 @@ All non-2xx responses:
 {
   "error": {
     "code": "quota_exceeded",
-    "message": "tenant vector quota exceeded",
-    "details": {
-      "dimension": "vectors",
-      "current": 1000001,
-      "limit": 1000000
-    }
+    "message": "vector quota exceeded for tenant='t1' database='db1' ..."
   },
-  "request_id": "req_01J..."
+  "request_id": "my-req-id"
 }
 ```
 
 Canonical error codes:
 
-- `unauthenticated`
-- `forbidden`
-- `not_found`
-- `already_exists`
-- `invalid_argument`
-- `conflict`
-- `quota_exceeded`
-- `rate_limited`
-- `resource_busy`
-- `internal`
+- `unauthenticated` — missing or invalid API key (401)
+- `forbidden` — valid key but insufficient permissions (403)
+- `invalid_argument` — bad request body or parameters (400)
+- `not_found` — resource does not exist (404)
+- `conflict` — resource already exists, or job state mismatch (409)
+- `quota_exceeded` — vector/disk/job quota exceeded (429)
+- `internal` — unexpected server error (500)
 
 ## Health
 
 ### `GET /healthz`
+
+No authentication required.
 
 Response `200`:
 
@@ -68,9 +59,9 @@ Response `200`:
 
 ## Collections
 
-### `POST /tenants/{tenant}/databases/{database}/collections`
+### `POST /v1/tenants/{tenant}/databases/{database}/collections`
 
-Create collection.
+Create collection. Returns `409` if the collection already exists.
 
 Request:
 
@@ -84,6 +75,8 @@ Request:
 }
 ```
 
+Fields: `name` (required), `dimension` (required), `bits` (required), `seed` (optional, default `42`), `metric` (optional, default `"ip"`; values: `"ip"`, `"cosine"`, `"l2"`).
+
 Response `201`:
 
 ```json
@@ -94,12 +87,11 @@ Response `201`:
   "dimension": 1536,
   "bits": 4,
   "seed": 42,
-  "metric": "ip",
-  "created_at": "2026-03-28T18:00:00Z"
+  "metric": "ip"
 }
 ```
 
-### `GET /tenants/{tenant}/databases/{database}/collections`
+### `GET /v1/tenants/{tenant}/databases/{database}/collections`
 
 List collections.
 
@@ -114,9 +106,9 @@ Response `200`:
 }
 ```
 
-### `DELETE /tenants/{tenant}/databases/{database}/collections/{collection}`
+### `DELETE /v1/tenants/{tenant}/databases/{database}/collections/{collection}`
 
-Delete collection.
+Delete collection. Returns `404` if it does not exist.
 
 Response `200`:
 
@@ -126,48 +118,68 @@ Response `200`:
 
 ## Vector Write APIs
 
-### `POST /tenants/{tenant}/databases/{database}/collections/{collection}/upsert`
+### `POST /v1/tenants/{tenant}/databases/{database}/collections/{collection}/add`
+
+Insert vectors. Fails with `409` if any ID already exists (fail-fast mode) or reports per-item failures when `report=true`.
 
 Request:
 
 ```json
 {
   "ids": ["id-1", "id-2"],
-  "vectors": [[0.1, 0.2], [0.3, 0.4]],
+  "embeddings": [[0.1, 0.2], [0.3, 0.4]],
   "metadatas": [{"source": "faq"}, {"source": "blog"}],
   "documents": ["doc1", "doc2"],
-  "mode": "report"
+  "report": false
 }
 ```
 
-- `mode` values:
-  - `fail_fast` (default)
-  - `report` (continue-on-error)
+- `embeddings` — required; list of float arrays matching the collection's dimension
+- `metadatas`, `documents` — optional; must have same length as `ids` if provided
+- `report` — optional bool (default `false`); when `true`, returns partial-failure report instead of failing on first error
 
-Response `200` (`fail_fast`):
+Response `201` (all succeeded):
 
 ```json
-{ "applied": 2 }
+{ "count": 2, "applied": 2, "failed": [] }
 ```
 
-Response `200` (`report`):
+Response `200` (partial failure, `report=true`):
 
 ```json
 {
+  "count": 1,
   "applied": 1,
   "failed": [
-    {"index": 1, "id": "id-2", "error": "vector dimension mismatch"}
+    {"index": 1, "id": "id-2", "error": "embedding dimension mismatch for id 'id-2': expected 1536, got 128"}
   ]
 }
 ```
 
-### `POST /tenants/{tenant}/databases/{database}/collections/{collection}/delete`
+### `POST /v1/tenants/{tenant}/databases/{database}/collections/{collection}/upsert`
+
+Insert or replace vectors. Same request/response shape as `/add`.
+
+Response `200` (always, even without `report`):
+
+```json
+{ "count": 2, "applied": 2, "failed": [] }
+```
+
+### `POST /v1/tenants/{tenant}/databases/{database}/collections/{collection}/delete`
+
+Delete vectors by IDs and/or metadata filter. At least one of `ids` or `filter` must be non-empty.
 
 Request:
 
 ```json
-{ "ids": ["id-1", "id-2"] }
+{
+  "ids": ["id-1", "id-2"],
+  "filter": {"source": {"$eq": "faq"}}
+}
 ```
+
+Alias `where_filter` is accepted in place of `filter`.
 
 Response `200`:
 
@@ -175,125 +187,89 @@ Response `200`:
 { "deleted": 2 }
 ```
 
-## Query/Search APIs
+### `POST /v1/tenants/{tenant}/databases/{database}/collections/{collection}/get`
 
-### `POST /tenants/{tenant}/databases/{database}/collections/{collection}/search`
-
-Single query search.
+Fetch vectors by IDs and/or metadata filter. At least one selector is required.
 
 Request:
 
 ```json
 {
-  "query": [0.1, 0.2, 0.3],
-  "top_k": 10,
-  "where_filter": {"tenant": {"$eq": "a"}},
-  "include_document": true,
-  "ann_search_list_size": 64
+  "ids": ["id-1"],
+  "filter": {"source": "faq"},
+  "include": ["ids", "metadatas", "documents"],
+  "offset": 0,
+  "limit": 10
 }
 ```
+
+`include` defaults to all fields (`ids`, `metadatas`, `documents`). Alias `where_filter` accepted in place of `filter`.
 
 Response `200`:
 
 ```json
 {
-  "results": [
-    {
-      "id": "id-1",
-      "score": 0.98,
-      "metadata": {"source": "faq"},
-      "document": "..."
-    }
-  ]
+  "ids": ["id-1"],
+  "metadatas": [{"source": "faq"}],
+  "documents": ["doc text"]
 }
 ```
 
-### `POST /tenants/{tenant}/databases/{database}/collections/{collection}/query`
+Only fields listed in `include` are present in the response.
 
-Batched query API.
+## Query API
+
+### `POST /v1/tenants/{tenant}/databases/{database}/collections/{collection}/query`
+
+Vector similarity search. Accepts a batch of query vectors in a single request.
 
 Request:
 
 ```json
 {
   "query_embeddings": [[0.1, 0.2], [0.3, 0.4]],
+  "top_k": 5,
   "n_results": 5,
-  "offset": 0,
+  "filter": {"source": "faq"},
   "include": ["ids", "scores", "metadatas", "documents"],
-  "where_filter": {"source": {"$in": ["faq", "blog"]}},
-  "ann_search_list_size": 64
+  "offset": 0
 }
 ```
 
-Response `200`:
+- `query_embeddings` — required; list of query vectors
+- `top_k` or `n_results` — results per query (default `10`); both are accepted, `top_k` takes precedence
+- `filter` / `where_filter` — optional metadata filter
+- `include` — optional; defaults to all fields (`ids`, `scores`, `metadatas`, `documents`)
+- `offset` — optional; skip the first N results per query (default `0`)
+
+Response `200` — one entry in `results` per query vector:
 
 ```json
 {
-  "ids": [["id-1"], ["id-7"]],
-  "scores": [[0.97], [0.91]],
-  "metadatas": [[{"source": "faq"}], [{"source": "blog"}]],
-  "documents": [["..."], ["..."]]
+  "results": [
+    {
+      "ids": ["id-1", "id-3"],
+      "scores": [0.97, 0.91],
+      "metadatas": [{"source": "faq"}, {"source": "faq"}],
+      "documents": ["doc text 1", "doc text 3"]
+    },
+    {
+      "ids": ["id-7"],
+      "scores": [0.88],
+      "metadatas": [{"source": "faq"}],
+      "documents": ["doc text 7"]
+    }
+  ]
 }
 ```
 
-### `POST /tenants/{tenant}/databases/{database}/collections/{collection}/search_hybrid`
-
-Request:
-
-```json
-{
-  "query": [0.1, 0.2, 0.3],
-  "query_text": "turboquant roadmap",
-  "top_k": 10,
-  "dense_weight": 0.7,
-  "sparse_weight": 0.3,
-  "where_filter": {"tenant": {"$eq": "a"}},
-  "include_document": true
-}
-```
-
-Response shape: same as `/search`.
-
-### `POST /tenants/{tenant}/databases/{database}/collections/{collection}/search_rerank`
-
-Request:
-
-```json
-{
-  "query": [0.1, 0.2, 0.3],
-  "top_k": 10,
-  "rerank_top_n": 50,
-  "where_filter": {"tenant": {"$eq": "a"}},
-  "ann_search_list_size": 64
-}
-```
-
-Response shape: same as `/search`.
-
-Note: reranker model callback transport is implementation-defined (local plugin/model ID in service context).
+Only fields listed in `include` are present in each result row.
 
 ## Index and Maintenance
 
-### `POST /tenants/{tenant}/databases/{database}/collections/{collection}/index`
+### `POST /v1/tenants/{tenant}/databases/{database}/collections/{collection}/index`
 
-Request:
-
-```json
-{
-  "max_degree": 32,
-  "search_list_size": 100,
-  "alpha": 1.2,
-  "async": true
-}
-```
-
-Response `202` (async):
-
-```json
-{ "job_id": "job_01J...", "status": "queued" }
-```
-
-### `POST /tenants/{tenant}/databases/{database}/collections/{collection}/compact`
+Enqueue an HNSW index build job. Index parameters (max_degree, ef_construction, etc.) are fixed at the server's defaults — use the embedded `Database.create_index()` API for custom tuning.
 
 Request:
 
@@ -301,104 +277,145 @@ Request:
 { "async": true }
 ```
 
-Response `202`: same job format.
+Response `202`:
 
-### `POST /tenants/{tenant}/databases/{database}/collections/{collection}/snapshot`
+```json
+{ "job_id": "job_0000000000000001", "status": "queued" }
+```
+
+### `POST /v1/tenants/{tenant}/databases/{database}/collections/{collection}/compact`
+
+Enqueue a background compaction job.
+
+Request:
+
+```json
+{ "async": true }
+```
+
+Response `202`:
+
+```json
+{ "job_id": "job_0000000000000002", "status": "queued" }
+```
+
+### `POST /v1/tenants/{tenant}/databases/{database}/collections/{collection}/snapshot`
+
+Enqueue a snapshot job. Copies the collection directory to `<TQ_LOCAL_ROOT>/snapshots/{tenant}/{database}/{collection}/{snapshot_name}/`.
 
 Request:
 
 ```json
 {
-  "snapshot_name": "docs-2026-03-28",
+  "snapshot_name": "docs-backup",
   "async": true
 }
 ```
 
-Response `202`: same job format.
+`snapshot_name` is optional; defaults to `snapshot_{created_at}_{job_id}`.
 
-### `POST /tenants/{tenant}/databases/{database}/collections/{collection}/restore`
-
-Request:
+Response `202`:
 
 ```json
-{
-  "snapshot_name": "docs-2026-03-28",
-  "async": true
-}
+{ "job_id": "job_0000000000000003", "status": "queued" }
 ```
 
-Response `202`: same job format.
+## Quota Usage
 
-## Stats
+### `GET /v1/tenants/{tenant}/databases/{database}/quota_usage`
 
-### `GET /tenants/{tenant}/databases/{database}/collections/{collection}/stats`
+Returns current quota limits and usage for a database.
 
 Response `200`:
 
 ```json
 {
-  "vector_count": 120000,
-  "physical_record_count": 130000,
-  "deleted_record_count": 10000,
-  "segment_count": 8,
-  "buffered_vectors": 0,
-  "dimension": 1536,
-  "bits": 4,
-  "total_disk_bytes": 123456789,
-  "segment_min_bytes": 1000,
-  "segment_max_bytes": 2000,
-  "segment_avg_bytes": 1500.0,
-  "segment_skew_ratio": 2.0,
-  "has_index": true,
-  "index_nodes": 120000,
-  "index_search_list_size": 100,
-  "index_alpha": 1.2,
-  "compaction_runs": 12,
-  "compaction_recovery_runs": 1,
-  "last_reclaimed_segments": 4
+  "tenant": "t1",
+  "database": "db1",
+  "max_collections": null,
+  "max_vectors": 1000000,
+  "max_disk_bytes": null,
+  "max_concurrent_jobs": 4,
+  "current_collections": 3,
+  "current_vectors": 50000,
+  "current_disk_bytes": 123456789,
+  "queued_jobs": 0,
+  "running_jobs": 1
 }
 ```
+
+`null` limit means unrestricted.
 
 ## Jobs
 
-### `GET /jobs/{job_id}`
+### `GET /v1/jobs/{job_id}`
 
-Response `200`:
+Response `200` — job record nested under `"job"`:
 
 ```json
 {
-  "job_id": "job_01J...",
-  "type": "index_build",
-  "status": "running",
-  "tenant": "t1",
-  "database": "db1",
-  "collection": "docs",
-  "created_at": "2026-03-28T18:00:00Z",
-  "started_at": "2026-03-28T18:00:02Z",
-  "completed_at": null,
-  "progress": {"done": 1200, "total": 10000},
-  "error": null
+  "job": {
+    "job_id": "job_0000000000000001",
+    "job_type": "index_build",
+    "status": "running",
+    "tenant": "t1",
+    "database": "db1",
+    "collection": "docs",
+    "snapshot_name": null,
+    "created_at": "1743800000",
+    "started_at": "1743800002",
+    "completed_at": null,
+    "error": null,
+    "attempts": 1,
+    "max_attempts": 3
+  }
 }
 ```
 
-### `GET /tenants/{tenant}/databases/{database}/collections/{collection}/jobs`
+`job_type` values: `"compact"`, `"index_build"`, `"snapshot"`
+
+`status` values: `"queued"`, `"running"`, `"succeeded"`, `"failed"`, `"canceled"`
+
+Timestamps are Unix epoch seconds as strings.
+
+### `GET /v1/tenants/{tenant}/databases/{database}/collections/{collection}/jobs`
+
+List all jobs for a collection.
 
 Response `200`:
 
 ```json
 {
   "jobs": [
-    {"job_id": "job_01J...", "type": "index_build", "status": "succeeded"}
+    {
+      "job_id": "job_0000000000000001",
+      "job_type": "index_build",
+      "status": "succeeded",
+      ...
+    }
   ]
 }
 ```
 
+### `POST /v1/jobs/{job_id}/cancel`
+
+Cancel a queued job. Returns `409` if the job is already running or terminal.
+
+Response `200`: same `JobStatusResponse` shape as `GET /v1/jobs/{job_id}`.
+
+### `POST /v1/jobs/{job_id}/retry`
+
+Retry a failed or canceled job. Returns `409` if the job is not in a retryable state or retry budget is exhausted (max 3 attempts).
+
+Response `200`: same `JobStatusResponse` shape as `GET /v1/jobs/{job_id}`.
+
 ## Security and Isolation Rules
 
-- Request tenant must match authenticated tenant unless caller has tenant-admin cross-scope role.
-- All reads/writes require resource-level authorization.
-- Quota checks run before mutating operations.
-- Job APIs must enforce same tenant/database/collection visibility constraints.
+- All requests (except `/healthz`) require `Authorization: ApiKey <key>`.
+- The authenticated principal's `tenant_id` must match the request's `{tenant}` path segment.
+- All reads/writes require a matching role binding (checked against `auth_store.json`).
+- Quota checks run before every mutating operation.
+- Job visibility is scoped to the tenant/database/collection of the job.
 
 ## Versioning
 
@@ -406,13 +423,15 @@ Response `200`:
 - Additive fields are allowed in responses.
 - Clients must ignore unknown fields.
 
-## Implementation Notes
+## HTTP Status Code Mapping
 
-- Map `invalid_argument` to HTTP 400.
-- Map `unauthenticated` to 401.
-- Map `forbidden` to 403.
-- Map `not_found` to 404.
-- Map `conflict` and `resource_busy` to 409.
-- Map `quota_exceeded` and `rate_limited` to 429.
-- Map `internal` to 500.
+| Code | Error code |
+|------|------------|
+| 400 | `invalid_argument` |
+| 401 | `unauthenticated` |
+| 403 | `forbidden` |
+| 404 | `not_found` |
+| 409 | `conflict` |
+| 429 | `quota_exceeded` |
+| 500 | `internal` |
 

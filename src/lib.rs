@@ -34,7 +34,7 @@
 //!
 //! ## Deployment
 //!
-//! - **Embedded** (`turboquantdb` Python package) — runs in-process, no server needed.
+//! - **Embedded** (`tqdb` Python package) — runs in-process, no server needed.
 //! - **Server** (`server/` workspace) — Axum HTTP service with multi-tenancy, RBAC, quotas.
 
 use pyo3::prelude::*;
@@ -45,7 +45,7 @@ pub mod quantizer;
 pub mod storage;
 
 #[pymodule]
-fn turboquantdb(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn tqdb(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     python::register(py, m)?;
     Ok(())
 }

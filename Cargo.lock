@@ -1028,8 +1028,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "turboquantdb"
-version = "0.1.0"
+name = "tqdb"
+version = "0.2.0"
 dependencies = [
  "bincode",
  "half",

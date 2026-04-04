@@ -8,7 +8,7 @@ Measures:
   - Index memory estimate
 
 Usage:
-    pip install numpy turboquantdb
+    pip install numpy tqdb
     python benchmarks/run_recall_bench.py --n 10000 --d 1536 --bits 4
 """
 
@@ -167,10 +167,10 @@ def run_benchmark(args):
 
     # --- Try importing TurboQuantDB ---
     try:
-        import turboquantdb as tq
+        import tqdb as tq
         HAS_TQ = True
     except ImportError:
-        print("[WARNING] turboquantdb not installed. Run `maturin develop --release` first.")
+        print("[WARNING] tqdb not installed. Run `maturin develop --release` first.")
         print("Showing exact Numpy baseline only.\n")
         HAS_TQ = False
 

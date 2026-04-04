@@ -14,7 +14,7 @@ This is the target architecture for evolving TurboQuantDB from embedded-only usa
 
 - Engine already supports per-collection isolation and collection lifecycle operations.
 - Persistence model is local/remote-backed files per collection with manifest/WAL/segments/metadata.
-- Python API has both direct `Database` access and collection-first `Client` APIs.
+- Python API has both direct `Database` access and collection-oriented usage via `collection=` parameter.
 - No service process, no auth, no tenant boundary enforcement in request path.
 
 ## Scope and Non-Goals
@@ -165,7 +165,7 @@ Job states:
 - `running`
 - `succeeded`
 - `failed`
-- `cancelled`
+- `canceled`
 
 Recovery:
 
@@ -263,11 +263,9 @@ Risk: background job contention with foreground writes.
 
 ## Immediate Follow-up Tasks
 
-1. [x] Create `docs/M5_API_SPEC.md` with request/response schemas and error codes.
+1. [x] Document the server API — see `docs/SERVER_API.md`.
 2. [x] Scaffold `server` crate with routing, auth middleware, and request context.
 3. Implement tenant/database path resolver and catalog helpers in storage layer.
 
-
-Related spec: docs/M5_API_SPEC.md
 
 

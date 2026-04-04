@@ -5,9 +5,9 @@ use std::path::Path;
 use std::sync::Arc;
 use tempfile::tempdir;
 
-use turboquantdb::storage::backend::StorageBackend;
-use turboquantdb::storage::engine::{DistanceMetric, TurboQuantEngine};
-use turboquantdb::storage::graph::GraphManager;
+use tqdb::storage::backend::StorageBackend;
+use tqdb::storage::engine::{DistanceMetric, TurboQuantEngine};
+use tqdb::storage::graph::GraphManager;
 
 /// Test full insert → flush → search roundtrip with metadata.
 #[test]
@@ -717,8 +717,8 @@ fn test_search_ann_override_api_and_high_beam_matches_bruteforce_top1() {
 
 #[test]
 fn test_compaction_recovery_deletes_old_segments_when_marker_exists() {
-    use turboquantdb::storage::compaction::Compactor;
-    use turboquantdb::storage::segment::{Segment, SegmentRecord};
+    use tqdb::storage::compaction::Compactor;
+    use tqdb::storage::segment::{Segment, SegmentRecord};
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().to_str().unwrap();
@@ -856,7 +856,7 @@ fn test_scoped_catalog_helpers_list_and_delete() {}
 
 #[test]
 fn test_rerank_disabled_behavior() {
-    use turboquantdb::storage::engine::RerankPrecision;
+    use tqdb::storage::engine::RerankPrecision;
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().to_str().unwrap();
@@ -947,7 +947,7 @@ fn test_hnsw_beam_search_recall() {
 /// and that values can be recovered within f16 precision (relative error < 0.2%).
 #[test]
 fn test_rerank_precision_f16_roundtrip() {
-    use turboquantdb::storage::engine::RerankPrecision;
+    use tqdb::storage::engine::RerankPrecision;
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().to_str().unwrap();
@@ -1005,7 +1005,7 @@ fn test_rerank_precision_f16_roundtrip() {
 /// Test that rerank_precision=F32 creates live_vectors.bin with exactly n*d*4 bytes.
 #[test]
 fn test_rerank_precision_f32_file_size() {
-    use turboquantdb::storage::engine::RerankPrecision;
+    use tqdb::storage::engine::RerankPrecision;
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().to_str().unwrap();
@@ -1053,7 +1053,7 @@ fn test_rerank_precision_f32_file_size() {
 /// and that both modes produce search results.
 #[test]
 fn test_rerank_precision_f16_vs_f32_size_ratio() {
-    use turboquantdb::storage::engine::RerankPrecision;
+    use tqdb::storage::engine::RerankPrecision;
 
     let d = 64usize;
     let n = 20usize;
@@ -1111,7 +1111,7 @@ fn test_rerank_precision_f16_vs_f32_size_ratio() {
 /// Test that default (Disabled) mode does NOT create live_vectors.bin.
 #[test]
 fn test_rerank_precision_disabled_no_file() {
-    use turboquantdb::storage::engine::RerankPrecision;
+    use tqdb::storage::engine::RerankPrecision;
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().to_str().unwrap();

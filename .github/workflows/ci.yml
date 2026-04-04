@@ -45,9 +45,9 @@ jobs:
         run: |
           python - <<'EOF'
           import numpy as np
-          import turboquantdb
+          import tqdb
 
-          db = turboquantdb.Database.open("/tmp/smoke_db", dimension=16, bits=4)
+          db = tqdb.Database.open("/tmp/smoke_db", dimension=16, bits=4)
           vec = np.random.rand(16).astype(np.float32)
           db.insert("id-1", vec, {})
           results = db.search(vec, top_k=1)

@@ -55,7 +55,7 @@ pip install tqdb
 Three presets covering the main use cases — pick one and you're ready:
 
 ```python
-from turboquantdb import Database
+from tqdb import Database
 
 # High Quality — best recall, exact reranking
 db = Database.open(path, dimension=DIM, bits=4, rerank=True, rerank_precision="f16")
@@ -84,7 +84,7 @@ Full parameter reference: [`docs/PYTHON_API.md`](https://github.com/jyunming/Tur
 
 ```python
 import numpy as np
-from turboquantdb import Database
+from tqdb import Database
 
 db = Database.open("./my_db", dimension=1536, bits=4, metric="ip", rerank=True)
 
@@ -181,9 +181,40 @@ results = db.search(query, top_k=10, ann_search_list_size=200)
 
 Measured on **DBpedia OpenAI3 embeddings** ([Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-1M](https://huggingface.co/datasets/Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-1M)) — real 1536-dim embeddings, n=100k vectors, 500 queries, Recall@1@k metric. HNSW uses M=32, ef_construction=200.
 
-![Benchmark plots](docs/benchmark_plot.png)
+### Algorithm validation (reproducing paper Section 4.4)
 
-**n=100k × 1536-dim, brute-force Recall@1@k:**
+Brute-force recall across all three datasets from [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) Figure 5 — n=100k vectors, paper values read visually from plots (approximate). Full script: [`benchmarks/paper_recall_bench.py`](https://github.com/jyunming/TurboQuantDB/blob/main/benchmarks/paper_recall_bench.py).
+
+**GloVe-200** (d=200, 100k corpus, 10k queries, brute-force)
+
+| Method | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
+|---|---|---|---|---|---|---|---|
+| TurboQuant 2-bit (paper Fig. 5a) | ≈55.0% | ≈70.0% | ≈83.0% | ≈91.0% | ≈96.0% | ≈99.0% | ≈100% |
+| **TQDB b=2** | **37.1%** | **50.0%** | **62.0%** | **73.0%** | **82.1%** | **88.9%** | **93.5%** |
+| TurboQuant 4-bit (paper Fig. 5a) | ≈86.0% | ≈96.0% | ≈99.0% | ≈100% | 100% | 100% | 100% |
+| **TQDB b=4** | **73.9%** | **88.3%** | **96.4%** | **99.2%** | **99.9%** | **100%** | **100%** |
+
+**DBpedia OpenAI3 d=1536** (d=1536, 100k corpus, 1k queries, brute-force)
+
+| Method | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
+|---|---|---|---|---|---|---|---|
+| TurboQuant 2-bit (paper Fig. 5b) | ≈89.5% | ≈98.0% | ≈99.5% | ≈100% | 100% | 100% | 100% |
+| **TQDB b=2** | **79.7%** | **93.3%** | **98.3%** | **99.7%** | **99.9%** | **100%** | **100%** |
+| TurboQuant 4-bit (paper Fig. 5b) | ≈97.0% | ≈100% | 100% | 100% | 100% | 100% | 100% |
+| **TQDB b=4** | **92.6%** | **99.1%** | **99.9%** | **100%** | 100% | 100% | 100% |
+
+**DBpedia OpenAI3 d=3072** (d=3072, 100k corpus, 1k queries, brute-force)
+
+| Method | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
+|---|---|---|---|---|---|---|---|
+| TurboQuant 2-bit (paper Fig. 5c) | ≈90.5% | ≈98.5% | ≈99.5% | ≈100% | 100% | 100% | 100% |
+| **TQDB b=2** | **84.6%** | **95.1%** | **99.0%** | **100%** | 100% | 100% | 100% |
+| TurboQuant 4-bit (paper Fig. 5c) | ≈97.5% | ≈100% | 100% | 100% | 100% | 100% | 100% |
+| **TQDB b=4** | **94.8%** | **99.1%** | **100%** | **100%** | 100% | 100% | 100% |
+
+The GloVe gap (~12–18% at k=1) is expected: d=200 is the hardest case (fewest bits per dimension), and we evaluate on the first 100k vectors from a 1.18M corpus while the paper used a random sample. From k=4 onward the gap is ≤2.6% on GloVe and ≤1% on DBpedia. For high-dimensional embeddings (d≥1536), TQDB matches the paper within ~5% at k=1 and within 1% from k=4. The paper also reports TurboQuant quantization time 0.001 s versus Product Quantization 240 s at d=1536 — TQDB inherits the same zero-training-time property.
+
+### Full results — n=100k × 1536-dim, brute-force Recall@1@k:
 
 | Mode | Recall@1 | Recall@10 | Disk | Compression | p50 latency |
 |------|----------|-----------|------|-------------|-------------|
@@ -206,7 +237,7 @@ Measured on **DBpedia OpenAI3 embeddings** ([Qdrant/dbpedia-entities-openai3-tex
 ## RAG Integration
 
 ```python
-from turboquantdb.rag import TurboQuantRetriever
+from tqdb.rag import TurboQuantRetriever
 
 retriever = TurboQuantRetriever(db_path="./rag_db", dimension=1536, bits=4)
 retriever.add_texts(texts=texts, embeddings=embeddings, metadatas=metadatas)
@@ -270,20 +301,20 @@ The brute-force search path (`_use_ann=False`) is the paper-conformant mode — 
 | `src/quantizer/prod.rs` | `ProdQuantizer` — MSE + QJL orchestrator |
 | `src/quantizer/mse.rs` | `MseQuantizer` — QR rotation + Lloyd-Max codebook |
 | `src/quantizer/qjl.rs` | `QjlQuantizer` — 1-bit Gaussian projection, bit-packed |
-| `python/turboquantdb/rag.py` | `TurboQuantRetriever` — LangChain-style wrapper |
+| `python/tqdb/rag.py` | `TurboQuantRetriever` — LangChain-style wrapper |
 | `server/` | Optional Axum HTTP service (separate Cargo workspace) |
 
 ---
 
 ## Server Mode
 
-> **Status: experimental.** The server crate compiles and the core endpoints work, but it has not been hardened for production use. The embedded library (`tqdb` Python package, `from turboquantdb import Database`) is the primary supported interface.
+> **Status: experimental.** The server crate compiles and the core endpoints work, but it has not been hardened for production use. The embedded library (`tqdb` Python package, `from tqdb import Database`) is the primary supported interface.
 
 An optional Axum-based HTTP server is available in `server/` for multi-tenant deployments. It adds API key authentication, quota enforcement, and async job management (compaction, index building, snapshots).
 
 ```bash
 cd server && cargo build --release
-TQ_SERVER_ADDR=0.0.0.0:8080 TQ_LOCAL_ROOT=./data ./target/release/turboquantdb-server
+TQ_SERVER_ADDR=0.0.0.0:8080 TQ_LOCAL_ROOT=./data ./target/release/tqdb-server
 ```
 
 See [`server/README.md`](https://github.com/jyunming/TurboQuantDB/blob/main/server/README.md) for the full endpoint reference. Key env vars:
