@@ -6,31 +6,14 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
-## [0.2.0] — 2026-04-04
-
-### Changed (breaking)
-
-- **Rename Python import namespace** — `from tqdb import Database` replaces `from turboquantdb import Database`; the `Database` class and all parameters are unchanged
-- Server binary renamed `turboquantdb-server` → `tqdb-server`
-- Rust crate renamed `turboquantdb` → `tqdb`
-
-### Fixed
-
-- **fix(quantizer)**: normalize vectors to unit sphere before quantization — fixes 2× recall gap for non-normalized input vectors; Lloyd-Max codebook assumes unit-sphere variance
-- **fix(wal)**: store and restore vector norm in WAL entries — norms written as `0.0` during crash recovery caused all recovered vectors to score `0.0` under IP metric
+## [Unreleased]
 
 ### Infrastructure
 
-- Comprehensive regression gate tracking recall, latency, disk, and RAM metrics across all configurations
-- Paper-methodology precommit regression gate
-
----
-
-## [0.1.1] — 2026-04-04
-
-### Fixed
-
-- Release CI: replaced `--find-interpreter` with `-i python` in Windows and macOS matrix jobs to prevent duplicate wheels and "ZIP archive: Trailing data" PyPI upload failures
+- Comprehensive benchmark system (`benchmarks/paper_recall_bench.py`, `bench_core.py`, `perf_tracker.py`) reproducing Section 4.4 of arXiv:2504.19874 across GloVe-200, DBpedia-1536, and DBpedia-3072
+- Public README benchmark tables (R@1–64, throughput, latency, disk, RAM, MRR) and embedded recall-curve plots
+- Performance history tracking (`perf_history.json`) with HTML trend viewer
+- CI: brute-force recall quality gate threshold calibrated per benchmark dimension
 
 ---
 
