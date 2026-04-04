@@ -8,6 +8,30 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ## [Unreleased]
 
+### Infrastructure
+
+- Comprehensive benchmark system (`benchmarks/paper_recall_bench.py`, `bench_core.py`, `perf_tracker.py`) reproducing Section 4.4 of arXiv:2504.19874 across GloVe-200, DBpedia-1536, and DBpedia-3072
+- Public README benchmark tables (R@1–64, throughput, latency, disk, RAM, MRR) and embedded recall-curve plots
+- Performance history tracking (`perf_history.json`) with HTML trend viewer
+- CI: brute-force recall quality gate threshold calibrated per benchmark dimension
+
+---
+
+## [0.2.0] — 2026-04-15
+
+### Changed
+
+- **Package renamed from `turboquantdb` to `tqdb`** — `import tqdb` replaces `import turboquantdb`; the `Database` class is the same
+- `src/lib.rs` doc comment updated to reference `tqdb` Python package
+
+---
+
+## [0.1.1] — 2026-04-10
+
+### Fixed
+
+- Release CI: replaced `--find-interpreter` with `-i python` in Windows and macOS matrix jobs to prevent duplicate wheels and "ZIP archive: Trailing data" PyPI upload failures
+
 ---
 
 ## [0.2.0] — 2026-04-15

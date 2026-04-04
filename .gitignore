@@ -62,8 +62,30 @@ docs/ROADMAP_BACKLOG.md
 2504.19874v1.pdf
 convert_pdf.py
 
-# Benchmark folder (local dev tooling, not for public repo)
-/benchmarks/
+# Benchmark folder — ignore generated data, tmp dirs, and result files
+# but commit the perf gate scripts
+/benchmarks/__pycache__/
+/benchmarks/_paper_bench_cache/
+/benchmarks/artifacts*/
+/benchmarks/store_compare_work*/
+/benchmarks/tmp_*/
+/benchmarks/*.json
+!/benchmarks/perf_baseline.json
+/benchmarks/*.md
+/benchmarks/real_world_bench_v2.py
+/benchmarks/scale_matrix_bench.py
+/benchmarks/tqdb_mode_bench.py
+/benchmarks/store_comparison_bench.py
+/benchmarks/_combine_bench_results.py
+/benchmarks/_full_bench_report.txt
+/benchmarks/_full_bench_report.md
+/benchmarks/run_bench_private.py
+/benchmarks/_bench_*_results.json
+/benchmarks/_private_report.md
+/benchmarks/_private_plots.png
+/benchmarks/_perf_history.html
+!/benchmarks/perf_history.json
+!/benchmarks/benchmark_plots.png
 
 # Benchmark output artifacts
 bench_results_*.json

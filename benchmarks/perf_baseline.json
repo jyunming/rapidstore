@@ -1,0 +1,62 @@
+{
+  "description": "Best-ever local perf for each metric. Bar only goes up. Commits regressing >5% from any best are blocked unless --force / TQDB_PERF_SKIP=1.",
+  "config": {
+    "n": 10000,
+    "d": 200,
+    "bits": 4,
+    "k_values": [
+      1,
+      4,
+      8
+    ],
+    "queries": 100,
+    "seed": 42
+  },
+  "tolerance_pct": 5.0,
+  "metrics": {
+    "recall_1_at_1": {
+      "higher_is_better": true,
+      "best": 0.77
+    },
+    "recall_1_at_4": {
+      "higher_is_better": true,
+      "best": 0.95
+    },
+    "recall_1_at_8": {
+      "higher_is_better": true,
+      "best": 1.0
+    },
+    "avg_latency_ms": {
+      "higher_is_better": false,
+      "best": 1.329654999426566
+    },
+    "p50_latency_ms": {
+      "higher_is_better": false,
+      "best": 1.3183999981265515
+    },
+    "p95_latency_ms": {
+      "higher_is_better": false,
+      "best": 1.4557250076904893
+    },
+    "disk_bytes": {
+      "higher_is_better": false,
+      "best": 1991396.0
+    },
+    "compression_ratio": {
+      "higher_is_better": true,
+      "best": 4.017282348663953
+    },
+    "ram_estimate_bytes": {
+      "higher_is_better": false,
+      "best": 1740000.0
+    },
+    "live_codes_bytes": {
+      "higher_is_better": false,
+      "best": 1370000.0
+    },
+    "live_vectors_bytes": {
+      "higher_is_better": false,
+      "best": 0.0
+    }
+  }
+}

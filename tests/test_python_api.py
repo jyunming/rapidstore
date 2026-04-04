@@ -1029,6 +1029,81 @@ class TestTurboQuantRetriever:
         results = retriever.similarity_search(rng.standard_normal(d).tolist(), k=5)
         assert results == []
 
+    # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Recall quality gate (mirrors CI benchmark at smaller scale)
+# ---------------------------------------------------------------------------
+
+class TestRecallQualityGate:
+    """Validates that brute-force recall meets the minimum bar for the CI config.
+
+    Uses a small corpus (n=2000, d=64) so the test stays fast (~2s), while
+    exercising the same code path as the CI benchmark (d=384, n=50000).
+    The 0.70 floor is conservative — production configs typically reach 80%+.
+    """
+
+    def _ground_truth(self, corpus: np.ndarray, query: np.ndarray, k: int) -> set[str]:
+        scores = corpus @ query
+        top_idx = np.argsort(scores)[::-1][:k]
+        return {f"v{i}" for i in top_idx}
+
+    def test_brute_force_recall_bits4(self, tmp_path):
+        """bits=4 brute-force should achieve ≥70 % Recall@10 on random unit vectors."""
+        rng = np.random.default_rng(42)
+        n, d, k = 2000, 64, 10
+        corpus = rng.standard_normal((n, d)).astype(np.float32)
+        corpus /= np.linalg.norm(corpus, axis=1, keepdims=True)
+
+        db = Database.open(str(tmp_path / "db"), d, bits=4, seed=42, metric="ip")
+        ids = [f"v{i}" for i in range(n)]
+        db.insert_batch(ids, corpus)
+
+        queries = rng.standard_normal((20, d)).astype(np.float32)
+        queries /= np.linalg.norm(queries, axis=1, keepdims=True)
+
+        recalls = []
+        for q in queries:
+            gt = self._ground_truth(corpus, q, k)
+            results = db.search(q, top_k=k)
+            retrieved = {r["id"] for r in results}
+            recalls.append(len(gt & retrieved) / k)
+
+        avg_recall = float(np.mean(recalls))
+        assert avg_recall >= 0.70, (
+            f"Brute-force Recall@{k} = {avg_recall:.1%} is below the 70% minimum. "
+            "This may indicate a quantizer regression."
+        )
+
+    def test_brute_force_recall_bits2(self, tmp_path):
+        """bits=2 brute-force should achieve ≥55 % Recall@10 (lower bits = higher distortion)."""
+        rng = np.random.default_rng(0)
+        n, d, k = 2000, 64, 10
+        corpus = rng.standard_normal((n, d)).astype(np.float32)
+        corpus /= np.linalg.norm(corpus, axis=1, keepdims=True)
+
+        db = Database.open(str(tmp_path / "db"), d, bits=2, seed=42, metric="ip")
+        ids = [f"v{i}" for i in range(n)]
+        db.insert_batch(ids, corpus)
+
+        queries = rng.standard_normal((20, d)).astype(np.float32)
+        queries /= np.linalg.norm(queries, axis=1, keepdims=True)
+
+        recalls = []
+        for q in queries:
+            gt = self._ground_truth(corpus, q, k)
+            results = db.search(q, top_k=k)
+            retrieved = {r["id"] for r in results}
+            recalls.append(len(gt & retrieved) / k)
+
+        avg_recall = float(np.mean(recalls))
+        assert avg_recall >= 0.55, (
+            f"Brute-force Recall@{k} = {avg_recall:.1%} is below the 55% minimum for bits=2. "
+            "This may indicate a quantizer regression."
+        )
+
+
     def test_fallback_stub_raises_runtime_error(self):
         """The fallback Database stub (used when extension is unavailable) must raise."""
         import importlib, sys
