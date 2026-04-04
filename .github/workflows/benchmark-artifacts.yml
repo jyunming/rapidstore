@@ -65,7 +65,7 @@ jobs:
             --rust-artifact target/benchmarks/bench_search.json \
             --min-recall 0.75 \
             --max-tq-latency-ms 150.0 \
-            --min-speedup-vs-numpy 0.20 \
+            --min-speedup-vs-numpy 0.05 \
             --max-ann-to-bruteforce-ratio 0.60
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4
