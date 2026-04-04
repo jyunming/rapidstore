@@ -3,7 +3,7 @@
 TurboQuantDB is a high-performance, embedded vector database written in Rust with Python bindings (PyO3/Maturin). It implements the TurboQuant algorithm (arXiv:2504.19874) for data-oblivious vector quantization — zero training time, 2–4 bit compression, unbiased inner product estimation via QJL transforms.
 
 Two deployment modes:
-- **Embedded** — `turboquantdb` Python package, runs in-process (like DuckDB)
+- **Embedded** — `tqdb` Python package, runs in-process (like DuckDB)
 - **Server** — Axum HTTP service in `server/`, with multi-tenancy, RBAC, quotas, and async jobs
 
 ---
@@ -63,7 +63,7 @@ cd server && cargo test -q
 | `src/quantizer/qjl.rs` | `QjlQuantizer` — dense Gaussian projection, 1-bit sign bit-packed |
 | `src/linalg/hadamard.rs` | In-place O(d log d) FWHT and SRHT (legacy path) |
 | `src/linalg/matmul.rs` | GEMM/SGEMM via matrixmultiply crate |
-| `python/turboquantdb/rag.py` | `TurboQuantRetriever` — LangChain-style wrapper |
+| `python/tqdb/rag.py` | `TurboQuantRetriever` — LangChain-style wrapper |
 | `server/` | Axum HTTP service — separate Cargo workspace |
 
 ### Data Flow
@@ -97,7 +97,7 @@ cd server && cargo test -q
 ## Python API Reference
 
 ```python
-from turboquantdb import Database
+from tqdb import Database
 
 db = Database.open(
     path,               # str — directory for database files

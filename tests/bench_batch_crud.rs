@@ -1,7 +1,7 @@
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::time::Instant;
-use turboquantdb::storage::engine::{BatchWriteItem, TurboQuantEngine};
+use tqdb::storage::engine::{BatchWriteItem, TurboQuantEngine};
 
 #[test]
 #[ignore]

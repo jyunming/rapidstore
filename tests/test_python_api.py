@@ -11,8 +11,8 @@ import tempfile
 import numpy as np
 import pytest
 
-import turboquantdb as tq
-from turboquantdb import Database
+import tqdb as tq
+from tqdb import Database
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +587,7 @@ class TestFlushClose:
 # ---------------------------------------------------------------------------
 
 class TestTurboQuantRetrieverOps:
-    """Tests for the TurboQuantRetriever class in turboquantdb.rag."""
+    """Tests for the TurboQuantRetriever class in tqdb.rag."""
 
     DIM = 32
 
@@ -599,12 +599,12 @@ class TestTurboQuantRetrieverOps:
         return vecs.tolist()
 
     def test_import_retriever(self):
-        """TurboQuantRetriever can be imported from turboquantdb.rag."""
-        from turboquantdb.rag import TurboQuantRetriever  # noqa: F401
+        """TurboQuantRetriever can be imported from tqdb.rag."""
+        from tqdb.rag import TurboQuantRetriever  # noqa: F401
 
     def test_add_texts_without_metadata(self, tmp_path):
         """add_texts with no metadata arg uses empty dicts."""
-        from turboquantdb.rag import TurboQuantRetriever
+        from tqdb.rag import TurboQuantRetriever
 
         retriever = TurboQuantRetriever(
             str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
@@ -617,7 +617,7 @@ class TestTurboQuantRetrieverOps:
 
     def test_add_texts_with_metadata(self, tmp_path):
         """add_texts stores metadata alongside the text."""
-        from turboquantdb.rag import TurboQuantRetriever
+        from tqdb.rag import TurboQuantRetriever
 
         retriever = TurboQuantRetriever(
             str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
@@ -633,7 +633,7 @@ class TestTurboQuantRetrieverOps:
 
     def test_add_texts_accumulates_ids(self, tmp_path):
         """Calling add_texts twice generates non-overlapping IDs."""
-        from turboquantdb.rag import TurboQuantRetriever
+        from tqdb.rag import TurboQuantRetriever
 
         retriever = TurboQuantRetriever(
             str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
@@ -647,7 +647,7 @@ class TestTurboQuantRetrieverOps:
 
     def test_similarity_search_returns_list_of_dicts(self, tmp_path):
         """similarity_search returns a list of dicts with text/metadata/score."""
-        from turboquantdb.rag import TurboQuantRetriever
+        from tqdb.rag import TurboQuantRetriever
 
         retriever = TurboQuantRetriever(
             str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
@@ -668,7 +668,7 @@ class TestTurboQuantRetrieverOps:
 
     def test_similarity_search_result_text_is_original(self, tmp_path):
         """similarity_search results contain the original inserted text."""
-        from turboquantdb.rag import TurboQuantRetriever
+        from tqdb.rag import TurboQuantRetriever
 
         retriever = TurboQuantRetriever(
             str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
@@ -685,7 +685,7 @@ class TestTurboQuantRetrieverOps:
 
     def test_similarity_search_empty_db_returns_empty(self, tmp_path):
         """similarity_search on an empty database returns an empty list."""
-        from turboquantdb.rag import TurboQuantRetriever
+        from tqdb.rag import TurboQuantRetriever
 
         retriever = TurboQuantRetriever(
             str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
@@ -696,7 +696,7 @@ class TestTurboQuantRetrieverOps:
 
     def test_similarity_search_k_limits_results(self, tmp_path):
         """similarity_search respects the k parameter."""
-        from turboquantdb.rag import TurboQuantRetriever
+        from tqdb.rag import TurboQuantRetriever
 
         retriever = TurboQuantRetriever(
             str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
@@ -711,7 +711,7 @@ class TestTurboQuantRetrieverOps:
 
     def test_similarity_search_metadata_preserved(self, tmp_path):
         """Metadata inserted via add_texts is returned in search results."""
-        from turboquantdb.rag import TurboQuantRetriever
+        from tqdb.rag import TurboQuantRetriever
 
         retriever = TurboQuantRetriever(
             str(tmp_path / "db"), dimension=self.DIM, bits=4, seed=42
@@ -949,10 +949,10 @@ class TestTurboQuantRetriever:
     """Tests for the LangChain-style TurboQuantRetriever wrapper."""
 
     def test_import(self):
-        from turboquantdb.rag import TurboQuantRetriever  # noqa: F401
+        from tqdb.rag import TurboQuantRetriever  # noqa: F401
 
     def test_add_texts_and_similarity_search(self, tmp_path):
-        from turboquantdb.rag import TurboQuantRetriever
+        from tqdb.rag import TurboQuantRetriever
 
         d = 32
         retriever = TurboQuantRetriever(str(tmp_path / "rag_db"), dimension=d, bits=4, seed=42)
@@ -973,7 +973,7 @@ class TestTurboQuantRetriever:
             assert "score" in r
 
     def test_add_texts_with_metadata(self, tmp_path):
-        from turboquantdb.rag import TurboQuantRetriever
+        from tqdb.rag import TurboQuantRetriever
 
         d = 32
         retriever = TurboQuantRetriever(str(tmp_path / "rag_db"), dimension=d, bits=4, seed=42)
@@ -990,7 +990,7 @@ class TestTurboQuantRetriever:
         assert results[0]["metadata"]["tag"] == "b"
 
     def test_add_texts_without_metadata_defaults_empty(self, tmp_path):
-        from turboquantdb.rag import TurboQuantRetriever
+        from tqdb.rag import TurboQuantRetriever
 
         d = 16
         retriever = TurboQuantRetriever(str(tmp_path / "rag_db"), dimension=d, bits=4, seed=42)
@@ -1004,7 +1004,7 @@ class TestTurboQuantRetriever:
         assert results[0]["metadata"] == {}
 
     def test_multiple_add_texts_accumulates(self, tmp_path):
-        from turboquantdb.rag import TurboQuantRetriever
+        from tqdb.rag import TurboQuantRetriever
 
         d = 16
         retriever = TurboQuantRetriever(str(tmp_path / "rag_db"), dimension=d, bits=4, seed=42)
@@ -1021,7 +1021,7 @@ class TestTurboQuantRetriever:
         assert len(retriever.doc_store) == 5
 
     def test_similarity_search_empty_db_returns_empty(self, tmp_path):
-        from turboquantdb.rag import TurboQuantRetriever
+        from tqdb.rag import TurboQuantRetriever
 
         d = 16
         retriever = TurboQuantRetriever(str(tmp_path / "rag_db"), dimension=d, bits=4, seed=42)
@@ -1034,28 +1034,28 @@ class TestTurboQuantRetriever:
         import importlib, sys
 
         # Temporarily hide the real extension to force the fallback path
-        real_mod = sys.modules.pop("turboquantdb.turboquantdb", None)
+        real_mod = sys.modules.pop("tqdb.tqdb", None)
         try:
             import importlib.util
             spec = importlib.util.spec_from_file_location(
                 "_rag_stub_test",
-                "python/turboquantdb/rag.py",
+                "python/tqdb/rag.py",
             )
             mod = importlib.util.module_from_spec(spec)
             # Patch the import inside rag.py to use the stub Database
             mod.__package__ = None  # prevent relative import
-            # Execute with turboquantdb.turboquantdb hidden → ImportError → stub activated
-            orig = sys.modules.get("turboquantdb.turboquantdb")
-            sys.modules["turboquantdb.turboquantdb"] = None  # type: ignore
+            # Execute with tqdb.tqdb hidden → ImportError → stub activated
+            orig = sys.modules.get("tqdb.tqdb")
+            sys.modules["tqdb.tqdb"] = None  # type: ignore
             try:
                 spec.loader.exec_module(mod)
                 with pytest.raises(RuntimeError, match="not available"):
                     mod.Database.open("path", 8)
             finally:
                 if orig is None:
-                    sys.modules.pop("turboquantdb.turboquantdb", None)
+                    sys.modules.pop("tqdb.tqdb", None)
                 else:
-                    sys.modules["turboquantdb.turboquantdb"] = orig
+                    sys.modules["tqdb.tqdb"] = orig
         finally:
             if real_mod is not None:
-                sys.modules["turboquantdb.turboquantdb"] = real_mod
+                sys.modules["tqdb.tqdb"] = real_mod

@@ -55,7 +55,7 @@ pip install tqdb
 Three presets covering the main use cases — pick one and you're ready:
 
 ```python
-from turboquantdb import Database
+from tqdb import Database
 
 # High Quality — best recall, exact reranking
 db = Database.open(path, dimension=DIM, bits=4, rerank=True, rerank_precision="f16")
@@ -84,7 +84,7 @@ Full parameter reference: [`docs/PYTHON_API.md`](https://github.com/jyunming/Tur
 
 ```python
 import numpy as np
-from turboquantdb import Database
+from tqdb import Database
 
 db = Database.open("./my_db", dimension=1536, bits=4, metric="ip", rerank=True)
 
@@ -206,7 +206,7 @@ Measured on **DBpedia OpenAI3 embeddings** ([Qdrant/dbpedia-entities-openai3-tex
 ## RAG Integration
 
 ```python
-from turboquantdb.rag import TurboQuantRetriever
+from tqdb.rag import TurboQuantRetriever
 
 retriever = TurboQuantRetriever(db_path="./rag_db", dimension=1536, bits=4)
 retriever.add_texts(texts=texts, embeddings=embeddings, metadatas=metadatas)
@@ -270,20 +270,20 @@ The brute-force search path (`_use_ann=False`) is the paper-conformant mode — 
 | `src/quantizer/prod.rs` | `ProdQuantizer` — MSE + QJL orchestrator |
 | `src/quantizer/mse.rs` | `MseQuantizer` — QR rotation + Lloyd-Max codebook |
 | `src/quantizer/qjl.rs` | `QjlQuantizer` — 1-bit Gaussian projection, bit-packed |
-| `python/turboquantdb/rag.py` | `TurboQuantRetriever` — LangChain-style wrapper |
+| `python/tqdb/rag.py` | `TurboQuantRetriever` — LangChain-style wrapper |
 | `server/` | Optional Axum HTTP service (separate Cargo workspace) |
 
 ---
 
 ## Server Mode
 
-> **Status: experimental.** The server crate compiles and the core endpoints work, but it has not been hardened for production use. The embedded library (`tqdb` Python package, `from turboquantdb import Database`) is the primary supported interface.
+> **Status: experimental.** The server crate compiles and the core endpoints work, but it has not been hardened for production use. The embedded library (`tqdb` Python package, `from tqdb import Database`) is the primary supported interface.
 
 An optional Axum-based HTTP server is available in `server/` for multi-tenant deployments. It adds API key authentication, quota enforcement, and async job management (compaction, index building, snapshots).
 
 ```bash
 cd server && cargo build --release
-TQ_SERVER_ADDR=0.0.0.0:8080 TQ_LOCAL_ROOT=./data ./target/release/turboquantdb-server
+TQ_SERVER_ADDR=0.0.0.0:8080 TQ_LOCAL_ROOT=./data ./target/release/tqdb-server
 ```
 
 See [`server/README.md`](https://github.com/jyunming/TurboQuantDB/blob/main/server/README.md) for the full endpoint reference. Key env vars:

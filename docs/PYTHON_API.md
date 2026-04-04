@@ -1,6 +1,6 @@
 # Python API Reference
 
-Complete reference for the `turboquantdb` Python package.
+Complete reference for the `tqdb` Python package.
 
 ---
 
@@ -17,7 +17,7 @@ Requires Python 3.10+. Pre-built wheels available for Linux, Windows, and macOS.
 ## Opening a Database
 
 ```python
-from turboquantdb import Database
+from tqdb import Database
 
 db = Database.open(
     path,                    # str — base directory path, created if it doesn't exist
@@ -256,7 +256,7 @@ Filter semantics:
 `TurboQuantRetriever` is a lightweight LangChain-style wrapper around `Database`.
 
 ```python
-from turboquantdb.rag import TurboQuantRetriever
+from tqdb.rag import TurboQuantRetriever
 
 retriever = TurboQuantRetriever(
     db_path,                # str — directory path for the database

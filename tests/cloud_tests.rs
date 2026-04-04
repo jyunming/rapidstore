@@ -1,6 +1,6 @@
 use ndarray::Array1;
 use std::collections::HashMap;
-use turboquantdb::storage::engine::TurboQuantEngine;
+use tqdb::storage::engine::TurboQuantEngine;
 
 #[test]
 fn test_local_file_uri_storage() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

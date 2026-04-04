@@ -2,7 +2,7 @@ import numpy as np
 from typing import Any, Dict, List, Optional
 
 try:
-    from .turboquantdb import Database
+    from .tqdb import Database
 except ImportError:
     class Database:  # type: ignore
         @staticmethod
@@ -16,7 +16,7 @@ except ImportError:
             fast_mode: bool = False,
             rerank_precision: Optional[str] = None,
         ):
-            raise RuntimeError("turboquantdb extension not available")
+            raise RuntimeError("tqdb extension not available")
 
 
 class TurboQuantRetriever:

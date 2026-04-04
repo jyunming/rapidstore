@@ -45,7 +45,7 @@ pub mod quantizer;
 pub mod storage;
 
 #[pymodule]
-fn turboquantdb(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn tqdb(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     python::register(py, m)?;
     Ok(())
 }

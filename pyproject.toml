@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "tqdb"
-version = "0.1.1"
+version = "0.2.0"
 description = "Embedded vector database using the TurboQuant algorithm (arXiv:2504.19874) — zero training, 2-4 bit compression, fast inner-product search"
 readme = "README.md"
 requires-python = ">=3.10"
