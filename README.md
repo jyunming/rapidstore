@@ -106,7 +106,7 @@ for r in results:
 # Open / create
 db = Database.open(path, dimension, bits=4, seed=42, metric="ip",
                    rerank=True, fast_mode=False, rerank_precision=None,
-                   collection=None)   # collection= → opens path/collection/
+                   collection=None, wal_flush_threshold=None)  # wal_flush_threshold default=5000; set higher for bulk loads
 
 # Write
 db.insert(id, vector, metadata=None, document=None)

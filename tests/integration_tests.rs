@@ -872,6 +872,7 @@ fn test_rerank_disabled_behavior() {
         true,
         false,
         RerankPrecision::Disabled,
+        None,
     )
     .unwrap();
 
@@ -963,6 +964,7 @@ fn test_rerank_precision_f16_roundtrip() {
         true,
         false,
         RerankPrecision::F16,
+        None,
     )
     .unwrap();
 
@@ -978,17 +980,17 @@ fn test_rerank_precision_f16_roundtrip() {
     // Flush WAL to compact live_vectors.bin to exactly the logical size.
     engine.flush_wal_to_segment().unwrap();
 
-    // live_vectors.bin must exist and be exactly n * d * 2 bytes.
+    // live_vectors.bin must exist and contain at least n * d * 2 bytes.
+    // (May be larger due to mmap pre-allocation; compaction truncates on delete-triggered flushes.)
     let vraw_path = dir.path().join("live_vectors.bin");
     assert!(
         vraw_path.exists(),
         "live_vectors.bin should be created for F16 precision"
     );
     let file_size = std::fs::metadata(&vraw_path).unwrap().len() as usize;
-    assert_eq!(
-        file_size,
-        n * d * 2,
-        "F16 file size should be n*d*2 bytes, got {}",
+    assert!(
+        file_size >= n * d * 2,
+        "F16 file size should be at least n*d*2 bytes, got {}",
         file_size
     );
 
@@ -1022,6 +1024,7 @@ fn test_rerank_precision_f32_file_size() {
         true,
         false,
         RerankPrecision::F32,
+        None,
     )
     .unwrap();
 
@@ -1041,10 +1044,9 @@ fn test_rerank_precision_f32_file_size() {
         "live_vectors.bin must exist for F32 precision"
     );
     let file_size = std::fs::metadata(&vraw_path).unwrap().len() as usize;
-    assert_eq!(
-        file_size,
-        n * d * 4,
-        "F32 file size should be n*d*4 bytes, got {}",
+    assert!(
+        file_size >= n * d * 4,
+        "F32 file size should be at least n*d*4 bytes, got {}",
         file_size
     );
 }
@@ -1076,6 +1078,7 @@ fn test_rerank_precision_f16_vs_f32_size_ratio() {
             true,
             false,
             *precision,
+            None,
         )
         .unwrap();
 
@@ -1126,6 +1129,7 @@ fn test_rerank_precision_disabled_no_file() {
         true,
         false,
         RerankPrecision::Disabled,
+        None,
     )
     .unwrap();
 

@@ -187,6 +187,10 @@ pub struct TurboQuantEngine {
     id_pool: IdPool,
     index_ids_dirty: bool,
     pending_manifest_updates: usize,
+    /// True when at least one delete has been issued since the last compaction.
+    /// When false, `live_compact_slab` is skipped on WAL flush — a pure insert
+    /// workload never needs to compact (no dead slots to remove).
+    has_pending_deletes: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -255,7 +259,7 @@ impl TurboQuantEngine {
             RerankPrecision::Disabled
         };
         Self::open_with_options(
-            uri, local_dir, d, b, seed, metric, rerank, fast_mode, precision,
+            uri, local_dir, d, b, seed, metric, rerank, fast_mode, precision, None,
         )
     }
 
@@ -269,6 +273,7 @@ impl TurboQuantEngine {
         rerank: bool,
         fast_mode: bool,
         rerank_precision: RerankPrecision,
+        wal_flush_threshold: Option<usize>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(local_dir)?;
         let manifest_path = format!("{}/manifest.json", local_dir);
@@ -399,7 +404,7 @@ impl TurboQuantEngine {
             backend,
             wal,
             wal_buffer: Vec::new(),
-            wal_flush_threshold: 100,
+            wal_flush_threshold: wal_flush_threshold.unwrap_or(5_000),
             segments,
             metadata,
             graph,
@@ -410,6 +415,7 @@ impl TurboQuantEngine {
             id_pool: IdPool::new(),
             index_ids_dirty: false,
             pending_manifest_updates: 0,
+            has_pending_deletes: false,
             rerank_enabled: manifest.rerank_enabled,
         };
 
@@ -570,6 +576,7 @@ impl TurboQuantEngine {
         };
         self.wal.append(&entry, false)?;
         self.wal_buffer.push(entry);
+        self.has_pending_deletes = true;
         self.live_delete_slot(&id);
         self.invalidate_index_state()?;
         self.maybe_persist_state(false)?;
@@ -1097,126 +1104,92 @@ impl TurboQuantEngine {
                 None
             };
 
+            // Expand candidate pool for ANN: always fetch at least sls candidates so the
+            // beam search has a sufficient buffer to recover from approximate navigation.
+            // Without reranking, internal_k=top_k leaves no buffer → recall collapses.
             let internal_k = if self.rerank_enabled {
                 top_k * 20
             } else {
-                top_k
+                // Fetch sls candidates, re-score by full LUT, return top_k.
+                sls.max(top_k)
             };
 
-            // Shared references captured by search closures. Using RefCell<Vec<u16>> for
-            // idx_buf lets the Fn closure reuse a single allocation across all candidate
-            // scorings instead of allocating a new Vec<CodeIndex> per call.
+            // Shared references captured by search closures.
             let mse_len = self.live_mse_len();
             let qjl_len = self.live_qjl_len();
             let qn = self.quantizer.n;
             let live_codes_r = &self.live_codes;
             let quantizer_r = &self.quantizer;
-            let idx_buf = std::cell::RefCell::new(vec![0u16; qn]);
 
-            let ann = if matches!(self.metric, DistanceMetric::Ip) {
-                let prep = self.quantizer.prepare_ip_query(query);
-                let index_ids = &self.index_ids;
-                let slot_set: Option<std::collections::HashSet<u32>> =
-                    filter_slots.map(|s| s.into_iter().collect());
+            // Single full-LUT query prep: used for both HNSW navigation and final scoring.
+            // The full scorer is more accurate than the lite scorer for navigation, and
+            // eliminates the need for a separate re-score step after beam search.
+            let prep = self.quantizer.prepare_ip_query(query);
+            let query_norm = if matches!(self.metric, DistanceMetric::Cosine) {
+                query.iter().map(|x| x * x).sum::<f64>().sqrt()
+            } else {
+                1.0
+            };
 
-                self.graph.search(
-                    0,
-                    internal_k,
-                    sls.max(internal_k),
-                    |node| {
-                        let slot = index_ids[node as usize];
-                        let rec = live_codes_r.get_slot(slot as usize);
-                        let qjl = &rec[mse_len..mse_len + qjl_len];
-                        let gamma = f32::from_le_bytes(
-                            rec[mse_len + qjl_len..mse_len + qjl_len + 4]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        let doc_norm = f32::from_le_bytes(
-                            rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        let mut buf = idx_buf.borrow_mut();
-                        quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut buf);
-                        quantizer_r.score_ip_encoded(&prep, &buf, qjl, gamma as f64)
-                            * doc_norm as f64
-                    },
-                    slot_set
-                        .map(|ss| move |node_idx: u32| ss.contains(&index_ids[node_idx as usize])),
-                )?
-            } else if matches!(self.metric, DistanceMetric::Cosine) {
-                let prep = self.quantizer.prepare_ip_query(query);
-                let query_norm = query.iter().map(|x| x * x).sum::<f64>().sqrt();
-                let index_ids = &self.index_ids;
-                let slot_set: Option<std::collections::HashSet<u32>> =
-                    filter_slots.map(|s| s.into_iter().collect());
+            let slot_set: Option<std::collections::HashSet<u32>> =
+                filter_slots.map(|s| s.into_iter().collect());
+            let index_ids = &self.index_ids;
+            let is_l2 = matches!(self.metric, DistanceMetric::L2);
+            let is_cosine = matches!(self.metric, DistanceMetric::Cosine);
+            let metric_r = &self.metric;
 
-                self.graph.search(
-                    0,
-                    internal_k,
-                    sls.max(internal_k),
-                    |node| {
-                        let slot = index_ids[node as usize];
-                        let rec = live_codes_r.get_slot(slot as usize);
-                        let qjl = &rec[mse_len..mse_len + qjl_len];
-                        let gamma = f32::from_le_bytes(
-                            rec[mse_len + qjl_len..mse_len + qjl_len + 4]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        let mut buf = idx_buf.borrow_mut();
-                        quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut buf);
-                        // Vectors are stored unit-normalized; ip estimates <query, unit_doc>.
-                        // cosine(query, doc) = <query, unit_doc> / ||query||
-                        let ip = quantizer_r.score_ip_encoded(&prep, &buf, qjl, gamma as f64);
+            // Reusable index buffer for MSE code unpacking — captured by the FnMut scorer
+            // closure so it is allocated once and reused across all HNSW node visits.
+            let mut idx_buf_ann = vec![0u16; qn];
+
+            // HNSW beam search: collect internal_k candidates with accurate full-LUT scores.
+            // internal_k = sls (≥ top_k) provides a candidate buffer to recover from any
+            // graph navigation approximation errors before truncating to the final top_k.
+            let ann_nodes = self.graph.search(
+                0,
+                internal_k,
+                sls.max(internal_k),
+                |node| {
+                    let slot = index_ids[node as usize];
+                    let rec = live_codes_r.get_slot(slot as usize);
+                    let qjl = &rec[mse_len..mse_len + qjl_len];
+                    let gamma = f32::from_le_bytes(
+                        rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    let doc_norm = f32::from_le_bytes(
+                        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut idx_buf_ann);
+
+                    if is_l2 {
+                        let mut v = quantizer_r.dequantize(&idx_buf_ann, qjl, gamma as f64);
+                        v.mapv_inplace(|x| x * doc_norm as f64);
+                        score_vectors_with_metric(metric_r, query, &v)
+                    } else if is_cosine {
+                        let ip =
+                            quantizer_r.score_ip_encoded(&prep, &idx_buf_ann, qjl, gamma as f64);
                         if query_norm > 0.0 {
                             ip / query_norm
                         } else {
                             0.0
                         }
-                    },
-                    slot_set
-                        .map(|ss| move |node_idx: u32| ss.contains(&index_ids[node_idx as usize])),
-                )?
-            } else {
-                let index_ids = &self.index_ids;
-                let metric_r = &self.metric;
-                let slot_set: Option<std::collections::HashSet<u32>> =
-                    filter_slots.map(|s| s.into_iter().collect());
+                    } else {
+                        quantizer_r.score_ip_encoded(&prep, &idx_buf_ann, qjl, gamma as f64)
+                            * doc_norm as f64
+                    }
+                },
+                slot_set.map(|ss| move |node_idx: u32| ss.contains(&index_ids[node_idx as usize])),
+            )?;
 
-                self.graph.search(
-                    0,
-                    internal_k,
-                    sls.max(internal_k),
-                    |node| {
-                        let slot = index_ids[node as usize];
-                        let rec = live_codes_r.get_slot(slot as usize);
-                        let qjl = &rec[mse_len..mse_len + qjl_len];
-                        let gamma = f32::from_le_bytes(
-                            rec[mse_len + qjl_len..mse_len + qjl_len + 4]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        let v = {
-                            let mut buf = idx_buf.borrow_mut();
-                            quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut buf);
-                            let doc_norm = f32::from_le_bytes(
-                                rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-                                    .try_into()
-                                    .unwrap(),
-                            );
-                            let mut v = quantizer_r.dequantize(&buf, qjl, gamma as f64);
-                            // Dequantize returns unit vector; scale back to original norm.
-                            v.mapv_inplace(|x| x * doc_norm as f64);
-                            v
-                        };
-                        score_vectors_with_metric(metric_r, query, &v)
-                    },
-                    slot_set
-                        .map(|ss| move |node_idx: u32| ss.contains(&index_ids[node_idx as usize])),
-                )?
-            };
+            // Navigation scores from the full LUT are already accurate; no re-score pass
+            // needed. ann_nodes is already sorted descending by graph.search(); truncate
+            // here handles the rerank=True path which uses internal_k = top_k * 20.
+            let mut ann: Vec<(u32, f64)> = ann_nodes;
+            ann.truncate(top_k);
 
             let slots: Vec<u32> = ann
                 .iter()
@@ -1519,8 +1492,13 @@ impl TurboQuantEngine {
         }
         // Persist segments first so any rebuilds (if needed) read a complete view.
         self.segments.flush_batch(records)?;
-        // live_codes is already updated during ingest; compact without full rebuild.
-        self.live_compact_slab()?;
+        // Only compact the live slab when there are pending deletes — compaction
+        // copies all live data to a fresh file and rebuilds the id_pool, which is
+        // unnecessary (and very expensive) for pure insert workloads.
+        if self.has_pending_deletes {
+            self.live_compact_slab()?;
+            self.has_pending_deletes = false;
+        }
         self.live_codes.flush()?;
         if let Some(vraw) = &mut self.live_vraw {
             vraw.flush()?;
@@ -1547,11 +1525,14 @@ impl TurboQuantEngine {
         }
 
         self.live_codes = LiveCodesFile::open(live_codes_path, self.live_stride())?;
+        // The file was pre-allocated to GROW_SLOTS multiples; correct len to match
+        // the id_pool's slot count so the next alloc_slot() resumes at the right offset.
+        let slot_count = self.id_pool.slot_count();
+        self.live_codes.set_len(slot_count);
         if had_vraw {
-            self.live_vraw = Some(LiveCodesFile::open(
-                live_vraw_path,
-                self.live_vraw_stride(),
-            )?);
+            let mut vraw = LiveCodesFile::open(live_vraw_path, self.live_vraw_stride())?;
+            vraw.set_len(slot_count);
+            self.live_vraw = Some(vraw);
         }
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_active_count() as u64;
@@ -1561,6 +1542,13 @@ impl TurboQuantEngine {
 
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.flush_wal_to_segment()?;
+        // Trim pre-allocated capacity to the exact slot count so the on-disk and
+        // memory-mapped sizes are minimal after the database is closed.
+        let slot_count = self.id_pool.slot_count();
+        self.live_codes.truncate_to(slot_count)?;
+        if let Some(vraw) = &mut self.live_vraw {
+            vraw.truncate_to(slot_count)?;
+        }
         self.metadata.flush()?;
         self.persist_id_pool()?;
         self.maybe_persist_state(true)?;
@@ -2566,6 +2554,7 @@ mod tests {
             true,
             false,
             RerankPrecision::F16,
+            None,
         )
         .unwrap();
         let mut v = vec![0.0f64; d];
@@ -2597,6 +2586,7 @@ mod tests {
             true,
             false,
             RerankPrecision::F16,
+            None,
         )
         .unwrap();
         // v = [0.1, 0.2, ..., 1.6]; expected IP = sum((0.1*i)^2) for i=1..=16
@@ -2803,6 +2793,7 @@ mod tests {
             false,
             false,
             RerankPrecision::Disabled,
+            None,
         )
         .unwrap();
         for i in 0..5u32 {
@@ -2933,6 +2924,7 @@ mod tests {
             false,
             false,
             RerankPrecision::Disabled,
+            None,
         )
         .unwrap();
         for i in 0..15u32 {
@@ -3162,13 +3154,25 @@ mod tests {
         let dir = tempdir().unwrap();
         let p = dir.path().to_str().unwrap();
         let d = 8;
-        let mut e = TurboQuantEngine::open(p, p, d, 2, 42).unwrap();
-        // Fill up to wal_flush_threshold (100) to ensure next delete pushes over
+        // Use a low explicit threshold so this test is deterministic regardless of the default.
+        let mut e = TurboQuantEngine::open_with_options(
+            p,
+            p,
+            d,
+            2,
+            42,
+            DistanceMetric::Ip,
+            false,
+            false,
+            RerankPrecision::Disabled,
+            Some(100),
+        )
+        .unwrap();
         for i in 0..100 {
             e.insert(format!("v{i}"), &make_vec(d, 0.5), no_meta())
                 .unwrap();
         }
-        // This delete should trigger flush_wal_to_segment
+        // This delete pushes wal_buffer over the threshold and triggers flush_wal_to_segment
         e.delete("v0".to_string()).unwrap();
         // Engine must remain functional after the flush
         let results = e
@@ -3216,6 +3220,7 @@ mod tests {
             true,
             false,
             RerankPrecision::F16,
+            None,
         )
         .unwrap();
         for i in 0..30u32 {
@@ -3250,6 +3255,7 @@ mod tests {
             true,
             false,
             RerankPrecision::F16,
+            None,
         )
         .unwrap();
         for i in 0..30u32 {
@@ -3286,6 +3292,7 @@ mod tests {
             false, // rerank disabled → no raw vectors → uses precomputed_l2
             false,
             RerankPrecision::Disabled,
+            None,
         )
         .unwrap();
         for i in 0..30u32 {
@@ -3327,6 +3334,7 @@ mod tests {
             true,
             false,
             RerankPrecision::F32,
+            None,
         )
         .unwrap();
         e.insert(
@@ -3401,6 +3409,7 @@ mod tests {
             true,
             false,
             RerankPrecision::Disabled,
+            None,
         )
         .unwrap();
         e.insert("a".into(), &Array1::from_vec(vec![0.0f64; d]), no_meta())
@@ -3855,6 +3864,7 @@ mod tests {
             true, // rerank_enabled=true
             false,
             RerankPrecision::Disabled, // no raw vecs → live_vraw=None
+            None,
         )
         .unwrap();
         for i in 0..30u32 {

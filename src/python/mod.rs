@@ -41,6 +41,11 @@ impl Database {
     ///         - ``None`` (default): dequantization reranking — no extra disk/RAM.
     ///         - ``"f16"``: store raw vectors as float16 (+n×d×2 bytes), exact reranking.
     ///         - ``"f32"``: store raw vectors as float32 (+n×d×4 bytes), maximum precision.
+    ///     wal_flush_threshold: Number of buffered vectors before flushing WAL to a segment file.
+    ///         Higher values give faster bulk ingest (fewer flush cycles) at the cost of more
+    ///         data at risk if the process crashes before flush. Default ``5000``.
+    ///         Set to ``100`` to restore old conservative behaviour (more flushes, same final
+    ///         disk/RAM — ``close()`` always trims the file to the exact slot count).
     ///
     /// Returns:
     ///     An open :class:`Database` instance.
@@ -49,7 +54,7 @@ impl Database {
     ///
     ///     db = Database.open("mydb", dimension=1536, bits=4, metric="cosine")
     #[staticmethod]
-    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None))]
+    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None))]
     fn open(
         path: String,
         dimension: usize,
@@ -60,6 +65,7 @@ impl Database {
         fast_mode: bool,
         rerank_precision: Option<&str>,
         collection: Option<&str>,
+        wal_flush_threshold: Option<usize>,
     ) -> PyResult<Self> {
         let engine_path = match collection {
             Some(col) if !col.is_empty() => {
@@ -108,6 +114,7 @@ impl Database {
             rerank,
             fast_mode,
             precision,
+            wal_flush_threshold,
         )
         .map_err(to_py_runtime)?;
         Ok(Self {
