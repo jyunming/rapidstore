@@ -34,7 +34,7 @@
 //!
 //! ## Deployment
 //!
-//! - **Embedded** (`turboquantdb` Python package) — runs in-process, no server needed.
+//! - **Embedded** (`tqdb` Python package) — runs in-process, no server needed.
 //! - **Server** (`server/` workspace) — Axum HTTP service with multi-tenancy, RBAC, quotas.
 
 use pyo3::prelude::*;
