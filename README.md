@@ -187,30 +187,30 @@ Brute-force recall across all three datasets from [arXiv:2504.19874](https://arx
 
 **GloVe-200** (d=200, 100k corpus, 10k queries, brute-force)
 
-| Method | @k=1 | @k=2 | @k=4 | @k=8 |
-|---|---|---|---|---|
-| TurboQuant 2-bit (paper Fig. 5a) | ≈55.0% | ≈70.0% | ≈83.0% | ≈91.0% |
-| **TQDB b=2** | **37.1%** | **50.0%** | **62.0%** | **73.0%** |
-| TurboQuant 4-bit (paper Fig. 5a) | ≈86.0% | ≈96.0% | ≈99.0% | ≈100% |
-| **TQDB b=4** | **73.9%** | **88.3%** | **96.4%** | **99.2%** |
+| Method | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
+|---|---|---|---|---|---|---|---|
+| TurboQuant 2-bit (paper Fig. 5a) | ≈55.0% | ≈70.0% | ≈83.0% | ≈91.0% | ≈96.0% | ≈99.0% | ≈100% |
+| **TQDB b=2** | **37.1%** | **50.0%** | **62.0%** | **73.0%** | **82.1%** | **88.9%** | **93.5%** |
+| TurboQuant 4-bit (paper Fig. 5a) | ≈86.0% | ≈96.0% | ≈99.0% | ≈100% | 100% | 100% | 100% |
+| **TQDB b=4** | **73.9%** | **88.3%** | **96.4%** | **99.2%** | **99.9%** | **100%** | **100%** |
 
 **DBpedia OpenAI3 d=1536** (d=1536, 100k corpus, 1k queries, brute-force)
 
-| Method | @k=1 | @k=2 | @k=4 | @k=8 |
-|---|---|---|---|---|
-| TurboQuant 2-bit (paper Fig. 5b) | ≈89.5% | ≈98.0% | ≈99.5% | ≈100% |
-| **TQDB b=2** | **79.7%** | **93.3%** | **98.3%** | **99.7%** |
-| TurboQuant 4-bit (paper Fig. 5b) | ≈97.0% | ≈100% | 100% | 100% |
-| **TQDB b=4** | **92.6%** | **99.1%** | **99.9%** | **100%** |
+| Method | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
+|---|---|---|---|---|---|---|---|
+| TurboQuant 2-bit (paper Fig. 5b) | ≈89.5% | ≈98.0% | ≈99.5% | ≈100% | 100% | 100% | 100% |
+| **TQDB b=2** | **79.7%** | **93.3%** | **98.3%** | **99.7%** | **99.9%** | **100%** | **100%** |
+| TurboQuant 4-bit (paper Fig. 5b) | ≈97.0% | ≈100% | 100% | 100% | 100% | 100% | 100% |
+| **TQDB b=4** | **92.6%** | **99.1%** | **99.9%** | **100%** | 100% | 100% | 100% |
 
 **DBpedia OpenAI3 d=3072** (d=3072, 100k corpus, 1k queries, brute-force)
 
-| Method | @k=1 | @k=2 | @k=4 | @k=8 |
-|---|---|---|---|---|
-| TurboQuant 2-bit (paper Fig. 5c) | ≈90.5% | ≈98.5% | ≈99.5% | ≈100% |
-| **TQDB b=2** | **84.6%** | **95.1%** | **99.0%** | **100%** |
-| TurboQuant 4-bit (paper Fig. 5c) | ≈97.5% | ≈100% | 100% | 100% |
-| **TQDB b=4** | **94.8%** | **99.1%** | **100%** | **100%** |
+| Method | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
+|---|---|---|---|---|---|---|---|
+| TurboQuant 2-bit (paper Fig. 5c) | ≈90.5% | ≈98.5% | ≈99.5% | ≈100% | 100% | 100% | 100% |
+| **TQDB b=2** | **84.6%** | **95.1%** | **99.0%** | **100%** | 100% | 100% | 100% |
+| TurboQuant 4-bit (paper Fig. 5c) | ≈97.5% | ≈100% | 100% | 100% | 100% | 100% | 100% |
+| **TQDB b=4** | **94.8%** | **99.1%** | **100%** | **100%** | 100% | 100% | 100% |
 
 The GloVe gap (~12–18% at k=1) is expected: d=200 is the hardest case (fewest bits per dimension), and we evaluate on the first 100k vectors from a 1.18M corpus while the paper used a random sample. From k=4 onward the gap is ≤2.6% on GloVe and ≤1% on DBpedia. For high-dimensional embeddings (d≥1536), TQDB matches the paper within ~5% at k=1 and within 1% from k=4. The paper also reports TurboQuant quantization time 0.001 s versus Product Quantization 240 s at d=1536 — TQDB inherits the same zero-training-time property.
 
