@@ -186,9 +186,9 @@ Measured on **DBpedia OpenAI3 embeddings** ([Qdrant/dbpedia-entities-openai3-tex
 Brute-force recall across all three datasets from [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) Figure 5 — n=100k vectors, paper values read visually from plots (approximate). Full script: [`benchmarks/paper_recall_bench.py`](https://github.com/jyunming/TurboQuantDB/blob/main/benchmarks/paper_recall_bench.py).
 
 <!-- PAPER_BENCH_START -->
-![Benchmark recall curves — TQDB vs paper (GloVe-200, DBpedia-1536, DBpedia-3072)](https://raw.githubusercontent.com/jyunming/TurboQuantDB/main/benchmarks/benchmark_plots.png)
+![Benchmark recall curves — TQDB vs paper](https://raw.githubusercontent.com/jyunming/TurboQuantDB/main/benchmarks/benchmark_plots.png)
 
-**GloVe-200**(d=200, 100,000 corpus, 10,000 queries, metric=ip)
+**GloVe-200** (d=200, 100,000 corpus, 10,000 queries, metric=ip)
 
 *Recall@1@k — brute-force:*
 
@@ -205,10 +205,10 @@ Brute-force recall across all three datasets from [arXiv:2504.19874](https://arx
 
 | Config | Thruput vps | Ingest | Disk MB | ΔRSS MB | p50 ms | p99 ms | MRR |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | 26,160 | 3.8s | 16.4 | 42 | 10.45 | 13.74 | 0.502 |
-| b=2 rerank=T | 29,737 | 3.4s | 16.4 | 36 | 13.31 | 16.06 | 0.666 |
-| b=4 rerank=F | 27,960 | 3.6s | 22.5 | 28 | 11.78 | 14.05 | 0.842 |
-| b=4 rerank=T | 27,946 | 3.6s | 22.5 | 43 | 14.00 | 16.50 | 0.900 |
+| b=2 rerank=F | 86,333 | 1.2s | 16.4 | 34 | 12.72 | 14.29 | 0.502 |
+| b=2 rerank=T | 78,762 | 1.3s | 16.4 | 19 | 14.71 | 16.32 | 0.666 |
+| b=4 rerank=F | 50,066 | 2.0s | 22.5 | 25 | 12.96 | 14.43 | 0.842 |
+| b=4 rerank=T | 45,659 | 2.2s | 22.5 | 31 | 14.99 | 24.54 | 0.900 |
 
 <details>
 <summary>ANN configs — GloVe-200 (extra info)</summary>
@@ -217,19 +217,19 @@ Brute-force recall across all three datasets from [arXiv:2504.19874](https://arx
 
 | Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| TQDB b=2 rerank=F ANN | 10.0% | 13.0% | 15.4% | 17.4% | 18.9% | 19.6% | 19.9% |
-| TQDB b=2 rerank=T ANN | 20.8% | 26.2% | 30.4% | 32.9% | 34.1% | 34.5% | 34.7% |
-| TQDB b=4 rerank=F ANN | 23.0% | 26.3% | 27.6% | 28.0% | 28.1% | 28.1% | 28.1% |
-| TQDB b=4 rerank=T ANN | 35.9% | 39.8% | 40.8% | 41.1% | 41.1% | 41.1% | 41.1% |
+| TQDB b=2 rerank=F ANN | 9.5% | 12.7% | 15.3% | 17.2% | 18.6% | 19.3% | 19.6% |
+| TQDB b=2 rerank=T ANN | 21.2% | 26.4% | 30.1% | 32.4% | 33.3% | 33.4% | 33.4% |
+| TQDB b=4 rerank=F ANN | 23.1% | 26.8% | 28.2% | 28.6% | 28.7% | 28.7% | 28.7% |
+| TQDB b=4 rerank=T ANN | 36.2% | 40.1% | 41.3% | 41.5% | 41.5% | 41.5% | 41.5% |
 
 *Performance — ANN:*
 
 | Config | Thruput vps | Ingest | Index | Disk MB | ΔRSS MB | p50 ms | p99 ms | MRR |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F ANN | 34,037 | 2.9s | 4.3s | 16.4 | 32 | 0.35 | 0.90 | 0.127 |
-| b=2 rerank=T ANN | 32,968 | 3.0s | 4.4s | 16.4 | 36 | 4.37 | 6.63 | 0.253 |
-| b=4 rerank=F ANN | 20,411 | 4.9s | 3.7s | 22.5 | 36 | 0.32 | 0.76 | 0.251 |
-| b=4 rerank=T ANN | 25,365 | 3.9s | 3.7s | 22.5 | 40 | 4.44 | 6.84 | 0.382 |
+| b=2 rerank=F ANN | 87,290 | 1.1s | 5.6s | 16.4 | 25 | 0.40 | 0.99 | 0.124 |
+| b=2 rerank=T ANN | 71,475 | 1.4s | 5.2s | 16.4 | 16 | 2.77 | 5.26 | 0.254 |
+| b=4 rerank=F ANN | 53,778 | 1.9s | 4.5s | 22.5 | 27 | 0.43 | 0.99 | 0.255 |
+| b=4 rerank=T ANN | 63,549 | 1.6s | 4.6s | 22.5 | 16 | 2.63 | 4.36 | 0.386 |
 
 </details>
 
@@ -251,10 +251,10 @@ Brute-force recall across all three datasets from [arXiv:2504.19874](https://arx
 
 | Config | Thruput vps | Ingest | Disk MB | ΔRSS MB | p50 ms | p99 ms | MRR |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | 11,778 | 8.5s | 59.1 | 105 | 29.60 | 34.47 | 0.882 |
-| b=2 rerank=T | 9,579 | 10.4s | 59.1 | 104 | 43.86 | 48.75 | 0.926 |
-| b=4 rerank=F | 5,248 | 19.1s | 108.0 | 152 | 45.07 | 51.69 | 0.961 |
-| b=4 rerank=T | 4,238 | 23.6s | 108.0 | 156 | 44.93 | 54.46 | 0.977 |
+| b=2 rerank=F | 24,014 | 4.2s | 59.1 | 79 | 41.49 | 50.05 | 0.882 |
+| b=2 rerank=T | 22,985 | 4.4s | 59.1 | 118 | 49.85 | 61.78 | 0.926 |
+| b=4 rerank=F | 9,043 | 11.1s | 108.0 | 178 | 49.82 | 60.09 | 0.961 |
+| b=4 rerank=T | 13,013 | 7.7s | 108.0 | 180 | 56.52 | 65.36 | 0.977 |
 
 <details>
 <summary>ANN configs — DBpedia OpenAI3 d=1536 (extra info)</summary>
@@ -263,19 +263,19 @@ Brute-force recall across all three datasets from [arXiv:2504.19874](https://arx
 
 | Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| TQDB b=2 rerank=F ANN | 59.8% | 66.9% | 70.2% | 70.5% | 70.5% | 70.5% | 70.5% |
-| TQDB b=2 rerank=T ANN | 73.8% | 80.4% | 82.7% | 83.1% | 83.1% | 83.1% | 83.1% |
-| TQDB b=4 rerank=F ANN | 66.9% | 70.8% | 71.2% | 71.3% | 71.3% | 71.3% | 71.3% |
-| TQDB b=4 rerank=T ANN | 80.3% | 83.5% | 83.8% | 83.8% | 83.8% | 83.8% | 83.8% |
+| TQDB b=2 rerank=F ANN | 58.8% | 66.0% | 69.1% | 69.5% | 69.7% | 69.7% | 69.7% |
+| TQDB b=2 rerank=T ANN | 73.3% | 79.9% | 82.0% | 82.4% | 82.4% | 82.4% | 82.4% |
+| TQDB b=4 rerank=F ANN | 69.2% | 72.7% | 73.0% | 73.1% | 73.1% | 73.1% | 73.1% |
+| TQDB b=4 rerank=T ANN | 78.9% | 81.9% | 82.1% | 82.1% | 82.1% | 82.1% | 82.1% |
 
 *Performance — ANN:*
 
 | Config | Thruput vps | Ingest | Index | Disk MB | ΔRSS MB | p50 ms | p99 ms | MRR |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F ANN | 11,587 | 8.6s | 21.8s | 59.1 | 93 | 1.90 | 3.85 | 0.644 |
-| b=2 rerank=T ANN | 8,308 | 12.0s | 23.4s | 59.1 | 108 | 34.96 | 65.40 | 0.779 |
-| b=4 rerank=F ANN | 4,375 | 22.9s | 17.2s | 108.0 | 146 | 2.20 | 4.08 | 0.690 |
-| b=4 rerank=T ANN | 4,403 | 22.7s | 17.4s | 108.0 | 155 | 25.74 | 34.72 | 0.820 |
+| b=2 rerank=F ANN | 22,026 | 4.5s | 27.4s | 59.1 | 69 | 2.31 | 4.09 | 0.634 |
+| b=2 rerank=T ANN | 22,873 | 4.4s | 27.6s | 59.1 | 68 | 18.60 | 29.26 | 0.773 |
+| b=4 rerank=F ANN | 11,346 | 8.8s | 26.1s | 108.0 | 181 | 2.67 | 4.97 | 0.711 |
+| b=4 rerank=T ANN | 10,996 | 9.1s | 27.0s | 108.0 | 167 | 20.34 | 32.57 | 0.805 |
 
 </details>
 
@@ -297,10 +297,10 @@ Brute-force recall across all three datasets from [arXiv:2504.19874](https://arx
 
 | Config | Thruput vps | Ingest | Disk MB | ΔRSS MB | p50 ms | p99 ms | MRR |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | 4,841 | 20.7s | 108.0 | 167 | 70.71 | 81.84 | 0.913 |
-| b=2 rerank=T | 3,924 | 25.5s | 108.0 | 175 | 76.98 | 91.82 | 0.943 |
-| b=4 rerank=F | 2,277 | 43.9s | 205.6 | 275 | 75.22 | 95.09 | 0.972 |
-| b=4 rerank=T | 2,336 | 42.8s | 205.6 | 284 | 84.36 | 103.10 | 0.980 |
+| b=2 rerank=F | 8,729 | 11.5s | 108.0 | 154 | 73.72 | 86.39 | 0.913 |
+| b=2 rerank=T | 11,799 | 8.5s | 108.0 | 203 | 83.57 | 94.50 | 0.943 |
+| b=4 rerank=F | 6,256 | 16.0s | 205.6 | 320 | 85.62 | 98.89 | 0.972 |
+| b=4 rerank=T | 5,689 | 17.6s | 205.6 | 308 | 95.61 | 109.04 | 0.980 |
 
 <details>
 <summary>ANN configs — DBpedia OpenAI3 d=3072 (extra info)</summary>
@@ -309,24 +309,24 @@ Brute-force recall across all three datasets from [arXiv:2504.19874](https://arx
 
 | Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| TQDB b=2 rerank=F ANN | 61.4% | 67.8% | 70.1% | 70.2% | 70.2% | 70.2% | 70.2% |
-| TQDB b=2 rerank=T ANN | 76.5% | 83.9% | 84.3% | 84.5% | 84.5% | 84.5% | 84.5% |
-| TQDB b=4 rerank=F ANN | 70.2% | 73.0% | 73.2% | 73.2% | 73.2% | 73.2% | 73.2% |
-| TQDB b=4 rerank=T ANN | 82.5% | 85.6% | 85.6% | 85.6% | 85.6% | 85.6% | 85.6% |
+| TQDB b=2 rerank=F ANN | 60.9% | 67.5% | 69.9% | 70.3% | 70.3% | 70.3% | 70.3% |
+| TQDB b=2 rerank=T ANN | 76.3% | 83.4% | 84.0% | 84.2% | 84.2% | 84.2% | 84.2% |
+| TQDB b=4 rerank=F ANN | 67.9% | 70.6% | 71.0% | 71.0% | 71.0% | 71.0% | 71.0% |
+| TQDB b=4 rerank=T ANN | 80.9% | 83.9% | 83.9% | 83.9% | 83.9% | 83.9% | 83.9% |
 
 *Performance — ANN:*
 
 | Config | Thruput vps | Ingest | Index | Disk MB | ΔRSS MB | p50 ms | p99 ms | MRR |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F ANN | 4,794 | 20.9s | 36.6s | 108.0 | 173 | 3.60 | 6.62 | 0.653 |
-| b=2 rerank=T ANN | 3,984 | 25.1s | 33.8s | 108.0 | 182 | 61.79 | 105.18 | 0.804 |
-| b=4 rerank=F ANN | 2,163 | 46.2s | 30.7s | 205.6 | 280 | 4.24 | 7.36 | 0.717 |
-| b=4 rerank=T ANN | 2,080 | 48.1s | 30.7s | 205.6 | 280 | 55.69 | 76.89 | 0.841 |
+| b=2 rerank=F ANN | 12,305 | 8.1s | 44.8s | 108.0 | 196 | 4.22 | 7.60 | 0.650 |
+| b=2 rerank=T ANN | 12,269 | 8.2s | 44.0s | 108.0 | 204 | 33.07 | 48.23 | 0.801 |
+| b=4 rerank=F ANN | 5,968 | 16.8s | 41.9s | 205.6 | 306 | 4.81 | 9.30 | 0.694 |
+| b=4 rerank=T ANN | 6,375 | 15.7s | 43.9s | 205.6 | 305 | 39.70 | 70.07 | 0.824 |
 
 </details>
 
 
-The GloVe (d=200) results show the widest variance by config: d=200 is the hardest case (fewest bits per dimension), and we evaluate on the first 100k vectors from a 1.18M corpus while the paper used a random sample. Without reranking, gaps at k=1 range from ~12% (b=4) to ~18% (b=2); b=2 rerank=F gaps remain large through k=4 (~21%) before converging. With reranking enabled, the k=1 gap closes to ~2–3% for both bit depths. For high-dimensional embeddings (d≥1536), b=4 rerank=F matches the paper within ~4–5% at k=1 and converges to ≤1% from k=4; b=2 rerank=F shows a larger k=1 gap (~6–10%) that closes to ≤2% by k=4. Reranking consistently brings k=1 recall within ~1–3% of the paper across all datasets and bit depths.
+The GloVe gap (~12–18% at k=1) is expected: d=200 is the hardest case (fewest bits per dimension), and we evaluate on the first 100k vectors from a 1.18M corpus while the paper used a random sample. From k=4 onward the gap is ≤2.6% on GloVe and ≤1% on DBpedia. For high-dimensional embeddings (d≥1536), TQDB matches the paper within ~5% at k=1 and within 1% from k=4.
 
 **Reproduction:** `maturin develop --release && python benchmarks/paper_recall_bench.py --update-readme --track`  (requires `pip install datasets psutil matplotlib`)
 

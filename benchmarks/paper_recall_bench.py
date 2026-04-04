@@ -117,7 +117,11 @@ def run_config(
         ingest_s = time.perf_counter() - t0
         sampler_ingest.stop()
 
+        # Close and reopen to flush pre-allocated capacity; disk measured post-close
+        # so GROW_SLOTS pre-allocation is trimmed and the number reflects steady-state.
+        db.close()
         dm = disk_size_mb(tmp)
+        db = tqdb.Database.open(tmp, dimension=DIM, bits=bits, metric="ip", rerank=rerank)
 
         # ── Index build (ANN only) ────────────────────────────────────────────
         index_s = None
@@ -127,6 +131,11 @@ def run_config(
             index_s = round(time.perf_counter() - t_idx, 3)
 
         # ── Query phase ───────────────────────────────────────────────────────
+        # Warmup: page the mmap into OS cache before timing (avoids cold-cache
+        # inflation from the close+reopen above).
+        for q in qvecs[:min(20, len(qvecs))]:
+            db.search(q, top_k=max_k, _use_ann=ann)
+
         sampler_query = CpuRamSampler()
         sampler_query.start()
         lats: list[float] = []
