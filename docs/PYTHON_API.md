@@ -22,7 +22,8 @@ from tqdb import Database
 db = Database.open(
     path,                    # str — base directory path, created if it doesn't exist
     dimension,               # int — vector dimension, must match on every reopen
-    bits=4,                  # int — quantization bits: 4 (4.2× compression) or 8 (2.47×, higher recall)
+    bits=4,                  # int — quantization bits: 2 (higher compression, lower recall)
+                             #                           or 4 (better recall, default)
     seed=42,                 # int — RNG seed for quantizer, must stay the same across sessions
     metric="ip",             # str — "ip" (inner product), "cosine", or "l2"
     rerank=True,             # bool — enable reranking of ANN candidates; precision via rerank_precision
@@ -119,7 +120,7 @@ db.update(id, vector, metadata=None, document=None)  # raises RuntimeError if id
 
 ```python
 db.delete(id)                    # bool — True if id existed
-db.delete_batch(ids)             # deletes multiple ids at once
+db.delete_batch(ids)             # → int — count of ids that were deleted
 
 db.get(id)                       # dict | None — {id, metadata, document}
 db.get_many(ids)                 # list[dict | None]
@@ -261,7 +262,7 @@ from tqdb.rag import TurboQuantRetriever
 retriever = TurboQuantRetriever(
     db_path,                # str — directory path for the database
     dimension=1536,         # int — vector dimension
-    bits=4,                 # int — quantization bits (4 or 8)
+    bits=4,                 # int — quantization bits (2 or 4)
     seed=42,                # int — RNG seed
     metric="ip",            # str — "ip", "cosine", or "l2"
     rerank_precision=None,  # str|None — None (dequant), "f16", or "f32"

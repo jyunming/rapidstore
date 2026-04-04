@@ -10,6 +10,23 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
+## [0.2.0] — 2026-04-15
+
+### Changed
+
+- **Package renamed from `turboquantdb` to `tqdb`** — `import tqdb` replaces `import turboquantdb`; the `Database` class is the same
+- `src/lib.rs` doc comment updated to reference `tqdb` Python package
+
+---
+
+## [0.1.1] — 2026-04-10
+
+### Fixed
+
+- Release CI: replaced `--find-interpreter` with `-i python` in Windows and macOS matrix jobs to prevent duplicate wheels and "ZIP archive: Trailing data" PyPI upload failures
+
+---
+
 ## [0.1.0] — 2026-04-03
 
 ### Added

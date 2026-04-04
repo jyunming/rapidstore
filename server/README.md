@@ -32,7 +32,6 @@ cargo build --release
 - `DELETE /v1/tenants/:tenant/databases/:database/collections/:collection`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/add`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/upsert`
-- `POST /v1/tenants/:tenant/databases/:database/collections/:collection/update`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/delete`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/get`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/query`
