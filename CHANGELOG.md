@@ -6,10 +6,6 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
-## [Unreleased]
-
----
-
 ## [0.2.0] — 2026-04-04
 
 ### Changed (breaking)
