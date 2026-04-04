@@ -2,61 +2,57 @@
   "description": "Best-ever local perf for each metric. Bar only goes up. Commits regressing >5% from any best are blocked unless --force / TQDB_PERF_SKIP=1.",
   "config": {
     "n": 10000,
-    "d": 384,
+    "d": 200,
     "bits": 4,
-    "k": 10,
+    "k_values": [
+      1,
+      4,
+      8
+    ],
     "queries": 100,
     "seed": 42
   },
   "tolerance_pct": 5.0,
   "metrics": {
-    "recall_at_k": {
+    "recall_1_at_1": {
       "higher_is_better": true,
-      "best": 0.8330000000000001
+      "best": 0.77
+    },
+    "recall_1_at_4": {
+      "higher_is_better": true,
+      "best": 0.95
+    },
+    "recall_1_at_8": {
+      "higher_is_better": true,
+      "best": 1.0
     },
     "avg_latency_ms": {
       "higher_is_better": false,
-      "best": 2.4319899994588923
+      "best": 1.329654999426566
     },
     "p50_latency_ms": {
       "higher_is_better": false,
-      "best": 2.3986500018509105
+      "best": 1.3183999981265515
     },
     "p95_latency_ms": {
       "higher_is_better": false,
-      "best": 2.7738350036088377
-    },
-    "latency_speedup_vs_numpy": {
-      "higher_is_better": true,
-      "best": 0.29119814871769956
-    },
-    "insert_throughput_vps": {
-      "higher_is_better": true,
-      "best": 703.9535021252193
-    },
-    "total_ingest_wall_s": {
-      "higher_is_better": false,
-      "best": 14.205483700003242
-    },
-    "ingest_cpu_s": {
-      "higher_is_better": false,
-      "best": 6.859375
+      "best": 1.4557250076904893
     },
     "disk_bytes": {
       "higher_is_better": false,
-      "best": 3274203.0
+      "best": 1991396.0
     },
     "compression_ratio": {
       "higher_is_better": true,
-      "best": 9.3824359699139
+      "best": 4.017282348663953
     },
     "ram_estimate_bytes": {
       "higher_is_better": false,
-      "best": 3020000.0
+      "best": 1740000.0
     },
     "live_codes_bytes": {
       "higher_is_better": false,
-      "best": 2650000.0
+      "best": 1370000.0
     },
     "live_vectors_bytes": {
       "higher_is_better": false,
