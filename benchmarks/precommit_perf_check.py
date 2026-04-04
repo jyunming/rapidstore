@@ -1,0 +1,454 @@
+"""
+Pre-commit performance regression check for TurboQuantDB.
+
+Uses the same methodology as the paper recall benchmark (arXiv:2504.19874):
+  - Recall@1@k  (is the true nearest neighbour in the returned top-k?)
+  - Uses insert_batch in chunks of 2000 (not individual inserts)
+  - rerank=False, metric="ip"  (pure quantized search, no rerank overhead)
+  - GloVe-200 cached data when available; synthetic d=200 otherwise
+
+Tracks ALL metrics:
+  recall@1@k for k=1,4,8, query latency (avg/p50/p95), speedup vs numpy,
+  ingest throughput, ingest wall time, ingest CPU time,
+  disk bytes, compression ratio, RAM estimate,
+  live codes bytes, live vectors bytes.
+
+The baseline (benchmarks/perf_baseline.json) stores the BEST value ever
+measured locally for each metric.  The floor for the next commit is
+best × 0.95 for "higher is better" metrics, or best × 1.05 for
+"lower is better" metrics (5% tolerance in every direction).
+
+When any metric improves beyond its stored best, the baseline for that
+metric is automatically raised — the bar can only go up.
+
+A failing check does NOT have to block the commit.  Two escape hatches:
+  • Set env var  TQDB_PERF_SKIP=1   — records a warning, exits 0
+  • Pass flag    --force             — same effect
+  (Both are intentional override paths for feature-tradeoff commits.)
+
+Typical usage:
+    # Run automatically by the pre-commit hook:
+    python benchmarks/precommit_perf_check.py
+
+    # Seed / hard-reset the baseline to current measured values:
+    python benchmarks/precommit_perf_check.py --update-baseline
+
+    # Force-pass a known regression (e.g. latency tradeoff for a new feature):
+    TQDB_PERF_SKIP=1 git commit -m "feat: ..."
+    python benchmarks/precommit_perf_check.py --force
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Metric registry — drives all comparison logic.
+# Each entry: (key, higher_is_better, display_label, unit, tol_override_pct | None)
+# tol_override_pct=None  → use global tolerance_pct from baseline (default 5%)
+# tol_override_pct=10.0  → use 10% (timing metrics — 1-5ms have ~150µs OS jitter
+#                           on Windows, making 5% = ±70µs sub-resolution)
+# ---------------------------------------------------------------------------
+# Number of repetition rounds to take the best-of for noisy timing metrics.
+# Higher = more reproducible floor at cost of longer pre-commit runtime.
+INGEST_ROUNDS = 3    # best throughput of N full ingest passes
+QUERY_ROUNDS  = 10   # per-query min across N rounds (more = less OS jitter)
+CHUNK_SIZE    = 2000  # insert_batch chunk size (matches paper_recall_bench.py)
+
+# GloVe cache (same path as paper_recall_bench.py)
+CACHE_DIR = Path(__file__).parent / "_paper_bench_cache"
+
+
+METRIC_DEFS: list[tuple[str, bool, str, str, float | None]] = [
+    # Quality — paper Recall@1@k — deterministic, 5% gate
+    ("recall_1_at_1",            True,  "recall@1@1            ", "",    None),
+    ("recall_1_at_4",            True,  "recall@1@4            ", "",    None),
+    ("recall_1_at_8",            True,  "recall@1@8            ", "",    None),
+    # Query latency — 10% gate (OS scheduling jitter on 1-3ms queries)
+    ("avg_latency_ms",           False, "query avg latency      ", "ms", 10.0),
+    ("p50_latency_ms",           False, "query p50 latency      ", "ms", 10.0),
+    ("p95_latency_ms",           False, "query p95 latency      ", "ms", 10.0),
+    # Ingest — displayed only, not gated (sub-second measurements too noisy on Windows)
+    # ("insert_throughput_vps",    True,  "ingest throughput      ", "vps",10.0),
+    # ("total_ingest_wall_s",      False, "ingest wall time       ", "s",  10.0),
+    # Storage — disk — deterministic, 5% gate
+    ("disk_bytes",               False, "disk bytes             ", "B",  None),
+    ("compression_ratio",        True,  "compression ratio      ", "x",  None),
+    # Storage — RAM — deterministic, 5% gate
+    ("ram_estimate_bytes",       False, "RAM estimate           ", "B",  None),
+    ("live_codes_bytes",         False, "live codes bytes       ", "B",  None),
+    ("live_vectors_bytes",       False, "live vectors bytes     ", "B",  None),
+]
+
+METRIC_KEYS = {key for key, *_ in METRIC_DEFS}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def load_data(n: int, d: int, n_queries: int, seed: int) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """
+    Load GloVe-200 corpus/query vectors from the paper bench cache when
+    available (same path as paper_recall_bench.py), otherwise fall back to
+    synthetic normalised Gaussian vectors with dimension d.
+    Accepts any n ≤ 100 000 by slicing the 100k cache file.
+    """
+    vecs_exact  = CACHE_DIR / f"glove200_{n}_vecs.npy"
+    vecs_100k   = CACHE_DIR / "glove200_100000_vecs.npy"
+    qvecs_path  = CACHE_DIR / "glove200_10000_qvecs.npy"
+    vecs_path   = vecs_exact if vecs_exact.exists() else (vecs_100k if vecs_100k.exists() else None)
+    if vecs_path and qvecs_path.exists():
+        corpus = np.load(str(vecs_path))[:n].astype(np.float32)
+        all_q  = np.load(str(qvecs_path)).astype(np.float32)
+        rng    = np.random.default_rng(seed)
+        idx    = rng.choice(len(all_q), n_queries, replace=False)
+        qs     = all_q[idx]
+        print(f"  data: GloVe-200 ({corpus.shape[0]:,} corpus, {qs.shape[0]} queries)", flush=True)
+    else:
+        rng    = np.random.default_rng(seed)
+        corpus = rng.standard_normal((n, d)).astype(np.float32)
+        corpus /= np.linalg.norm(corpus, axis=1, keepdims=True)
+        qs     = rng.standard_normal((n_queries, d)).astype(np.float32)
+        qs     /= np.linalg.norm(qs, axis=1, keepdims=True)
+        print(f"  data: synthetic d={d} ({n:,} corpus, {n_queries} queries)", flush=True)
+    return corpus, qs, [f"vec_{i}" for i in range(len(corpus))]
+
+
+def _fmt(value: float, unit: str) -> str:
+    if unit == "B":
+        if value >= 1 << 20:
+            return f"{value / (1 << 20):.2f} MB"
+        if value >= 1 << 10:
+            return f"{value / 1024:.1f} KB"
+        return f"{value:.0f} B"
+    if unit == "vps":
+        return f"{value:,.0f} vps"
+    if unit in ("ms", "s"):
+        return f"{value:.3f}{unit}"
+    if unit == "x":
+        return f"{value:.3f}x"
+    return f"{value:.4g}"
+
+
+# ---------------------------------------------------------------------------
+# Benchmark runner
+# ---------------------------------------------------------------------------
+
+def run_benchmark(config: dict) -> dict:
+    """
+    Paper-methodology benchmark:
+      - GloVe-200 cache if available, else synthetic
+      - insert_batch in chunks of CHUNK_SIZE (matches paper_recall_bench.py)
+      - rerank=False, metric="ip"
+      - Recall@1@k for k in k_values
+      - Best-of INGEST_ROUNDS / QUERY_ROUNDS for timing stability
+    """
+    n, d, bits  = config["n"], config["d"], config["bits"]
+    k_values    = config.get("k_values", [1, 4, 8])
+    n_queries   = config["queries"]
+    seed        = config["seed"]
+
+    corpus, qs, ids = load_data(n, d, n_queries, seed)
+    d = corpus.shape[1]  # may differ from config if GloVe was loaded
+    raw_bytes = corpus.nbytes
+
+    # Precompute ground-truth top-1 for each query
+    true_top1s = [f"vec_{int(np.argmax(corpus @ q))}" for q in qs]
+
+    try:
+        import tqdb as tq
+    except ImportError:
+        print("[pre-commit] tqdb not installed — run: maturin develop --release")
+        sys.exit(0)
+
+    # ── ingest: median of INGEST_ROUNDS ───────────────────────────────────
+    # Median (not min) is more representative for short ingest times on
+    # Windows where one lucky machine-idle round can skew the "best ever".
+    ingest_walls: list[float] = []
+    stats = None
+
+    print(f"  ingest ({INGEST_ROUNDS} rounds, median) ...", flush=True)
+    for _ in range(INGEST_ROUNDS):
+        with tempfile.TemporaryDirectory() as db_dir:
+            db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=False, metric="ip")
+            wall_start = time.perf_counter()
+            for start in range(0, n, CHUNK_SIZE):
+                db.insert_batch(ids[start:start + CHUNK_SIZE],
+                                corpus[start:start + CHUNK_SIZE])
+            db.flush()
+            ingest_walls.append(time.perf_counter() - wall_start)
+            stats = db.stats()  # deterministic — same on every round
+
+    # ── query: per-query minimum latency across QUERY_ROUNDS ───────────────
+    # Taking the per-query minimum (not the best-round p50) eliminates
+    # Windows OS-scheduling spikes from p50/p95 without sacrificing rounds.
+    print(f"  queries ({QUERY_ROUNDS} rounds, per-query min) ...", flush=True)
+    max_k = max(k_values)
+    min_lats = [float("inf")] * len(qs)
+    recalls_by_k: dict[int, list[float]] = {k: [] for k in k_values}
+
+    with tempfile.TemporaryDirectory() as db_dir:
+        db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=False, metric="ip")
+        for start in range(0, n, CHUNK_SIZE):
+            db.insert_batch(ids[start:start + CHUNK_SIZE],
+                            corpus[start:start + CHUNK_SIZE])
+        db.flush()
+
+        for rnd in range(QUERY_ROUNDS):
+            for j, (q, top1_id) in enumerate(zip(qs, true_top1s)):
+                t0 = time.perf_counter()
+                results = db.search(q, top_k=max_k)
+                elapsed = (time.perf_counter() - t0) * 1000
+                min_lats[j] = min(min_lats[j], elapsed)
+                # Recalls are deterministic; record once from last round
+                if rnd == QUERY_ROUNDS - 1:
+                    returned_ids = [r["id"] for r in results]
+                    for k in k_values:
+                        recalls_by_k[k].append(1.0 if top1_id in returned_ids[:k] else 0.0)
+
+        db.close()
+
+    lats_arr   = np.array(min_lats)
+    disk_bytes = float(stats["total_disk_bytes"])
+    compression_ratio = raw_bytes / disk_bytes if disk_bytes > 0 else 0.0
+
+    return {
+        # quality — paper Recall@1@k
+        "recall_1_at_1": float(np.mean(recalls_by_k[1])),
+        "recall_1_at_4": float(np.mean(recalls_by_k[4])),
+        "recall_1_at_8": float(np.mean(recalls_by_k[8])),
+        # query latency (best round)
+        "avg_latency_ms":           float(np.mean(lats_arr)),
+        "p50_latency_ms":           float(np.percentile(lats_arr, 50)),
+        "p95_latency_ms":           float(np.percentile(lats_arr, 95)),
+        # ingest (median of rounds — resistant to lucky machine-idle outliers)
+        "insert_throughput_vps":    float(n / float(np.median(ingest_walls))),
+        "total_ingest_wall_s":      float(np.median(ingest_walls)),
+        "ingest_cpu_s":             0.0,  # informational only, not gated
+        # disk (deterministic)
+        "disk_bytes":               disk_bytes,
+        "compression_ratio":        compression_ratio,
+        # RAM (deterministic)
+        "ram_estimate_bytes":       float(stats["ram_estimate_bytes"]),
+        "live_codes_bytes":         float(stats["live_codes_bytes"]),
+        "live_vectors_bytes":       float(stats.get("live_vectors_bytes_estimate", 0)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Comparison
+# ---------------------------------------------------------------------------
+
+def compare(
+    measured: dict,
+    metrics_doc: dict,
+    tol: float,
+) -> tuple[list[str], dict]:
+    """
+    Compare measured values against stored bests.
+
+    Returns:
+        failures       — list of human-readable regression messages
+        updated_metrics — copy of metrics_doc with raised bests where applicable
+    """
+    failures: list[str] = []
+    updated = {k: dict(v) for k, v in metrics_doc.items()}
+
+    for key, higher_is_better, label, unit, tol_override in METRIC_DEFS:
+        if key not in metrics_doc:
+            continue
+        m = measured[key]
+        b = metrics_doc[key]["best"]
+        metric_tol = tol_override if tol_override is not None else tol
+        if b is None:
+            updated[key]["best"] = m
+            print(f"  {label}  {_fmt(m, unit)}  (no prior best — recorded)")
+            continue
+
+        delta_pct = (m - b) / b * 100.0 if b != 0 else 0.0
+
+        if higher_is_better:
+            floor = b * (1 - metric_tol / 100)
+            if m > b:
+                status = "↑ new best"
+                updated[key]["best"] = m
+            elif m >= floor:
+                status = "✓"
+            else:
+                status = "✗"
+                failures.append(
+                    f"{key}: {_fmt(m, unit)} < floor {_fmt(floor, unit)}  "
+                    f"(Δ{delta_pct:.1f}% — limit −{metric_tol}%)"
+                )
+            print(
+                f"  {label}  {_fmt(m, unit)}  "
+                f"(best {_fmt(b, unit)}, Δ{delta_pct:+.1f}%, floor {_fmt(floor, unit)})  {status}"
+            )
+        else:
+            ceil = b * (1 + metric_tol / 100)
+            if m < b:
+                status = "↑ new best"
+                updated[key]["best"] = m
+            elif m <= ceil:
+                status = "✓"
+            else:
+                status = "✗"
+                failures.append(
+                    f"{key}: {_fmt(m, unit)} > ceil {_fmt(ceil, unit)}  "
+                    f"(Δ{delta_pct:+.1f}% — limit +{metric_tol}%)"
+                )
+            print(
+                f"  {label}  {_fmt(m, unit)}  "
+                f"(best {_fmt(b, unit)}, Δ{delta_pct:+.1f}%, ceil {_fmt(ceil, unit)})  {status}"
+            )
+
+    return failures, updated
+
+
+# ---------------------------------------------------------------------------
+# Baseline I/O
+# ---------------------------------------------------------------------------
+
+def _default_metrics_doc() -> dict:
+    """Skeleton metrics document with all known metrics and best=null."""
+    return {
+        key: {"higher_is_better": hib, "best": None}
+        for key, hib, *_ in METRIC_DEFS
+    }
+
+
+def load_doc(path: Path) -> dict:
+    if path.exists():
+        with path.open(encoding="utf-8") as f:
+            doc = json.load(f)
+        # Back-fill any metrics added after the file was last written
+        metrics = doc.setdefault("metrics", _default_metrics_doc())
+        for key, hib, *_ in METRIC_DEFS:
+            metrics.setdefault(key, {"higher_is_better": hib, "best": None})
+        return doc
+    return {
+        "description": (
+            "Best-ever local perf for each metric. Bar only goes up. "
+            "Commits regressing >5% from any best are blocked "
+            "unless --force / TQDB_PERF_SKIP=1."
+        ),
+        "config": {"n": 10000, "d": 200, "bits": 4, "k_values": [1, 4, 8], "queries": 100, "seed": 42},
+        "tolerance_pct": 5.0,
+        "metrics": _default_metrics_doc(),
+    }
+
+
+def save_doc(path: Path, doc: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Pre-commit perf regression check")
+    p.add_argument("--baseline", default="benchmarks/perf_baseline.json")
+    p.add_argument(
+        "--update-baseline",
+        action="store_true",
+        help="Hard-reset ALL metric bests to current measured values",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Exit 0 even on regression (records override; use for intentional tradeoffs)",
+    )
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    baseline_path = Path(args.baseline)
+    force = args.force or os.environ.get("TQDB_PERF_SKIP", "").strip() not in ("", "0")
+
+    if not baseline_path.exists() and not args.update_baseline:
+        print(f"[pre-commit] baseline not found: {baseline_path}")
+        print("[pre-commit] Seed it with: python benchmarks/precommit_perf_check.py --update-baseline")
+        sys.exit(1)
+
+    doc = load_doc(baseline_path)
+    config = doc["config"]
+    tol = float(doc.get("tolerance_pct", 5.0))
+
+    print(
+        f"[pre-commit] perf check  "
+        f"n={config['n']:,}  d={config['d']}  bits={config['bits']}  "
+        f"k_values={config.get('k_values', [1,4,8])}  queries={config['queries']}  tol={tol}%"
+    )
+
+    measured = run_benchmark(config)
+
+    # Hard reset — overwrite every best regardless of direction
+    if args.update_baseline:
+        for key in doc["metrics"]:
+            if key in measured:
+                doc["metrics"][key]["best"] = measured[key]
+        save_doc(baseline_path, doc)
+        print(f"[pre-commit] baseline reset → {baseline_path}")
+        for key, _, label, unit, _tol in METRIC_DEFS:
+            if key in measured:
+                print(f"  {label}  {_fmt(measured[key], unit)}")
+        # informational ingest stats
+        print(f"  {'ingest throughput':22}  {measured['insert_throughput_vps']:,.0f} vps  (informational, not gated)")
+        print(f"  {'ingest wall time':22}  {measured['total_ingest_wall_s']:.3f}s  (median of {INGEST_ROUNDS} rounds, not gated)")
+        return
+
+    failures, updated_metrics = compare(measured, doc["metrics"], tol)
+
+    # Informational ingest stats (not gated — too noisy at sub-second scale)
+    print(
+        f"  {'ingest throughput':<22}  {measured['insert_throughput_vps']:,.0f} vps  "
+        f"  {'ingest wall':<11}  {measured['total_ingest_wall_s']:.3f}s  "
+        "(median, not gated)"
+    )
+
+    # Persist raised bests
+    if updated_metrics != doc["metrics"]:
+        doc["metrics"] = updated_metrics
+        save_doc(baseline_path, doc)
+        print(f"[pre-commit] ↑ baseline raised → stage: git add {baseline_path}")
+
+    if not failures:
+        print("[pre-commit] ✓ all metrics within 5% of best")
+        return
+
+    print("\n[pre-commit] FAIL — regression(s) detected:")
+    for msg in failures:
+        print(f"  ✗ {msg}")
+
+    if force:
+        print(
+            "\n[pre-commit] ⚠ override active (--force / TQDB_PERF_SKIP=1) — "
+            "proceeding despite regression"
+        )
+        return
+
+    print(
+        "\n  Intentional tradeoff?  Use one of:\n"
+        "    TQDB_PERF_SKIP=1 git commit ...\n"
+        "    python benchmarks/precommit_perf_check.py --force\n"
+        "  Reset baseline to current values:\n"
+        "    python benchmarks/precommit_perf_check.py --update-baseline"
+    )
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
