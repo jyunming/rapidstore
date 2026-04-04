@@ -13,7 +13,7 @@ use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
-use turboquantdb::storage::engine::{BatchWriteItem, DistanceMetric, GetResult, TurboQuantEngine};
+use tqdb::storage::engine::{BatchWriteItem, DistanceMetric, GetResult, TurboQuantEngine};
 
 #[derive(Clone)]
 struct AppState {
@@ -697,7 +697,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "turboquantdb_server=info,axum=info".to_string()),
+                .unwrap_or_else(|_| "tqdb_server=info,axum=info".to_string()),
         )
         .init();
 
@@ -741,7 +741,7 @@ async fn main() {
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
         .parse()
         .expect("invalid TQ_SERVER_ADDR");
-    info!(%addr, auth_store=%state.storage.auth_store_path, quota_store=%state.storage.quota_store_path, job_store=%state.storage.job_store_path, job_workers=state.job_worker_concurrency, "starting turboquantdb server");
+    info!(%addr, auth_store=%state.storage.auth_store_path, quota_store=%state.storage.quota_store_path, job_store=%state.storage.job_store_path, job_workers=state.job_worker_concurrency, "starting tqdb server");
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
