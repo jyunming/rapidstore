@@ -20,7 +20,7 @@
     },
     "recall_1_at_4": {
       "higher_is_better": true,
-      "best": 0.95
+      "best": 0.97
     },
     "recall_1_at_8": {
       "higher_is_better": true,
