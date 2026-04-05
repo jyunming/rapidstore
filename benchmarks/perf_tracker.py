@@ -2,8 +2,12 @@
 """
 perf_tracker.py — Performance history visualization for TurboQuantDB.
 
-Reads perf_history.json (accumulated by `paper_recall_bench.py --track`)
-and generates _perf_history.html with interactive time-series charts.
+Reads perf_history.json (written by paper_recall_bench.py --track and
+precommit_perf_check.py) and generates _perf_history.html.
+
+Layout: one section per dataset; within each section one subplot per metric.
+Each subplot shows all available configs as time-series lines.
+X-axis: commit hash + timestamp.
 
 Usage:
     python benchmarks/perf_tracker.py
@@ -15,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -25,21 +28,34 @@ BENCH_DIR    = Path(__file__).parent
 HISTORY_PATH = BENCH_DIR / "perf_history.json"
 OUTPUT_PATH  = BENCH_DIR / "_perf_history.html"
 
-# Tracked metrics: (json_key_suffix, display_label, higher_is_better)
-TRACKED_METRICS = [
-    ("b4_rerank=T_brute_r1at1",       "b=4 rr=T brute  R@1@1",      True),
-    ("b4_rerank=F_brute_r1at1",       "b=4 rr=F brute  R@1@1",      True),
-    ("b4_rerank=T_brute_throughput",  "b=4 rr=T brute  Thruput vps", True),
-    ("b4_rerank=T_brute_p50_ms",      "b=4 rr=T brute  p50 (ms)",    False),
-    ("b4_rerank=T_brute_disk_mb",     "b=4 rr=T brute  Disk (MB)",   False),
-    ("b4_rerank=T_brute_mrr",         "b=4 rr=T brute  MRR",         True),
+DATASETS = ["glove-200", "dbpedia-1536", "dbpedia-3072"]
+
+# Metrics: (json_key_suffix, display_label, higher_is_better)
+METRICS = [
+    ("r1at1",        "Recall@1@1",      True),
+    ("throughput",   "Throughput (vps)", True),
+    ("p50_ms",       "p50 latency (ms)", False),
+    ("disk_mb",      "Disk (MB)",        False),
+    ("ram_delta_mb", "RAM delta (MB)",   False),
+    ("mrr",          "MRR",              True),
 ]
 
-DATASETS = ["glove-200", "dbpedia-1536", "dbpedia-3072"]
+# Configs: (key_prefix, display_label, hex_color, plotly_dash)
+CONFIGS = [
+    ("b2_rerankF_brute", "b=2 rr=F brute", "#4477AA", "solid"),
+    ("b2_rerankT_brute", "b=2 rr=T brute", "#EE6677", "solid"),
+    ("b4_rerankF_brute", "b=4 rr=F brute", "#228833", "solid"),
+    ("b4_rerankT_brute", "b=4 rr=T brute", "#CCBB44", "solid"),
+    ("b2_rerankF_ANN",   "b=2 rr=F ANN",   "#4477AA", "dot"),
+    ("b2_rerankT_ANN",   "b=2 rr=T ANN",   "#EE6677", "dot"),
+    ("b4_rerankF_ANN",   "b=4 rr=F ANN",   "#228833", "dot"),
+    ("b4_rerankT_ANN",   "b=4 rr=T ANN",   "#CCBB44", "dot"),
+]
+
+_METRICS_PER_ROW = 3  # 3 cols → 2 rows for 6 metrics
 
 
 def _norm_key(raw: str) -> str:
-    """Normalise result dict key to match TRACKED_METRICS suffixes."""
     return raw.replace(" ", "_").replace("=", "").replace("-", "_")
 
 
@@ -54,139 +70,94 @@ def load_history(path: Path) -> list[dict]:
         return []
 
 
-def _extract(entry: dict, ds: str, suffix: str) -> float | None:
+def _get_value(entry: dict, ds: str, cfg_key: str, metric_suffix: str) -> float | None:
     ds_data = entry.get("results", {}).get(ds, {})
-    # Normalise all keys
     norm_map = {_norm_key(k): v for k, v in ds_data.items()}
-    return norm_map.get(_norm_key(suffix))
+    return norm_map.get(_norm_key(f"{cfg_key}_{metric_suffix}"))
 
 
 def generate_html_plotly(history: list[dict], out_path: Path) -> None:
     try:
-        import plotly.graph_objects as go  # noqa: PLC0415
-        from plotly.subplots import make_subplots  # noqa: PLC0415
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
     except ImportError as exc:
         raise ImportError(
             "plotly is required for HTML reports. Install it with: pip install plotly"
         ) from exc
 
-    n_metrics = len(TRACKED_METRICS)
-    n_ds      = len(DATASETS)
-    n_rows    = n_metrics
-    n_cols    = n_ds
-
-    subplot_titles = [
-        f"{ds} — {lbl}"
-        for _, lbl, _ in TRACKED_METRICS
-        for ds in DATASETS
-    ]
-
-    fig = make_subplots(
-        rows=n_rows, cols=n_cols,
-        subplot_titles=subplot_titles,
-        shared_xaxes=True,
-        vertical_spacing=0.04,
-        horizontal_spacing=0.06,
-    )
-
     x_labels = [
-        f"{e.get('git_commit', 'unknown')[:7]}<br>{e.get('timestamp', '')[:10]}"
+        f"{e.get('git_commit', '?')[:7]}<br>{e.get('timestamp', '')[:10]}"
         for e in history
     ]
 
-    for mi, (suffix, label, higher_better) in enumerate(TRACKED_METRICS):
-        for di, ds in enumerate(DATASETS):
-            ys = [_extract(e, ds, suffix) for e in history]
-            valid = [(x, y) for x, y in zip(x_labels, ys) if y is not None]
-            if not valid:
-                continue
-            xs_plot, ys_plot = zip(*valid)
+    n_cols = _METRICS_PER_ROW
+    n_rows = (len(METRICS) + n_cols - 1) // n_cols
 
-            row = mi + 1
-            col = di + 1
-            color = "rgba(0, 120, 200, 0.9)" if higher_better else "rgba(220, 60, 60, 0.9)"
-
-            fig.add_trace(
-                go.Scatter(
-                    x=list(xs_plot),
-                    y=list(ys_plot),
-                    mode="lines+markers",
-                    name=f"{ds} {label}",
-                    line=dict(color=color, width=2),
-                    marker=dict(size=6),
-                    showlegend=False,
-                ),
-                row=row, col=col,
-            )
-
-    fig.update_layout(
-        title="TurboQuantDB — Performance History",
-        height=350 * n_rows,
-        width=400 * n_cols,
-        template="plotly_white",
-        font=dict(size=11),
-    )
-
-    html = fig.to_html(full_html=True, include_plotlyjs="cdn")
-    out_path.write_text(html, encoding="utf-8")
-    print(f"  History report saved to {out_path} ({len(history)} entries)", flush=True)
-
-
-def generate_html_matplotlib(history: list[dict], out_path: Path) -> None:
-    """Fallback: embed matplotlib PNG into a minimal HTML page."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import io, base64
-    except ImportError:
-        print("  matplotlib not available — cannot generate history report", flush=True)
-        return
-
-    n_metrics = len(TRACKED_METRICS)
-    n_ds      = len(DATASETS)
-    fig, axes = plt.subplots(n_metrics, n_ds, figsize=(6 * n_ds, 3.5 * n_metrics),
-                              squeeze=False)
-    fig.suptitle("TurboQuantDB — Performance History", fontsize=13, fontweight="bold")
-
-    x_ticks = [e.get("git_commit", "?")[:7] for e in history]
-
-    for mi, (suffix, label, higher_better) in enumerate(TRACKED_METRICS):
-        for di, ds in enumerate(DATASETS):
-            ax = axes[mi][di]
-            ys = [_extract(e, ds, suffix) for e in history]
-            valid_idx = [i for i, y in enumerate(ys) if y is not None]
-            valid_ys  = [ys[i] for i in valid_idx]
-            valid_xs  = [x_ticks[i] for i in valid_idx]
-
-            if valid_ys:
-                ax.plot(range(len(valid_ys)), valid_ys,
-                        "b-o" if higher_better else "r-o", linewidth=1.5, markersize=5)
-                ax.set_xticks(range(len(valid_xs)))
-                ax.set_xticklabels(valid_xs, rotation=45, ha="right", fontsize=7)
-
-            ax.set_title(f"{ds}\n{label}", fontsize=8)
-            ax.grid(True, alpha=0.3)
-
-    plt.tight_layout(rect=[0, 0, 1, 0.97])
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=100, bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    img_b64 = base64.b64encode(buf.read()).decode()
-
-    html = (
+    html_parts = [
         "<!DOCTYPE html><html><head>"
         "<meta charset='utf-8'>"
         "<title>TurboQuantDB Performance History</title>"
+        "<style>"
+        "body{font-family:sans-serif;margin:20px;background:#fafafa}"
+        "h1{color:#222}"
+        "h2{color:#444;margin-top:48px;border-bottom:2px solid #ddd;padding-bottom:8px}"
+        "</style>"
+        "<script src='https://cdn.plot.ly/plotly-latest.min.js'></script>"
         "</head><body>"
         f"<h1>TurboQuantDB — Performance History ({len(history)} entries)</h1>"
-        f"<img src='data:image/png;base64,{img_b64}' style='max-width:100%'/>"
-        "</body></html>"
-    )
-    out_path.write_text(html, encoding="utf-8")
-    print(f"  History report (matplotlib) saved to {out_path}", flush=True)
+    ]
+
+    for ds in DATASETS:
+        subplot_titles = [label for _, label, _ in METRICS]
+        fig = make_subplots(
+            rows=n_rows,
+            cols=n_cols,
+            subplot_titles=subplot_titles,
+            vertical_spacing=0.18,
+            horizontal_spacing=0.08,
+        )
+
+        for mi, (metric_suffix, _label, higher_better) in enumerate(METRICS):
+            row = mi // n_cols + 1
+            col = mi % n_cols + 1
+
+            for cfg_key, cfg_label, color, dash in CONFIGS:
+                xs, ys = [], []
+                for xi, entry in enumerate(history):
+                    val = _get_value(entry, ds, cfg_key, metric_suffix)
+                    if val is not None:
+                        xs.append(x_labels[xi])
+                        ys.append(val)
+                if not ys:
+                    continue
+                fig.add_trace(
+                    go.Scatter(
+                        x=xs,
+                        y=ys,
+                        mode="lines+markers",
+                        name=cfg_label,
+                        line=dict(color=color, width=2, dash=dash),
+                        marker=dict(size=7),
+                        legendgroup=cfg_label,
+                        showlegend=(mi == 0),
+                    ),
+                    row=row, col=col,
+                )
+
+        fig.update_layout(
+            height=300 * n_rows,
+            width=1100,
+            template="plotly_white",
+            font=dict(size=11),
+            margin=dict(t=50, b=30, l=60, r=20),
+        )
+
+        html_parts.append(f"<h2>{ds}</h2>")
+        html_parts.append(fig.to_html(full_html=False, include_plotlyjs=False))
+
+    html_parts.append("</body></html>")
+    out_path.write_text("\n".join(html_parts), encoding="utf-8")
+    print(f"  History report saved to {out_path} ({len(history)} entries)", flush=True)
 
 
 def print_summary(history: list[dict]) -> None:
@@ -194,19 +165,16 @@ def print_summary(history: list[dict]) -> None:
         print("  No history entries.", flush=True)
         return
     last = history[-1]
-    print(f"\n  Latest entry: {last.get('timestamp', '?')[:19]}  "
-          f"commit={last.get('git_commit', '?')}  "
-          f"version={last.get('version', '?')}", flush=True)
+    print(
+        f"\n  Latest: {last.get('timestamp','?')[:19]}  "
+        f"commit={last.get('git_commit','?')}  version={last.get('version','?')}",
+        flush=True,
+    )
     print(f"  Total entries: {len(history)}", flush=True)
-    ds_data = last.get("results", {})
     for ds in DATASETS:
-        if ds not in ds_data:
-            continue
-        norm_map = {_norm_key(k): v for k, v in ds_data[ds].items()}
-        r1 = norm_map.get(_norm_key("b4_rerank=T_brute_r1at1"), "—")
-        tp = norm_map.get(_norm_key("b4_rerank=T_brute_throughput"), "—")
-        p5 = norm_map.get(_norm_key("b4_rerank=T_brute_p50_ms"), "—")
-        print(f"  {ds:20s}  R@1@1={r1}  throughput={tp}  p50={p5}ms", flush=True)
+        val = _get_value(last, ds, "b4_rerankT_brute", "r1at1")
+        if val is not None:
+            print(f"  {ds:20s}  b4_rerankT_brute  R@1@1={val}", flush=True)
 
 
 def main() -> None:
@@ -221,7 +189,7 @@ def main() -> None:
 
     history = load_history(Path(args.input))
     if not history:
-        print("  No history data found — run `paper_recall_bench.py --track` first.")
+        print("  No history data found — run `paper_recall_bench.py --track` or `precommit_perf_check.py` first.")
         return
 
     print_summary(history)
