@@ -8,6 +8,19 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ## [Unreleased]
 
+### Added
+
+- **`list_metadata_values(field)`** — enumerate all distinct values stored for a metadata field across active vectors; useful for building filter UIs.
+- **`normalize=True` on `Database.open()`** — automatically L2-normalizes all inserted vectors and queries at write time, making inner-product scoring equivalent to cosine similarity without changing the metric.
+- **Hybrid ANN + brute-force search** — vectors inserted *after* `create_index()` are no longer silently missed. The engine now detects "dark slots" (active but unindexed vectors), runs a targeted brute-force scan over them, and merges results with the HNSW candidates before returning top-k.
+- **ChromaDB compatibility shim** (`tqdb.chroma_compat`) — drop-in `PersistentClient(path)` backed by `tqdb.Database`; supports `get_or_create_collection`, `add`/`upsert`/`update`/`delete`/`get`/`query`/`peek`/`count`/`modify`; metric parsed from `{"hnsw:space": "cosine"}` metadata; where-filter operators `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$and/$or`.
+- **LanceDB compatibility shim** (`tqdb.lancedb_compat`) — `connect(uri)` factory with `create_table`/`open_table`/`drop_table`; fluent `CompatQuery` builder (`.metric().limit().where().select().to_list()`); PyArrow Table and `list[dict]` ingestion; SQL WHERE parser for `id IN (...)` and `field = 'value'`.
+- **Server restore endpoint** — `POST /v1/tenants/:tenant/databases/:database/collections/:collection/restore` atomically copies a snapshot back into the live collection directory.
+
+### Fixed
+
+- **Server compilation** — added missing engine stubs (`open_collection_scoped`, `snapshot_local_dir`, `insert_many_report`, `upsert_many_report`, `delete_many`, `compact`, `list_collections_scoped`).
+
 ---
 
 ## [0.2.1] — 2026-04-05
