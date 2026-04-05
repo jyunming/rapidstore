@@ -1695,8 +1695,17 @@ impl TurboQuantEngine {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let path = format!("{local_root}/{tenant}/{database}/{collection}");
         Self::open_with_options(
-            uri, &path, d, b, seed, metric, true, false,
-            RerankPrecision::Disabled, None, false,
+            uri,
+            &path,
+            d,
+            b,
+            seed,
+            metric,
+            true,
+            false,
+            RerankPrecision::Disabled,
+            None,
+            false,
         )
     }
 
@@ -1715,7 +1724,10 @@ impl TurboQuantEngine {
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 let file_name = entry.file_name();
-                std::fs::copy(entry.path(), format!("{tmp_dir}/{}", file_name.to_string_lossy()))?;
+                std::fs::copy(
+                    entry.path(),
+                    format!("{tmp_dir}/{}", file_name.to_string_lossy()),
+                )?;
             }
         }
         // Atomic rename: replace dst_dir with the fully-written tmp copy.
@@ -1788,17 +1800,17 @@ impl TurboQuantEngine {
     /// Batch-insert with per-item failure reporting.  Unlike `insert_many_with_mode`,
     /// this never returns an early `Err`; individual item failures are collected and
     /// returned alongside the successes.
-    pub fn insert_many_report(
-        &mut self,
-        items: Vec<BatchWriteItem>,
-    ) -> BatchWriteReport {
+    pub fn insert_many_report(&mut self, items: Vec<BatchWriteItem>) -> BatchWriteReport {
         let mut failed = Vec::new();
         let mut ok = Vec::new();
         for (index, item) in items.into_iter().enumerate() {
             let id = item.id.clone();
             let vec_f64: ndarray::Array1<f64> = item.vector.iter().map(|&x| x as f64).collect();
             match self.insert_many_with_mode(
-                vec![BatchWriteItem { id: id.clone(), ..item }],
+                vec![BatchWriteItem {
+                    id: id.clone(),
+                    ..item
+                }],
                 BatchWriteMode::Insert,
             ) {
                 Ok(_) => ok.push(id),
@@ -1811,20 +1823,24 @@ impl TurboQuantEngine {
             let _ = vec_f64; // suppress unused warning
         }
         let applied = ok.len();
-        BatchWriteReport { ok, failed, applied }
+        BatchWriteReport {
+            ok,
+            failed,
+            applied,
+        }
     }
 
     /// Same as `insert_many_report` but uses upsert semantics.
-    pub fn upsert_many_report(
-        &mut self,
-        items: Vec<BatchWriteItem>,
-    ) -> BatchWriteReport {
+    pub fn upsert_many_report(&mut self, items: Vec<BatchWriteItem>) -> BatchWriteReport {
         let mut failed = Vec::new();
         let mut ok = Vec::new();
         for (index, item) in items.into_iter().enumerate() {
             let id = item.id.clone();
             match self.insert_many_with_mode(
-                vec![BatchWriteItem { id: id.clone(), ..item }],
+                vec![BatchWriteItem {
+                    id: id.clone(),
+                    ..item
+                }],
                 BatchWriteMode::Upsert,
             ) {
                 Ok(_) => ok.push(id),
@@ -1836,7 +1852,11 @@ impl TurboQuantEngine {
             }
         }
         let applied = ok.len();
-        BatchWriteReport { ok, failed, applied }
+        BatchWriteReport {
+            ok,
+            failed,
+            applied,
+        }
     }
 
     /// Batch-delete by string IDs.  Wraps `delete_batch`.
@@ -1849,9 +1869,7 @@ impl TurboQuantEngine {
 
     /// Trigger segment compaction if the compaction threshold is met.
     /// Flushes the WAL first so all buffered data is on disk before merging.
-    pub fn compact(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn compact(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.flush_wal_to_segment()?;
         // Compaction is a background concern; no-op if below threshold.
         Ok(())
@@ -1882,9 +1900,7 @@ impl TurboQuantEngine {
         let mut collections = Vec::new();
         for entry in std::fs::read_dir(dir_path)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir()
-                && entry.path().join("manifest.json").exists()
-            {
+            if entry.file_type()?.is_dir() && entry.path().join("manifest.json").exists() {
                 if let Some(name) = entry.file_name().to_str() {
                     collections.push(name.to_string());
                 }

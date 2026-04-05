@@ -1,0 +1,429 @@
+"""
+LanceDB compatibility shim for tqdb.
+
+Provides a ``connect()`` function that mirrors the LanceDB Python API surface
+(v0.x / v1.x).  Internally each "table" is stored as a ``tqdb.Database``
+under ``{uri}/{table_name}/``.
+
+Supported usage pattern::
+
+    from tqdb.lancedb_compat import connect
+
+    db = connect("/data/lancedb")
+    tbl = db.create_table("docs", data=pa_table)
+    results = tbl.search(query_vec).metric("dot").limit(10).to_list()
+
+PyArrow is required for data ingestion (``import pyarrow``).  Pandas is
+optional (needed only for ``.to_pandas()``).
+
+Intentionally not implemented (raises ``NotImplementedError`` or is a no-op):
+- Remote / cloud URIs (``s3://``, ``gs://``, ``az://``)
+- ``update(where, values)``, ``merge_insert()``
+- ``create_fts_index``, ``create_scalar_index``
+- ``drop_database``
+- Complex SQL WHERE predicates (only ``id IN (...)`` and ``field = 'val'``
+  are parsed; anything else raises ``NotImplementedError``)
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+from typing import Any, Dict, List, Optional, Union
+
+import numpy as np
+
+try:
+    from .tqdb import Database
+except ImportError:
+    from tqdb.tqdb import Database  # type: ignore[no-redef]
+
+# ---------------------------------------------------------------------------
+# Metric mapping
+# ---------------------------------------------------------------------------
+
+_METRIC_MAP: Dict[str, str] = {
+    "dot": "ip",
+    "ip": "ip",
+    "cosine": "cosine",
+    "l2": "l2",
+    "euclidean": "l2",
+}
+
+
+def _map_metric(m: str) -> str:
+    key = m.lower()
+    if key not in _METRIC_MAP:
+        raise ValueError(f"Unsupported metric '{m}'. Use: dot, ip, cosine, l2, euclidean.")
+    return _METRIC_MAP[key]
+
+
+# ---------------------------------------------------------------------------
+# SQL WHERE parser (minimal subset)
+# ---------------------------------------------------------------------------
+
+_ID_IN_PATTERN = re.compile(
+    r"""^\s*id\s+IN\s*\(([^)]+)\)\s*$""", re.IGNORECASE
+)
+_FIELD_EQ_PATTERN = re.compile(
+    r"""^\s*(\w+)\s*=\s*'([^']*)'\s*$"""
+)
+
+
+def _parse_sql_where(where: str) -> Dict[str, Any]:
+    """
+    Parse a minimal SQL WHERE clause into a tqdb filter dict.
+
+    Supported forms:
+    - ``id IN ('a', 'b', 'c')``
+    - ``field = 'value'``
+
+    Anything else raises ``NotImplementedError``.
+    """
+    m = _ID_IN_PATTERN.match(where)
+    if m:
+        ids_raw = m.group(1)
+        ids = [s.strip().strip("'\"") for s in ids_raw.split(",")]
+        return {"id": {"$in": ids}}
+    m = _FIELD_EQ_PATTERN.match(where)
+    if m:
+        field, value = m.group(1), m.group(2)
+        return {field: {"$eq": value}}
+    raise NotImplementedError(
+        f"Complex SQL WHERE clause not supported: '{where}'. "
+        "Only 'id IN (...)' and \"field = 'value'\" are handled."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Data ingestion helpers
+# ---------------------------------------------------------------------------
+
+def _extract_rows(data: Any) -> List[Dict[str, Any]]:
+    """
+    Convert PyArrow Table or list[dict] to a list of dicts.
+
+    Each dict must contain a ``vector`` key.
+    """
+    try:
+        import pyarrow as pa  # type: ignore
+        if isinstance(data, pa.Table):
+            return data.to_pylist()
+    except ImportError:
+        pass
+    if isinstance(data, list):
+        return data
+    raise TypeError(
+        f"data must be a PyArrow Table or list[dict], got {type(data).__name__}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# CompatQuery  (fluent builder)
+# ---------------------------------------------------------------------------
+
+class CompatQuery:
+    """
+    Fluent query builder matching LanceDB's
+    ``tbl.search(q).metric("dot").limit(k).where(f).to_list()`` pattern.
+    """
+
+    def __init__(self, table: "CompatTable", query: Any):
+        self._table = table
+        self._query = np.asarray(query, dtype=np.float64).flatten()
+        self._metric: Optional[str] = None   # mapped metric override
+        self._k: int = 10
+        self._where: Optional[str] = None
+        self._select: Optional[List[str]] = None
+
+    def metric(self, m: str) -> "CompatQuery":
+        self._metric = _map_metric(m)
+        return self
+
+    def limit(self, k: int) -> "CompatQuery":
+        self._k = k
+        return self
+
+    def where(self, filter_str: str, prefilter: bool = False) -> "CompatQuery":
+        self._where = filter_str
+        return self
+
+    def select(self, columns: List[str]) -> "CompatQuery":
+        self._select = columns
+        return self
+
+    # Silently accepted, no-op (tqdb has no IVF nprobe tuning)
+    def nprobes(self, n: int) -> "CompatQuery":
+        return self
+
+    def refine_factor(self, n: int) -> "CompatQuery":
+        return self
+
+    def to_list(self) -> List[Dict[str, Any]]:
+        tqdb_filter: Optional[Dict[str, Any]] = None
+        if self._where:
+            tqdb_filter = _parse_sql_where(self._where)
+
+        # tqdb bakes metric into the DB at creation; per-query metric override is ignored.
+        db = self._table._open_db()
+        results = db.search(self._query, self._k, filter=tqdb_filter)
+
+        rows = []
+        for r in results:
+            row: Dict[str, Any] = {"id": r["id"], "_distance": r["score"]}
+            meta = r.get("metadata") or {}
+            for k, v in meta.items():
+                row[k] = v
+            if r.get("document") is not None:
+                row["document"] = r["document"]
+            if self._select:
+                row = {k: row[k] for k in self._select if k in row}
+            rows.append(row)
+        return rows
+
+    def to_arrow(self):
+        import pyarrow as pa  # type: ignore
+        rows = self.to_list()
+        if not rows:
+            return pa.table({})
+        return pa.Table.from_pylist(rows)
+
+    def to_pandas(self):
+        import pandas as pd  # type: ignore
+        return pd.DataFrame(self.to_list())
+
+
+# ---------------------------------------------------------------------------
+# CompatTable
+# ---------------------------------------------------------------------------
+
+class CompatTable:
+    """Wraps a ``tqdb.Database`` behind the LanceDB Table interface."""
+
+    def __init__(self, path: str, name: str, metric: str):
+        self._path = path
+        self._name = name
+        self._metric = metric
+        self._dim: Optional[int] = None
+        self._db: Optional[Database] = None
+        # Recover dim from _lance_meta.json (written on first add)
+        meta_path = os.path.join(path, "_lance_meta.json")
+        if os.path.exists(meta_path):
+            import json
+            with open(meta_path) as f:
+                info = json.load(f)
+            self._dim = info.get("dim")
+
+    def _open_db(self) -> Database:
+        if self._db is not None:
+            return self._db
+        if self._dim is not None:
+            self._db = Database.open(self._path, self._dim, metric=self._metric)
+            return self._db
+        raise RuntimeError(
+            "Cannot open table: dimension unknown. "
+            "Call add() or create_table(data=...) first."
+        )
+
+    def _persist_dim(self) -> None:
+        """Persist dim (and metric) into _lance_meta.json after first ingestion."""
+        import json
+        meta_path = os.path.join(self._path, "_lance_meta.json")
+        info: Dict[str, Any] = {}
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                info = json.load(f)
+        info["dim"] = self._dim
+        info["metric"] = self._metric
+        with open(meta_path, "w") as f:
+            json.dump(info, f)
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def add(self, data: Any, mode: str = "append") -> None:
+        rows = _extract_rows(data)
+        if not rows:
+            return
+        vectors = [r["vector"] for r in rows]
+        if isinstance(vectors[0], (list, tuple)):
+            vecs = np.asarray(vectors, dtype=np.float64)
+        else:
+            vecs = np.stack([np.asarray(v, dtype=np.float64) for v in vectors])
+        dim = vecs.shape[1]
+        if self._dim is None:
+            self._dim = dim
+
+        ids = [str(r.get("id", i)) for i, r in enumerate(rows)]
+        metas = []
+        docs = []
+        for r in rows:
+            meta = {k: v for k, v in r.items() if k not in ("id", "vector", "document")}
+            metas.append(meta if meta else {})
+            docs.append(r.get("document"))
+
+        if mode == "overwrite":
+            # Wipe and recreate; invalidate cached db handle
+            if os.path.exists(self._path):
+                shutil.rmtree(self._path)
+            os.makedirs(self._path, exist_ok=True)
+            self._dim = dim
+            self._db = None
+
+        if self._db is None:
+            self._dim = dim
+            self._db = Database.open(self._path, self._dim, metric=self._metric)
+        write_mode = "upsert" if mode == "overwrite" else "insert"
+        self._db.insert_batch(ids, vecs, metas, docs, write_mode)
+        self._persist_dim()
+
+    def search(self, query: Any) -> CompatQuery:
+        return CompatQuery(self, query)
+
+    def delete(self, where: str) -> None:
+        tqdb_filter = _parse_sql_where(where)
+        db = self._open_db()
+        if "id" in tqdb_filter and "$in" in tqdb_filter["id"]:
+            ids = tqdb_filter["id"]["$in"]
+            db.delete_batch(ids)
+        else:
+            # filter-based delete
+            results = db.list_ids(where_filter=tqdb_filter)
+            if results:
+                db.delete_batch(results)
+
+    def count_rows(self, filter: Optional[str] = None) -> int:
+        if not os.path.exists(os.path.join(self._path, "manifest.json")):
+            return 0
+        db = self._open_db()
+        if filter:
+            tqdb_filter = _parse_sql_where(filter)
+            return db.count(filter=tqdb_filter)
+        return len(db)
+
+    def optimize(self, cleanup_older_than=None, delete_unverified: bool = False) -> None:
+        """No-op stub — tqdb handles compaction automatically."""
+        pass
+
+    def create_index(
+        self,
+        metric: str = "L2",
+        index_type: str = "IVF_PQ",
+        num_partitions: int = 256,
+        num_sub_vectors: Optional[int] = None,
+        **kwargs,
+    ) -> None:
+        """Delegate to tqdb.create_index() with sane defaults; IVF_PQ params ignored."""
+        db = self._open_db()
+        db.create_index()
+
+    def to_arrow(self):
+        import pyarrow as pa  # type: ignore
+        db = self._open_db()
+        rows = db.list_all()
+        if not rows:
+            return pa.table({})
+        return pa.Table.from_pylist(rows)
+
+    def to_pandas(self):
+        import pandas as pd  # type: ignore
+        db = self._open_db()
+        return pd.DataFrame(db.list_all())
+
+
+# ---------------------------------------------------------------------------
+# CompatConnection
+# ---------------------------------------------------------------------------
+
+class CompatConnection:
+    """LanceDB-compatible connection backed by tqdb."""
+
+    def __init__(self, uri: str):
+        if uri.startswith(("s3://", "gs://", "az://")):
+            raise NotImplementedError(
+                f"Cloud URIs are not supported in the tqdb LanceDB shim: {uri}"
+            )
+        self._root = os.path.abspath(uri)
+        os.makedirs(self._root, exist_ok=True)
+
+    def _table_dir(self, name: str) -> str:
+        return os.path.join(self._root, name)
+
+    def _meta_path(self, name: str) -> str:
+        return os.path.join(self._table_dir(name), "_lance_meta.json")
+
+    def _is_table(self, name: str) -> bool:
+        return os.path.isdir(self._table_dir(name)) and (
+            os.path.exists(self._meta_path(name))
+            or os.path.exists(os.path.join(self._table_dir(name), "manifest.json"))
+        )
+
+    def _load_metric(self, name: str) -> str:
+        mp = self._meta_path(name)
+        if os.path.exists(mp):
+            import json
+            with open(mp) as f:
+                return json.load(f).get("metric", "ip")
+        return "ip"
+
+    def _save_meta(self, name: str, metric: str) -> None:
+        import json
+        with open(self._meta_path(name), "w") as f:
+            json.dump({"metric": metric}, f)
+
+    def create_table(
+        self,
+        name: str,
+        data: Any = None,
+        schema=None,
+        mode: str = "create",
+    ) -> CompatTable:
+        if mode not in ("create", "overwrite"):
+            raise ValueError(f"Unsupported mode '{mode}'. Use 'create' or 'overwrite'.")
+
+        tbl_dir = self._table_dir(name)
+        if mode == "overwrite" and os.path.exists(tbl_dir):
+            shutil.rmtree(tbl_dir)
+        os.makedirs(tbl_dir, exist_ok=True)
+
+        metric = "ip"  # default; LanceDB default metric is "dot" ≡ ip
+        self._save_meta(name, metric)
+        tbl = CompatTable(tbl_dir, name, metric)
+        if data is not None:
+            # Dir was already wiped above for overwrite; always use append here
+            tbl.add(data, mode="append")
+        return tbl
+
+    def open_table(self, name: str) -> CompatTable:
+        if not self._is_table(name):
+            raise ValueError(f"Table '{name}' not found at {self._root}.")
+        metric = self._load_metric(name)
+        return CompatTable(self._table_dir(name), name, metric)
+
+    def drop_table(self, name: str) -> None:
+        tbl_dir = self._table_dir(name)
+        if not os.path.exists(tbl_dir):
+            raise ValueError(f"Table '{name}' not found.")
+        shutil.rmtree(tbl_dir)
+
+    def table_names(self) -> List[str]:
+        return sorted(
+            entry.name
+            for entry in os.scandir(self._root)
+            if entry.is_dir() and (
+                os.path.exists(os.path.join(entry.path, "_lance_meta.json"))
+                or os.path.exists(os.path.join(entry.path, "manifest.json"))
+            )
+        )
+
+
+def connect(uri: str) -> CompatConnection:
+    """
+    Factory matching ``lancedb.connect(uri)`` signature.
+
+    ``uri`` must be a local directory path.  Cloud URIs raise
+    ``NotImplementedError``.
+    """
+    return CompatConnection(uri)
