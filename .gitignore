@@ -1,3 +1,6 @@
+# GitHub Copilot CLI instructions (local agent config — not for version control)
+.github/copilot-instructions.md
+
 # Rust build artifacts
 /target
 /target_*/

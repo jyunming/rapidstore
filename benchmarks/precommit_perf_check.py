@@ -104,10 +104,10 @@ HISTORY_PATH = BENCH_DIR / "perf_history.json"
 
 # Datasets run for history tracking (smaller n than full benchmark for speed)
 HISTORY_DS_CONFIGS: list[tuple[str, int, int, int]] = [
-    # (ds_label, n, d, n_queries)
-    ("glove-200",    10_000, 200,  1000),   # cache has 10k queries
-    ("dbpedia-1536",  2_000, 1536,  500),   # cache has 1k queries
-    ("dbpedia-3072",  1_000, 3072,  500),   # cache has 1k queries
+    # (ds_label, n, d, n_queries)  — full 100k corpus
+    ("glove-200",    100_000, 200,  10_000),
+    ("dbpedia-1536", 100_000, 1536,  1_000),
+    # dbpedia-3072 (d=3072) omitted — ~6 hrs/commit, too expensive for CI history
 ]
 
 # Full config set matching perf_tracker.py CONFIGS: (bits, rerank, ann)
@@ -190,11 +190,8 @@ def _run_one_config_for_history(
             db.insert_batch(ids[start:start + CHUNK_SIZE], corpus[start:start + CHUNK_SIZE])
         db.flush()
         ingest_s = time.perf_counter() - t0
-        if sampler:
-            sampler.stop()
-            ram_mb = sampler.delta_ram_mb
-        else:
-            ram_mb = db.stats()["ram_estimate_bytes"] / (1 << 20)
+        # Use deterministic structural estimate — avoids RSS noise from GC/mmap faulting
+        ram_mb = db.stats()["ram_estimate_bytes"] / (1 << 20)
         db.close()
         # Reopen then close to trim pre-allocated mmap capacity before measuring disk
         tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip").close()
@@ -247,12 +244,12 @@ def _run_one_config_for_history(
             mrr_vals.append(0.0)
 
     return {
-        "r1at1":        round(r1at1, 4),
-        "throughput":   round(n / ingest_s),
-        "p50_ms":       round(float(np.percentile(lats, 50)), 3),
-        "disk_mb":      round(disk_mb, 2),
-        "ram_delta_mb": round(ram_mb, 1),
-        "mrr":          round(float(np.mean(mrr_vals)), 4),
+        "r1at1":          round(r1at1, 4),
+        "throughput":     round(n / ingest_s),
+        "p50_ms":         round(float(np.percentile(lats, 50)), 3),
+        "disk_mb":        round(disk_mb, 2),
+        "ram_estimate_mb": round(ram_mb, 1),
+        "mrr":            round(float(np.mean(mrr_vals)), 4),
     }
 
 
@@ -281,9 +278,26 @@ def _append_perf_history() -> None:
         "results":    {},
     }
 
+    # Cache dir is gitignored and survives git checkouts — safe to read at any commit
+    _CACHE_DIR = Path(__file__).parent / "_paper_bench_cache"
+
     for ds_label, n, d, n_queries in HISTORY_DS_CONFIGS:
         print(f"  [history] {ds_label}  n={n:,}  d={d}", flush=True)
-        corpus, qs, _ = load_data(n, d, n_queries, seed=42)
+        corpus: "np.ndarray"
+        qs: "np.ndarray"
+        if ds_label.startswith("dbpedia-"):
+            dim = int(ds_label.split("-")[1])
+            tag = f"dbpedia{dim}"
+            _ckpt_vecs  = _CACHE_DIR / f"{tag}_100000_vecs.npy"
+            _ckpt_qvecs = _CACHE_DIR / f"{tag}_1000_qvecs.npy"
+            if _ckpt_vecs.exists() and _ckpt_qvecs.exists():
+                corpus = np.load(_ckpt_vecs)[:n]
+                qs     = np.load(_ckpt_qvecs)[:n_queries]
+                print(f"  data: DBpedia-{dim} ({corpus.shape[0]:,} corpus, {qs.shape[0]} queries)", flush=True)
+            else:
+                corpus, qs, _ = load_data(n, d, n_queries, seed=42)
+        else:
+            corpus, qs, _ = load_data(n, d, n_queries, seed=42)
         true_top1s = [f"vec_{int(np.argmax(corpus @ q))}" for q in qs]
         ds_snap: dict = {}
         for bits, rerank, ann in HISTORY_BENCH_CONFIGS:
