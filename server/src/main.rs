@@ -112,6 +112,7 @@ enum JobType {
     Compact,
     IndexBuild,
     Snapshot,
+    Restore,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +355,11 @@ struct SnapshotRequest {
     snapshot_name: Option<String>,
 }
 #[derive(Deserialize)]
+struct RestoreRequest {
+    snapshot_name: String,
+    r#async: Option<bool>,
+}
+#[derive(Deserialize)]
 struct AddVectorsRequest {
     ids: Vec<String>,
     embeddings: Vec<Vec<f64>>,
@@ -508,6 +514,10 @@ fn build_app(state: AppState) -> Router {
         .route(
             "/v1/tenants/:tenant/databases/:database/collections/:collection/snapshot",
             post(start_snapshot_job),
+        )
+        .route(
+            "/v1/tenants/:tenant/databases/:database/collections/:collection/restore",
+            post(start_restore_job),
         )
         .route(
             "/v1/tenants/:tenant/databases/:database/collections/:collection/jobs",
@@ -1623,6 +1633,43 @@ async fn start_snapshot_job(
     ))
 }
 
+async fn start_restore_job(
+    State(state): State<AppState>,
+    Path((tenant, database, collection)): Path<(String, String, String)>,
+    Extension(ctx): Extension<RequestContext>,
+    Json(body): Json<RestoreRequest>,
+) -> Result<(StatusCode, Json<JobEnqueueResponse>), ApiError> {
+    authorize(
+        &ctx,
+        &state.auth,
+        "write",
+        &tenant,
+        &database,
+        Some(&collection),
+    )?;
+    enforce_job_enqueue_quota(
+        &state,
+        &tenant,
+        &database,
+        Some(&collection),
+        ctx.request_id.clone(),
+    )?;
+    let _ = body.r#async.unwrap_or(true);
+    let (job_id, status) = enqueue_job(
+        &state,
+        JobType::Restore,
+        tenant,
+        database,
+        collection,
+        Some(body.snapshot_name),
+        ctx.request_id.clone(),
+    )?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(JobEnqueueResponse { job_id, status }),
+    ))
+}
+
 async fn get_job_status(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
@@ -1967,6 +2014,35 @@ fn execute_job_operation(
             let collection_dir_s = collection_dir.to_string_lossy().to_string();
             let snapshot_dir_s = snapshot_dir.to_string_lossy().to_string();
             TurboQuantEngine::snapshot_local_dir(&collection_dir_s, &snapshot_dir_s)
+        }
+        JobType::Restore => {
+            let snapshot_name = job
+                .snapshot_name
+                .as_deref()
+                .ok_or("restore job missing snapshot_name")?;
+            let snapshot_dir = PathBuf::from(&state.storage.local_root)
+                .join("snapshots")
+                .join(&job.tenant)
+                .join(&job.database)
+                .join(&job.collection)
+                .join(snapshot_name);
+            if !snapshot_dir.exists() {
+                return Err(format!(
+                    "snapshot '{}' not found for collection '{}' in tenant '{}' database '{}'",
+                    snapshot_name, job.collection, job.tenant, job.database
+                )
+                .into());
+            }
+            let collection_dir = scoped_collection_dir(
+                &state.storage.local_root,
+                &job.tenant,
+                &job.database,
+                &job.collection,
+            );
+            let snapshot_dir_s = snapshot_dir.to_string_lossy().to_string();
+            let collection_dir_s = collection_dir.to_string_lossy().to_string();
+            // Atomically replace the live collection dir with the snapshot contents.
+            TurboQuantEngine::snapshot_local_dir(&snapshot_dir_s, &collection_dir_s)
         }
     }
 }
