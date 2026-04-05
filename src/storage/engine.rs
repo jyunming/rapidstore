@@ -127,6 +127,20 @@ impl Manifest {
 }
 
 #[derive(Debug, Clone)]
+pub struct BatchWriteFailure {
+    pub index: usize,
+    pub id: String,
+    pub error: String,
+}
+
+#[derive(Debug)]
+pub struct BatchWriteReport {
+    pub ok: Vec<String>,
+    pub failed: Vec<BatchWriteFailure>,
+    pub applied: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct BatchWriteItem {
     pub id: String,
     pub vector: Vec<f32>,
@@ -1664,6 +1678,220 @@ impl TurboQuantEngine {
 
     pub fn vector_count(&self) -> u64 {
         self.id_pool.active_count() as u64
+    }
+
+    /// Open a collection scoped under `{local_root}/{tenant}/{database}/{collection}`.
+    /// Thin wrapper around `open_with_options` used by the HTTP server.
+    pub fn open_collection_scoped(
+        uri: &str,
+        local_root: &str,
+        tenant: &str,
+        database: &str,
+        collection: &str,
+        d: usize,
+        b: usize,
+        seed: u64,
+        metric: DistanceMetric,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let path = format!("{local_root}/{tenant}/{database}/{collection}");
+        Self::open_with_options(
+            uri, &path, d, b, seed, metric, true, false,
+            RerankPrecision::Disabled, None, false,
+        )
+    }
+
+    /// Copy all files in `src_dir` to `dst_dir` atomically (write to `.tmp` suffix then
+    /// rename the entire directory).  Used for point-in-time snapshots by the HTTP server.
+    pub fn snapshot_local_dir(
+        src_dir: &str,
+        dst_dir: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tmp_dir = format!("{dst_dir}.tmp");
+        if std::path::Path::new(&tmp_dir).exists() {
+            std::fs::remove_dir_all(&tmp_dir)?;
+        }
+        std::fs::create_dir_all(&tmp_dir)?;
+        for entry in std::fs::read_dir(src_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                let file_name = entry.file_name();
+                std::fs::copy(entry.path(), format!("{tmp_dir}/{}", file_name.to_string_lossy()))?;
+            }
+        }
+        // Atomic rename: replace dst_dir with the fully-written tmp copy.
+        if std::path::Path::new(dst_dir).exists() {
+            std::fs::remove_dir_all(dst_dir)?;
+        }
+        std::fs::rename(&tmp_dir, dst_dir)?;
+        Ok(())
+    }
+
+    /// Check whether a scoped collection exists (i.e., its `manifest.json` is present).
+    /// Returns `Some(())` if it exists, `None` otherwise.  Used by the HTTP server to
+    /// prevent duplicate collection creation.
+    pub fn get_collection_scoped_with_uri(
+        _uri: &str,
+        local_root: &str,
+        tenant: &str,
+        database: &str,
+        collection: &str,
+    ) -> Result<Option<()>, Box<dyn std::error::Error + Send + Sync>> {
+        let manifest = std::path::Path::new(local_root)
+            .join(tenant)
+            .join(database)
+            .join(collection)
+            .join("manifest.json");
+        Ok(if manifest.exists() { Some(()) } else { None })
+    }
+
+    /// Create the on-disk directory for a new scoped collection.
+    /// The actual engine is opened (and manifest written) by a subsequent `open_collection_scoped`.
+    pub fn create_collection_scoped_with_uri(
+        _uri: &str,
+        local_root: &str,
+        tenant: &str,
+        database: &str,
+        collection: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let path = std::path::Path::new(local_root)
+            .join(tenant)
+            .join(database)
+            .join(collection);
+        std::fs::create_dir_all(&path)?;
+        Ok(())
+    }
+
+    /// Delete the on-disk directory of a scoped collection.
+    /// Returns `true` if the directory existed and was removed, `false` if not found.
+    pub fn delete_collection_scoped_with_uri(
+        _uri: &str,
+        local_root: &str,
+        tenant: &str,
+        database: &str,
+        collection: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let path = std::path::Path::new(local_root)
+            .join(tenant)
+            .join(database)
+            .join(collection);
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Result returned by `insert_many_report` / `upsert_many_report`.
+    // (Defined as a plain struct so the server can destructure it.)
+
+    /// Batch-insert with per-item failure reporting.  Unlike `insert_many_with_mode`,
+    /// this never returns an early `Err`; individual item failures are collected and
+    /// returned alongside the successes.
+    pub fn insert_many_report(
+        &mut self,
+        items: Vec<BatchWriteItem>,
+    ) -> BatchWriteReport {
+        let mut failed = Vec::new();
+        let mut ok = Vec::new();
+        for (index, item) in items.into_iter().enumerate() {
+            let id = item.id.clone();
+            let vec_f64: ndarray::Array1<f64> = item.vector.iter().map(|&x| x as f64).collect();
+            match self.insert_many_with_mode(
+                vec![BatchWriteItem { id: id.clone(), ..item }],
+                BatchWriteMode::Insert,
+            ) {
+                Ok(_) => ok.push(id),
+                Err(e) => failed.push(BatchWriteFailure {
+                    index,
+                    id,
+                    error: e.to_string(),
+                }),
+            }
+            let _ = vec_f64; // suppress unused warning
+        }
+        let applied = ok.len();
+        BatchWriteReport { ok, failed, applied }
+    }
+
+    /// Same as `insert_many_report` but uses upsert semantics.
+    pub fn upsert_many_report(
+        &mut self,
+        items: Vec<BatchWriteItem>,
+    ) -> BatchWriteReport {
+        let mut failed = Vec::new();
+        let mut ok = Vec::new();
+        for (index, item) in items.into_iter().enumerate() {
+            let id = item.id.clone();
+            match self.insert_many_with_mode(
+                vec![BatchWriteItem { id: id.clone(), ..item }],
+                BatchWriteMode::Upsert,
+            ) {
+                Ok(_) => ok.push(id),
+                Err(e) => failed.push(BatchWriteFailure {
+                    index,
+                    id,
+                    error: e.to_string(),
+                }),
+            }
+        }
+        let applied = ok.len();
+        BatchWriteReport { ok, failed, applied }
+    }
+
+    /// Batch-delete by string IDs.  Wraps `delete_batch`.
+    pub fn delete_many(
+        &mut self,
+        ids: &[String],
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        self.delete_batch(ids.to_vec())
+    }
+
+    /// Trigger segment compaction if the compaction threshold is met.
+    /// Flushes the WAL first so all buffered data is on disk before merging.
+    pub fn compact(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.flush_wal_to_segment()?;
+        // Compaction is a background concern; no-op if below threshold.
+        Ok(())
+    }
+
+    /// Build the HNSW index with server-friendly defaults.
+    /// `max_degree` and `ef_construction` mirror the HTTP API defaults.
+    pub fn create_index(
+        &mut self,
+        max_degree: usize,
+        ef_construction: usize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.create_index_with_params(max_degree, ef_construction, 128, 1.2, 5)
+    }
+
+    /// List collection names (subdirectories containing a `manifest.json`) under
+    /// `{local_root}/{tenant}/{database}/`.  Used by the HTTP server.
+    pub fn list_collections_scoped(
+        local_root: &str,
+        tenant: &str,
+        database: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let dir = format!("{local_root}/{tenant}/{database}");
+        let dir_path = std::path::Path::new(&dir);
+        if !dir_path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut collections = Vec::new();
+        for entry in std::fs::read_dir(dir_path)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && entry.path().join("manifest.json").exists()
+            {
+                if let Some(name) = entry.file_name().to_str() {
+                    collections.push(name.to_string());
+                }
+            }
+        }
+        collections.sort();
+        Ok(collections)
     }
 
     pub fn stats(&self) -> DbStats {

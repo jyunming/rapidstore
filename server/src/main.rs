@@ -13,7 +13,7 @@ use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
-use tqdb::storage::engine::{BatchWriteItem, DistanceMetric, GetResult, TurboQuantEngine};
+use tqdb::storage::engine::{BatchWriteFailure, BatchWriteItem, DistanceMetric, GetResult, TurboQuantEngine};
 
 #[derive(Clone)]
 struct AppState {
@@ -161,7 +161,7 @@ fn build_batch_items(
     (0..ids.len())
         .map(|i| BatchWriteItem {
             id: ids[i].clone(),
-            vector: Array1::from(embeddings[i].clone()),
+            vector: embeddings[i].iter().map(|&x| x as f32).collect(),
             metadata: metadatas
                 .and_then(|m| m.get(i).cloned())
                 .unwrap_or_default(),
@@ -996,7 +996,7 @@ async fn add_vectors(
             }
             items.push(BatchWriteItem {
                 id: body.ids[i].clone(),
-                vector: Array1::from(body.embeddings[i].clone()),
+                vector: body.embeddings[i].iter().map(|&x| x as f32).collect(),
                 metadata: body
                     .metadatas
                     .as_ref()
@@ -1178,7 +1178,7 @@ async fn upsert_vectors(
             }
             items.push(BatchWriteItem {
                 id: body.ids[i].clone(),
-                vector: Array1::from(body.embeddings[i].clone()),
+                vector: body.embeddings[i].iter().map(|&x| x as f32).collect(),
                 metadata: body
                     .metadatas
                     .as_ref()
@@ -1358,12 +1358,15 @@ async fn get_vectors(
     let mut engine = open_scoped_engine_from_manifest(&state, &tenant, &database, &collection)
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
 
-    let mut rows = if selector_ids.is_empty() {
+    let mut rows: Vec<GetResult> = if selector_ids.is_empty() {
         Vec::new()
     } else {
         engine
             .get_many(&selector_ids)
             .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?
+            .into_iter()
+            .flatten()
+            .collect()
     };
 
     if let Some(filter_expr) = where_filter {
