@@ -126,11 +126,11 @@ db.count(filter=None)                # → int
 db.stats()                           # → dict
 len(db) / "id" in db                 # container protocol
 
-# Search — ANN is used automatically when an index has been built
-results = db.search(query, top_k=10, filter=None,
+# Search — brute-force by default; pass _use_ann=True to use HNSW index
+results = db.search(query, top_k=10, filter=None, _use_ann=False,
                     ann_search_list_size=None, include=None)
 # include: list of "id"|"score"|"metadata"|"document" (default all)
-# ann_search_list_size: HNSW ef_search override (larger = more recall, slower)
+# ann_search_list_size: HNSW ef_search override (only used when _use_ann=True)
 
 all_results = db.query(query_embeddings, n_results=10, where_filter=None)
 # query_embeddings: np.ndarray (N, D) — returns list[list[dict]]
@@ -387,7 +387,7 @@ The TurboQuant paper contributes the **quantization algorithm** — how to compr
 
 **Added by TurboQuantDB (not in the paper):** WAL persistence, memory-mapped storage, metadata/documents, HNSW graph index, reranking, Python bindings, and the HTTP server.
 
-The brute-force search path is the paper-conformant mode — it scores all vectors using TurboQuant's LUT scorer, matching the paper's experimental setup exactly. The HNSW index is a practical engineering addition that reduces the candidate set before scoring, enabling sub-linear search at the cost of approximate recall. **ANN is engaged automatically** when an index is present (built via `create_index()`); no extra flag is needed.
+The brute-force search path (`_use_ann=False`, the default) is the paper-conformant mode — it scores all vectors using TurboQuant's LUT scorer, matching the paper's experimental setup exactly. The HNSW index is a practical engineering addition that reduces the candidate set before scoring, enabling sub-linear search at the cost of approximate recall. Pass `_use_ann=True` to engage the HNSW index (requires `create_index()` to have been called first).
 
 ### Module Map
 

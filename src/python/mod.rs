@@ -365,15 +365,18 @@ impl Database {
 
     /// Search for the nearest neighbours of a query vector.
     ///
-    /// The HNSW index is used automatically when one has been built via
-    /// :meth:`create_index` — no extra flag needed.  Without an index the
-    /// search falls back to exhaustive (brute-force) scoring.
+    /// The HNSW index is used when an index has been built via
+    /// :meth:`create_index` **and** ``_use_ann=True`` is passed.
+    /// With ``_use_ann=False`` (the default) the search always uses exhaustive
+    /// brute-force scoring, which gives the highest recall at the cost of
+    /// linear scan time.
     ///
     /// Args:
     ///     query: Query vector (1-D numpy array, float32 or float64).
     ///     top_k: Number of results to return.
     ///     filter: Optional metadata filter dict.
     ///     ann_search_list_size: HNSW ef_search override (larger = more recall, slower).
+    ///         Only relevant when ``_use_ann=True`` and an index exists.
     ///     include: Subset of fields to return — ``["id", "score", "metadata", "document"]``.
     ///              Defaults to all four.
     ///
@@ -410,7 +413,7 @@ impl Database {
         let results = py.allow_threads(|| {
             let engine = self.engine.read().unwrap();
             engine
-                .search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size)
+                .search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size, _use_ann)
                 .map_err(to_py_runtime)
         })?;
 
@@ -562,11 +565,11 @@ impl Database {
     ///     n_results: Number of results per query. Default 10.
     ///     where_filter: Optional metadata filter (same syntax as :meth:`search`).
     ///     ann_search_list_size: HNSW ef_search override (larger = more recall, slower).
-    ///         Only relevant when an index has been built via :meth:`create_index`.
+    ///         Only relevant when ``_use_ann=True`` and an index exists.
     ///
     /// Note:
-    ///     The HNSW index is used automatically when one has been built.
-    ///     No extra flag is needed — ``search`` and ``query`` detect the index at runtime.
+    ///     Pass ``_use_ann=True`` to engage the HNSW index (must be built first via
+    ///     :meth:`create_index`). Default is ``False`` (exhaustive brute-force).
     ///
     /// Returns:
     ///     List of N result lists, each in the same format as :meth:`search`.
@@ -616,7 +619,13 @@ impl Database {
         let batch = py.allow_threads(|| {
             let engine = self.engine.read().unwrap();
             engine
-                .search_batch(&queries, n_results, filter_ref, ann_search_list_size)
+                .search_batch(
+                    &queries,
+                    n_results,
+                    filter_ref,
+                    ann_search_list_size,
+                    _use_ann,
+                )
                 .map_err(to_py_runtime)
         })?;
 
