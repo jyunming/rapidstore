@@ -4,6 +4,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use metrics_exporter_prometheus::PrometheusHandle;
 use ndarray::Array1;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -11,9 +12,9 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
-use tqdb::storage::engine::{BatchWriteFailure, BatchWriteItem, DistanceMetric, GetResult, TurboQuantEngine};
+use tqdb::storage::engine::{BatchWriteItem, DistanceMetric, GetResult, TurboQuantEngine};
 
 #[derive(Clone)]
 struct AppState {
@@ -22,6 +23,7 @@ struct AppState {
     jobs: Arc<Mutex<JobStore>>,
     storage: StorageConfig,
     job_worker_concurrency: usize,
+    metrics_handle: PrometheusHandle,
 }
 
 #[derive(Clone)]
@@ -538,6 +540,7 @@ fn build_app(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics_handler))
         .merge(protected)
         .with_state(state)
 }
@@ -711,6 +714,15 @@ async fn main() {
         )
         .init();
 
+    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Prefix("tqdb_search_latency_seconds".to_string()),
+            &[0.001, 0.005, 0.010, 0.050, 0.100],
+        )
+        .expect("invalid histogram buckets")
+        .install_recorder()
+        .expect("failed to install Prometheus metrics recorder");
+
     let local_root = std::env::var("TQ_LOCAL_ROOT").unwrap_or_else(|_| "./data".to_string());
     let uri = std::env::var("TQ_STORAGE_URI").unwrap_or_else(|_| local_root.clone());
     let auth_store_path = std::env::var("TQ_AUTH_STORE_PATH")
@@ -743,6 +755,7 @@ async fn main() {
             job_store_path,
         },
         job_worker_concurrency,
+        metrics_handle,
     };
 
     dispatch_queued_jobs(&state);
@@ -763,6 +776,76 @@ async fn main() {
 
 async fn healthz() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    collect_collection_gauges(&state);
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state.metrics_handle.render(),
+    )
+}
+
+fn collect_collection_gauges(state: &AppState) {
+    let tenants_dir = PathBuf::from(&state.storage.local_root).join("tenants");
+    let Ok(tenant_entries) = std::fs::read_dir(&tenants_dir) else {
+        return;
+    };
+    for tenant_entry in tenant_entries.flatten() {
+        if !tenant_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let tenant = tenant_entry.file_name().to_string_lossy().to_string();
+        let Ok(db_entries) = std::fs::read_dir(tenant_entry.path().join("databases")) else {
+            continue;
+        };
+        for db_entry in db_entries.flatten() {
+            if !db_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let database = db_entry.file_name().to_string_lossy().to_string();
+            let Ok(col_entries) = std::fs::read_dir(db_entry.path().join("collections")) else {
+                continue;
+            };
+            for col_entry in col_entries.flatten() {
+                if !col_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let collection = col_entry.file_name().to_string_lossy().to_string();
+                if !col_entry.path().join("manifest.json").exists() {
+                    continue;
+                }
+                let Ok(mut engine) =
+                    open_scoped_engine_from_manifest(state, &tenant, &database, &collection)
+                else {
+                    continue;
+                };
+                let s = engine.stats();
+                let _ = engine.close();
+                metrics::gauge!("tqdb_vectors_total",
+                    "tenant" => tenant.clone(),
+                    "database" => database.clone(),
+                    "collection" => collection.clone(),
+                )
+                .set(s.vector_count as f64);
+                metrics::gauge!("tqdb_wal_buffer_size",
+                    "tenant" => tenant.clone(),
+                    "database" => database.clone(),
+                    "collection" => collection.clone(),
+                )
+                .set(s.buffered_vectors as f64);
+                metrics::gauge!("tqdb_index_nodes",
+                    "tenant" => tenant.clone(),
+                    "database" => database.clone(),
+                    "collection" => collection.clone(),
+                )
+                .set(s.index_nodes as f64);
+            }
+        }
+    }
 }
 
 async fn auth_middleware(
@@ -1472,6 +1555,7 @@ async fn query_vectors(
     let mut engine = open_scoped_engine_from_manifest(&state, &tenant, &database, &collection)
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
     let mut rows = Vec::new();
+    let search_start = std::time::Instant::now();
     for q in &body.query_embeddings {
         if q.len() != engine.d {
             engine
@@ -1510,9 +1594,22 @@ async fn query_vectors(
                 .then(|| hits.iter().map(|h| h.document.clone()).collect()),
         });
     }
+    let elapsed = search_start.elapsed().as_secs_f64();
     engine
         .close()
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
+    metrics::counter!("tqdb_search_requests_total",
+        "tenant" => tenant.clone(),
+        "database" => database.clone(),
+        "collection" => collection.clone(),
+    )
+    .increment(1);
+    metrics::histogram!("tqdb_search_latency_seconds",
+        "tenant" => tenant.clone(),
+        "database" => database.clone(),
+        "collection" => collection.clone(),
+    )
+    .record(elapsed);
     Ok(Json(QueryVectorsResponse { results: rows }))
 }
 async fn start_compact_job(
