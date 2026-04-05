@@ -284,13 +284,17 @@ impl GraphManager {
         }
 
         // Level 0 search — use Vec<bool> as a bitset for O(1) visited checks
-        // without hash-table overhead. Allocation is node_count bytes (~100KB for 100k nodes),
-        // which is far cheaper than the repeated hash operations on a HashSet.
+        // without hash-table overhead. Vec<bool> is bit-packed (~node_count/8 bytes,
+        // ~12.5KB for 100k nodes), which is far cheaper than the repeated hash
+        // operations of a HashSet on this hot path.
         let mut visited = vec![false; self.node_count];
         let mut candidates = BinaryHeap::new();
         let mut results = BinaryHeap::new();
 
         for OrderingWrapper(seed) in beam {
+            if seed.id as usize >= self.node_count {
+                continue; // guard against corrupted graph neighbor ids
+            }
             candidates.push(seed);
             visited[seed.id as usize] = true;
             let matches = if let Some(f) = &filter {
@@ -311,6 +315,9 @@ impl GraphManager {
 
             if let Ok(nbs) = self.get_neighbors_at_level(current.id, 0) {
                 for nb in nbs {
+                    if nb as usize >= self.node_count {
+                        continue; // guard against corrupted neighbor ids
+                    }
                     if visited[nb as usize] {
                         continue;
                     }

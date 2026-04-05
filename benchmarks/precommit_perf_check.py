@@ -51,7 +51,8 @@ from pathlib import Path
 
 import numpy as np
 
-sys.stdout.reconfigure(encoding="utf-8")
+if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 # ---------------------------------------------------------------------------
 # Metric registry — drives all comparison logic.

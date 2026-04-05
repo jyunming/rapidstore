@@ -429,6 +429,11 @@ impl TurboQuantEngine {
             if let Some(vraw) = engine.live_vraw.as_mut() {
                 vraw.set_len(slot_count);
             }
+            // Carry forward any pre-existing tombstones so that the next
+            // flush_wal_to_segment() will call live_compact_slab() even if no
+            // new deletes are issued during this session.
+            engine.has_pending_deletes =
+                engine.id_pool.active_count() < engine.id_pool.slot_count();
             true
         } else {
             false
