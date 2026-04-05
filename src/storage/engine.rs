@@ -775,6 +775,7 @@ impl TurboQuantEngine {
             deleted += 1;
         }
         if deleted > 0 {
+            self.has_pending_deletes = true;
             self.invalidate_index_state()?;
             self.maybe_persist_state(false)?;
             if self.wal_buffer.len() >= self.wal_flush_threshold {
@@ -4087,6 +4088,52 @@ mod tests {
         // delete_batch brings buffer to 100 → flush (line 685)
         e.delete_batch(vec!["b0".to_string()]).unwrap();
         assert_eq!(e.vector_count(), 98);
+    }
+
+    #[test]
+    fn delete_batch_sets_has_pending_deletes_so_compaction_runs_on_flush() {
+        // Regression: delete_batch previously did NOT set has_pending_deletes,
+        // so flush_wal_to_segment skipped live_compact_slab and deleted slots
+        // remained in the live slab even after a WAL flush.
+        //
+        // The test proves compaction ran by checking live_slot_count == vector_count:
+        // - With fix:    compaction removes 5 deleted slots → live_slot_count == 4994
+        // - Without fix: deleted slots linger          → live_slot_count == 4999 != 4994
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let n = 5usize;
+        {
+            let mut e = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+            let threshold = e.wal_flush_threshold;
+
+            // Fill WAL buffer to threshold - 1 (no flush yet).
+            for i in 0..threshold - 1 {
+                e.insert(format!("v{i}"), &make_vec(d, 0.5), no_meta())
+                    .unwrap();
+            }
+
+            // delete_batch adds n entries → buffer reaches threshold → flush triggered.
+            let to_delete: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
+            let deleted = e.delete_batch(to_delete).unwrap();
+            assert_eq!(deleted, n, "all requested ids should be deleted");
+
+            // Compaction should have reduced live_slot_count to match vector_count.
+            let stats = e.stats();
+            assert_eq!(
+                stats.live_slot_count as u64, stats.vector_count,
+                "live_slot_count must equal vector_count after compaction (no ghost slots)"
+            );
+            assert_eq!(stats.vector_count, (threshold - 1 - n) as u64);
+        }
+        // Confirm deleted IDs are gone after reload.
+        let e2 = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+        for i in 0..n {
+            assert!(
+                e2.get(&format!("v{i}")).unwrap().is_none(),
+                "v{i} should be deleted after reopen"
+            );
+        }
     }
 
     // ── insert_many WAL flush at buffer==threshold (line 1859) ───────────────
