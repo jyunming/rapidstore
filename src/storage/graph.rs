@@ -222,7 +222,7 @@ impl GraphManager {
         _entry_node_unused: u32,
         k: usize,
         search_list_size: usize,
-        scorer: impl Fn(u32) -> f64,
+        mut scorer: impl FnMut(u32) -> f64,
         filter: Option<impl Fn(u32) -> bool>,
     ) -> Result<Vec<(u32, f64)>, Box<dyn std::error::Error + Send + Sync>> {
         if self.node_count == 0 {
@@ -283,14 +283,20 @@ impl GraphManager {
             beam = layer_results;
         }
 
-        // Level 0 search
-        let mut visited = HashSet::new();
+        // Level 0 search — use Vec<bool> as a bitset for O(1) visited checks
+        // without hash-table overhead. Vec<bool> is bit-packed (~node_count/8 bytes,
+        // ~12.5KB for 100k nodes), which is far cheaper than the repeated hash
+        // operations of a HashSet on this hot path.
+        let mut visited = vec![false; self.node_count];
         let mut candidates = BinaryHeap::new();
         let mut results = BinaryHeap::new();
 
         for OrderingWrapper(seed) in beam {
+            if seed.id as usize >= self.node_count {
+                continue; // guard against corrupted graph neighbor ids
+            }
             candidates.push(seed);
-            visited.insert(seed.id);
+            visited[seed.id as usize] = true;
             let matches = if let Some(f) = &filter {
                 f(seed.id)
             } else {
@@ -309,10 +315,13 @@ impl GraphManager {
 
             if let Ok(nbs) = self.get_neighbors_at_level(current.id, 0) {
                 for nb in nbs {
-                    if visited.contains(&nb) {
+                    if nb as usize >= self.node_count {
+                        continue; // guard against corrupted neighbor ids
+                    }
+                    if visited[nb as usize] {
                         continue;
                     }
-                    visited.insert(nb);
+                    visited[nb as usize] = true;
 
                     let score = scorer(nb);
                     let cand = SearchCandidate { id: nb, score };

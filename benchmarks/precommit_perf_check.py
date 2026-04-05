@@ -43,12 +43,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 
 import numpy as np
+
+if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 # ---------------------------------------------------------------------------
 # Metric registry — drives all comparison logic.
@@ -89,6 +93,182 @@ METRIC_DEFS: list[tuple[str, bool, str, str, float | None]] = [
 ]
 
 METRIC_KEYS = {key for key, *_ in METRIC_DEFS}
+
+
+# ---------------------------------------------------------------------------
+# Perf history tracking — run all datasets/configs, append to perf_history.json
+# ---------------------------------------------------------------------------
+
+BENCH_DIR    = Path(__file__).parent
+HISTORY_PATH = BENCH_DIR / "perf_history.json"
+
+# Datasets run for history tracking (smaller n than full benchmark for speed)
+HISTORY_DS_CONFIGS: list[tuple[str, int, int, int]] = [
+    # (ds_label, n, d, n_queries)
+    ("glove-200",    10_000, 200,  100),
+    ("dbpedia-1536",  2_000, 1536,  30),
+    ("dbpedia-3072",  1_000, 3072,  20),
+]
+
+# Same config set tracked by perf_tracker.py CONFIGS (brute only for precommit speed)
+HISTORY_BENCH_CONFIGS: list[tuple[int, bool]] = [
+    (4, False),  # b=4 rerank=F brute
+    (4, True),   # b=4 rerank=T brute
+]
+
+HISTORY_QUERY_ROUNDS = 3  # fewer rounds than gate check; just for trending
+
+
+def _git_info() -> tuple[str, str]:
+    def _run(cmd: list[str]) -> str:
+        try:
+            return subprocess.check_output(
+                cmd, cwd=BENCH_DIR.parent, stderr=subprocess.DEVNULL
+            ).decode().strip()
+        except Exception:
+            return "unknown"
+    return (
+        _run(["git", "rev-parse", "--short", "HEAD"]),
+        _run(["git", "rev-parse", "--abbrev-ref", "HEAD"]),
+    )
+
+
+def _config_key(bits: int, rerank: bool) -> str:
+    """Key prefix matching paper_recall_bench.py config_label format."""
+    rr = "rerankT" if rerank else "rerankF"
+    return f"b{bits}_{rr}_brute"
+
+
+def _run_one_config_for_history(
+    corpus: "np.ndarray",
+    qs: "np.ndarray",
+    true_top1s: list[str],
+    bits: int,
+    rerank: bool,
+) -> dict:
+    """Run one config, return metrics matching perf_history.json key suffixes."""
+    import tqdb as tq  # noqa: PLC0415
+
+    n, d = corpus.shape
+    ids = [f"vec_{i}" for i in range(n)]
+    max_k = 8
+
+    # Ingest pass — single round (trending, not gating)
+    with tempfile.TemporaryDirectory() as db_dir:
+        db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip")
+        t0 = time.perf_counter()
+        for start in range(0, n, CHUNK_SIZE):
+            db.insert_batch(ids[start:start + CHUNK_SIZE], corpus[start:start + CHUNK_SIZE])
+        db.flush()
+        ingest_s = time.perf_counter() - t0
+        ram_mb = db.stats()["ram_estimate_bytes"] / (1 << 20)
+        db.close()
+        disk_mb = sum(
+            p.stat().st_size for p in Path(db_dir).iterdir() if p.is_file()
+        ) / (1 << 20)
+
+    # Query pass
+    with tempfile.TemporaryDirectory() as db_dir:
+        db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip")
+        for start in range(0, n, CHUNK_SIZE):
+            db.insert_batch(ids[start:start + CHUNK_SIZE], corpus[start:start + CHUNK_SIZE])
+        db.flush()
+
+        min_lats = [float("inf")] * len(qs)
+        last_returned: list[list[str]] = []
+        for rnd in range(HISTORY_QUERY_ROUNDS):
+            round_ret: list[list[str]] = []
+            for j, q in enumerate(qs):
+                t0 = time.perf_counter()
+                results = db.search(q, top_k=max_k)
+                min_lats[j] = min(min_lats[j], (time.perf_counter() - t0) * 1000)
+                round_ret.append([r["id"] for r in results])
+            if rnd == HISTORY_QUERY_ROUNDS - 1:
+                last_returned = round_ret
+        db.close()
+
+    lats = np.array(min_lats)
+    r1at1 = float(np.mean([
+        1.0 if true_top1s[j] in last_returned[j][:1] else 0.0
+        for j in range(len(qs))
+    ]))
+    mrr_vals = []
+    for j in range(len(qs)):
+        for rank, rid in enumerate(last_returned[j], 1):
+            if rid == true_top1s[j]:
+                mrr_vals.append(1.0 / rank)
+                break
+        else:
+            mrr_vals.append(0.0)
+
+    return {
+        "r1at1":        round(r1at1, 4),
+        "throughput":   round(n / ingest_s),
+        "p50_ms":       round(float(np.percentile(lats, 50)), 3),
+        "disk_mb":      round(disk_mb, 2),
+        "ram_delta_mb": round(ram_mb, 1),
+        "mrr":          round(float(np.mean(mrr_vals)), 4),
+    }
+
+
+def _append_perf_history() -> None:
+    """Run all tracked datasets/configs and append one entry to perf_history.json."""
+    try:
+        import tqdb  # noqa: F401, PLC0415
+    except ImportError:
+        print("[pre-commit] tqdb not installed — skipping history tracking", flush=True)
+        return
+
+    commit, branch = _git_info()
+    try:
+        import importlib.metadata
+        version = importlib.metadata.version("tqdb")
+    except Exception:
+        version = "unknown"
+
+    from datetime import datetime, timezone
+    entry: dict = {
+        "timestamp":  datetime.now(timezone.utc).isoformat(),
+        "git_commit": commit,
+        "git_branch": branch,
+        "version":    version,
+        "source":     "precommit",
+        "results":    {},
+    }
+
+    for ds_label, n, d, n_queries in HISTORY_DS_CONFIGS:
+        print(f"  [history] {ds_label}  n={n:,}  d={d}", flush=True)
+        corpus, qs, _ = load_data(n, d, n_queries, seed=42)
+        true_top1s = [f"vec_{int(np.argmax(corpus @ q))}" for q in qs]
+        ds_snap: dict = {}
+        for bits, rerank in HISTORY_BENCH_CONFIGS:
+            key = _config_key(bits, rerank)
+            print(f"    {key} ...", flush=True)
+            metrics = _run_one_config_for_history(corpus, qs, true_top1s, bits, rerank)
+            for suffix, val in metrics.items():
+                ds_snap[f"{key}_{suffix}"] = val
+        entry["results"][ds_label] = ds_snap
+
+    history: list = []
+    if HISTORY_PATH.exists():
+        try:
+            history = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            history = []
+    history.append(entry)
+    HISTORY_PATH.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    print(f"  [history] Appended → {HISTORY_PATH} ({len(history)} entries)", flush=True)
+
+    tracker_path = BENCH_DIR / "perf_tracker.py"
+    if tracker_path.exists():
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("perf_tracker", tracker_path)
+            pt = importlib.util.module_from_spec(spec)   # type: ignore[arg-type]
+            spec.loader.exec_module(pt)                  # type: ignore[union-attr]
+            pt.generate_html_plotly(pt.load_history(HISTORY_PATH), BENCH_DIR / "_perf_history.html")
+        except Exception as exc:
+            print(f"  [history] Warning: HTML not regenerated: {exc}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +366,12 @@ def run_benchmark(config: dict) -> dict:
                                 corpus[start:start + CHUNK_SIZE])
             db.flush()
             ingest_walls.append(time.perf_counter() - wall_start)
-            stats = db.stats()  # deterministic — same on every round
+            stats = db.stats()  # RAM metrics — capture before close
+            db.close()  # trims GROW_SLOTS pre-allocation from live_codes.bin
+            # measure disk post-close so pre-allocated capacity is excluded
+            stats["total_disk_bytes"] = sum(
+                p.stat().st_size for p in Path(db_dir).iterdir() if p.is_file()
+            )
 
     # ── query: per-query minimum latency across QUERY_ROUNDS ───────────────
     # Taking the per-query minimum (not the best-round p50) eliminates
@@ -427,6 +612,7 @@ def main() -> None:
 
     if not failures:
         print("[pre-commit] ✓ all metrics within 5% of best")
+        _append_perf_history()
         return
 
     print("\n[pre-commit] FAIL — regression(s) detected:")
@@ -438,6 +624,7 @@ def main() -> None:
             "\n[pre-commit] ⚠ override active (--force / TQDB_PERF_SKIP=1) — "
             "proceeding despite regression"
         )
+        _append_perf_history()
         return
 
     print(

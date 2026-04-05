@@ -19,6 +19,9 @@
 python/turboquantdb/*.pyd
 python/turboquantdb/*.so
 python/turboquantdb/*.pdb
+python/tqdb/*.pyd
+python/tqdb/*.so
+python/tqdb/*.pdb
 
 # Secrets and local config
 .env
@@ -28,6 +31,10 @@ python/turboquantdb/*.pdb
 /tmp/
 /tmp_*/
 /rq_fix_*/
+/_tmp/
+/_tmp_*/
+/_b_turbo/
+/_tmp_engine_stash.rs
 
 /recall_results.json
 
@@ -77,6 +84,10 @@ convert_pdf.py
 /benchmarks/tqdb_mode_bench.py
 /benchmarks/store_comparison_bench.py
 /benchmarks/_combine_bench_results.py
+/benchmarks/compare_bench.py
+/benchmarks/hamming_nav_bench.py
+/benchmarks/ingest_speedup_bench.py
+/benchmarks/_ivf_prefilter_bench.py
 /benchmarks/_full_bench_report.txt
 /benchmarks/_full_bench_report.md
 /benchmarks/run_bench_private.py
@@ -84,6 +95,8 @@ convert_pdf.py
 /benchmarks/_private_report.md
 /benchmarks/_private_plots.png
 /benchmarks/_perf_history.html
+/benchmarks/_ingest_speedup_plots.png
+/benchmarks/_ivf_prefilter_plots.png
 !/benchmarks/perf_history.json
 !/benchmarks/benchmark_plots.png
 

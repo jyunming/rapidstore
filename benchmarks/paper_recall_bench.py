@@ -117,7 +117,11 @@ def run_config(
         ingest_s = time.perf_counter() - t0
         sampler_ingest.stop()
 
+        # Close and reopen to flush pre-allocated capacity; disk measured post-close
+        # so GROW_SLOTS pre-allocation is trimmed and the number reflects steady-state.
+        db.close()
         dm = disk_size_mb(tmp)
+        db = tqdb.Database.open(tmp, dimension=DIM, bits=bits, metric="ip", rerank=rerank)
 
         # ── Index build (ANN only) ────────────────────────────────────────────
         index_s = None
@@ -127,6 +131,11 @@ def run_config(
             index_s = round(time.perf_counter() - t_idx, 3)
 
         # ── Query phase ───────────────────────────────────────────────────────
+        # Warmup: page the mmap into OS cache before timing (avoids cold-cache
+        # inflation from the close+reopen above).
+        for q in qvecs[:min(20, len(qvecs))]:
+            db.search(q, top_k=max_k, _use_ann=ann)
+
         sampler_query = CpuRamSampler()
         sampler_query.start()
         lats: list[float] = []
@@ -613,6 +622,23 @@ def save_results(all_results: dict[str, list[dict]]) -> None:
     print(f"  Raw results saved to {RESULTS_PATH}", flush=True)
 
 
+def _regenerate_perf_history_html() -> None:
+    """Regenerate _perf_history.html from updated perf_history.json via perf_tracker."""
+    tracker_path = BENCH_DIR / "perf_tracker.py"
+    if not tracker_path.exists():
+        return
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("perf_tracker", tracker_path)
+        pt = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(pt)  # type: ignore[union-attr]
+        history = pt.load_history(HISTORY_PATH)
+        out = BENCH_DIR / "_perf_history.html"
+        pt.generate_html_plotly(history, out)
+    except Exception as exc:
+        print(f"  Warning: perf history HTML not regenerated: {exc}", flush=True)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -692,6 +718,7 @@ def main() -> None:
 
     if args.track:
         update_perf_history(all_results)
+        _regenerate_perf_history_html()
 
     print("\nDone.")
 

@@ -187,6 +187,10 @@ pub struct TurboQuantEngine {
     id_pool: IdPool,
     index_ids_dirty: bool,
     pending_manifest_updates: usize,
+    /// True when at least one delete has been issued since the last compaction.
+    /// When false, `live_compact_slab` is skipped on WAL flush — a pure insert
+    /// workload never needs to compact (no dead slots to remove).
+    has_pending_deletes: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -255,7 +259,7 @@ impl TurboQuantEngine {
             RerankPrecision::Disabled
         };
         Self::open_with_options(
-            uri, local_dir, d, b, seed, metric, rerank, fast_mode, precision,
+            uri, local_dir, d, b, seed, metric, rerank, fast_mode, precision, None,
         )
     }
 
@@ -269,6 +273,7 @@ impl TurboQuantEngine {
         rerank: bool,
         fast_mode: bool,
         rerank_precision: RerankPrecision,
+        wal_flush_threshold: Option<usize>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(local_dir)?;
         let manifest_path = format!("{}/manifest.json", local_dir);
@@ -399,7 +404,7 @@ impl TurboQuantEngine {
             backend,
             wal,
             wal_buffer: Vec::new(),
-            wal_flush_threshold: 100,
+            wal_flush_threshold: wal_flush_threshold.unwrap_or(5_000),
             segments,
             metadata,
             graph,
@@ -410,6 +415,7 @@ impl TurboQuantEngine {
             id_pool: IdPool::new(),
             index_ids_dirty: false,
             pending_manifest_updates: 0,
+            has_pending_deletes: false,
             rerank_enabled: manifest.rerank_enabled,
         };
 
@@ -423,6 +429,11 @@ impl TurboQuantEngine {
             if let Some(vraw) = engine.live_vraw.as_mut() {
                 vraw.set_len(slot_count);
             }
+            // Carry forward any pre-existing tombstones so that the next
+            // flush_wal_to_segment() will call live_compact_slab() even if no
+            // new deletes are issued during this session.
+            engine.has_pending_deletes =
+                engine.id_pool.active_count() < engine.id_pool.slot_count();
             true
         } else {
             false
@@ -570,6 +581,7 @@ impl TurboQuantEngine {
         };
         self.wal.append(&entry, false)?;
         self.wal_buffer.push(entry);
+        self.has_pending_deletes = true;
         self.live_delete_slot(&id);
         self.invalidate_index_state()?;
         self.maybe_persist_state(false)?;
@@ -703,10 +715,13 @@ impl TurboQuantEngine {
         top_k: usize,
         filter: Option<&HashMap<String, JsonValue>>,
         ann_search_list_size: Option<usize>,
+        use_ann: bool,
     ) -> Result<Vec<Vec<SearchResult>>, Box<dyn std::error::Error + Send + Sync>> {
         queries
             .iter()
-            .map(|q| self.search_with_filter_and_ann(q, top_k, filter, ann_search_list_size))
+            .map(|q| {
+                self.search_with_filter_and_ann(q, top_k, filter, ann_search_list_size, use_ann)
+            })
             .collect()
     }
 
@@ -765,6 +780,7 @@ impl TurboQuantEngine {
             deleted += 1;
         }
         if deleted > 0 {
+            self.has_pending_deletes = true;
             self.invalidate_index_state()?;
             self.maybe_persist_state(false)?;
             if self.wal_buffer.len() >= self.wal_flush_threshold {
@@ -1036,7 +1052,7 @@ impl TurboQuantEngine {
         query: &Array1<f64>,
         top_k: usize,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
-        self.search_with_filter_and_ann(query, top_k, None, None)
+        self.search_with_filter_and_ann(query, top_k, None, None, true)
     }
 
     pub fn search_with_filter(
@@ -1045,7 +1061,7 @@ impl TurboQuantEngine {
         top_k: usize,
         filter: Option<&HashMap<String, JsonValue>>,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
-        self.search_with_filter_and_ann(query, top_k, filter, None)
+        self.search_with_filter_and_ann(query, top_k, filter, None, true)
     }
 
     pub fn search_with_filter_and_ann(
@@ -1054,6 +1070,7 @@ impl TurboQuantEngine {
         top_k: usize,
         filter: Option<&HashMap<String, JsonValue>>,
         ann_search_list_size: Option<usize>,
+        use_ann: bool,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
         if self.id_pool.active_count() == 0 || top_k == 0 {
             return Ok(Vec::new());
@@ -1067,7 +1084,7 @@ impl TurboQuantEngine {
             .as_ref()
             .is_some_and(|s| s.indexed_nodes == self.index_ids.len());
 
-        if has_index && not_empty && state_match {
+        if use_ann && has_index && not_empty && state_match {
             let sls = ann_search_list_size.unwrap_or_else(|| {
                 self.manifest
                     .index_state
@@ -1097,126 +1114,92 @@ impl TurboQuantEngine {
                 None
             };
 
+            // Expand candidate pool for ANN: always fetch at least sls candidates so the
+            // beam search has a sufficient buffer to recover from approximate navigation.
+            // Without reranking, internal_k=top_k leaves no buffer → recall collapses.
             let internal_k = if self.rerank_enabled {
                 top_k * 20
             } else {
-                top_k
+                // Fetch sls candidates, re-score by full LUT, return top_k.
+                sls.max(top_k)
             };
 
-            // Shared references captured by search closures. Using RefCell<Vec<u16>> for
-            // idx_buf lets the Fn closure reuse a single allocation across all candidate
-            // scorings instead of allocating a new Vec<CodeIndex> per call.
+            // Shared references captured by search closures.
             let mse_len = self.live_mse_len();
             let qjl_len = self.live_qjl_len();
             let qn = self.quantizer.n;
             let live_codes_r = &self.live_codes;
             let quantizer_r = &self.quantizer;
-            let idx_buf = std::cell::RefCell::new(vec![0u16; qn]);
 
-            let ann = if matches!(self.metric, DistanceMetric::Ip) {
-                let prep = self.quantizer.prepare_ip_query(query);
-                let index_ids = &self.index_ids;
-                let slot_set: Option<std::collections::HashSet<u32>> =
-                    filter_slots.map(|s| s.into_iter().collect());
+            // Single full-LUT query prep: used for both HNSW navigation and final scoring.
+            // The full scorer is more accurate than the lite scorer for navigation, and
+            // eliminates the need for a separate re-score step after beam search.
+            let prep = self.quantizer.prepare_ip_query(query);
+            let query_norm = if matches!(self.metric, DistanceMetric::Cosine) {
+                query.iter().map(|x| x * x).sum::<f64>().sqrt()
+            } else {
+                1.0
+            };
 
-                self.graph.search(
-                    0,
-                    internal_k,
-                    sls.max(internal_k),
-                    |node| {
-                        let slot = index_ids[node as usize];
-                        let rec = live_codes_r.get_slot(slot as usize);
-                        let qjl = &rec[mse_len..mse_len + qjl_len];
-                        let gamma = f32::from_le_bytes(
-                            rec[mse_len + qjl_len..mse_len + qjl_len + 4]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        let doc_norm = f32::from_le_bytes(
-                            rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        let mut buf = idx_buf.borrow_mut();
-                        quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut buf);
-                        quantizer_r.score_ip_encoded(&prep, &buf, qjl, gamma as f64)
-                            * doc_norm as f64
-                    },
-                    slot_set
-                        .map(|ss| move |node_idx: u32| ss.contains(&index_ids[node_idx as usize])),
-                )?
-            } else if matches!(self.metric, DistanceMetric::Cosine) {
-                let prep = self.quantizer.prepare_ip_query(query);
-                let query_norm = query.iter().map(|x| x * x).sum::<f64>().sqrt();
-                let index_ids = &self.index_ids;
-                let slot_set: Option<std::collections::HashSet<u32>> =
-                    filter_slots.map(|s| s.into_iter().collect());
+            let slot_set: Option<std::collections::HashSet<u32>> =
+                filter_slots.map(|s| s.into_iter().collect());
+            let index_ids = &self.index_ids;
+            let is_l2 = matches!(self.metric, DistanceMetric::L2);
+            let is_cosine = matches!(self.metric, DistanceMetric::Cosine);
+            let metric_r = &self.metric;
 
-                self.graph.search(
-                    0,
-                    internal_k,
-                    sls.max(internal_k),
-                    |node| {
-                        let slot = index_ids[node as usize];
-                        let rec = live_codes_r.get_slot(slot as usize);
-                        let qjl = &rec[mse_len..mse_len + qjl_len];
-                        let gamma = f32::from_le_bytes(
-                            rec[mse_len + qjl_len..mse_len + qjl_len + 4]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        let mut buf = idx_buf.borrow_mut();
-                        quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut buf);
-                        // Vectors are stored unit-normalized; ip estimates <query, unit_doc>.
-                        // cosine(query, doc) = <query, unit_doc> / ||query||
-                        let ip = quantizer_r.score_ip_encoded(&prep, &buf, qjl, gamma as f64);
+            // Reusable index buffer for MSE code unpacking — captured by the FnMut scorer
+            // closure so it is allocated once and reused across all HNSW node visits.
+            let mut idx_buf_ann = vec![0u16; qn];
+
+            // HNSW beam search: collect internal_k candidates with accurate full-LUT scores.
+            // internal_k = sls (≥ top_k) provides a candidate buffer to recover from any
+            // graph navigation approximation errors before truncating to the final top_k.
+            let ann_nodes = self.graph.search(
+                0,
+                internal_k,
+                sls.max(internal_k),
+                |node| {
+                    let slot = index_ids[node as usize];
+                    let rec = live_codes_r.get_slot(slot as usize);
+                    let qjl = &rec[mse_len..mse_len + qjl_len];
+                    let gamma = f32::from_le_bytes(
+                        rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    let doc_norm = f32::from_le_bytes(
+                        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut idx_buf_ann);
+
+                    if is_l2 {
+                        let mut v = quantizer_r.dequantize(&idx_buf_ann, qjl, gamma as f64);
+                        v.mapv_inplace(|x| x * doc_norm as f64);
+                        score_vectors_with_metric(metric_r, query, &v)
+                    } else if is_cosine {
+                        let ip =
+                            quantizer_r.score_ip_encoded(&prep, &idx_buf_ann, qjl, gamma as f64);
                         if query_norm > 0.0 {
                             ip / query_norm
                         } else {
                             0.0
                         }
-                    },
-                    slot_set
-                        .map(|ss| move |node_idx: u32| ss.contains(&index_ids[node_idx as usize])),
-                )?
-            } else {
-                let index_ids = &self.index_ids;
-                let metric_r = &self.metric;
-                let slot_set: Option<std::collections::HashSet<u32>> =
-                    filter_slots.map(|s| s.into_iter().collect());
+                    } else {
+                        quantizer_r.score_ip_encoded(&prep, &idx_buf_ann, qjl, gamma as f64)
+                            * doc_norm as f64
+                    }
+                },
+                slot_set.map(|ss| move |node_idx: u32| ss.contains(&index_ids[node_idx as usize])),
+            )?;
 
-                self.graph.search(
-                    0,
-                    internal_k,
-                    sls.max(internal_k),
-                    |node| {
-                        let slot = index_ids[node as usize];
-                        let rec = live_codes_r.get_slot(slot as usize);
-                        let qjl = &rec[mse_len..mse_len + qjl_len];
-                        let gamma = f32::from_le_bytes(
-                            rec[mse_len + qjl_len..mse_len + qjl_len + 4]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        let v = {
-                            let mut buf = idx_buf.borrow_mut();
-                            quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut buf);
-                            let doc_norm = f32::from_le_bytes(
-                                rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-                                    .try_into()
-                                    .unwrap(),
-                            );
-                            let mut v = quantizer_r.dequantize(&buf, qjl, gamma as f64);
-                            // Dequantize returns unit vector; scale back to original norm.
-                            v.mapv_inplace(|x| x * doc_norm as f64);
-                            v
-                        };
-                        score_vectors_with_metric(metric_r, query, &v)
-                    },
-                    slot_set
-                        .map(|ss| move |node_idx: u32| ss.contains(&index_ids[node_idx as usize])),
-                )?
-            };
+            // Navigation scores from the full LUT are already accurate; no re-score pass
+            // needed. ann_nodes is already sorted descending by graph.search(); truncate
+            // here handles the rerank=True path which uses internal_k = top_k * 20.
+            let mut ann: Vec<(u32, f64)> = ann_nodes;
+            ann.truncate(top_k);
 
             let slots: Vec<u32> = ann
                 .iter()
@@ -1519,8 +1502,13 @@ impl TurboQuantEngine {
         }
         // Persist segments first so any rebuilds (if needed) read a complete view.
         self.segments.flush_batch(records)?;
-        // live_codes is already updated during ingest; compact without full rebuild.
-        self.live_compact_slab()?;
+        // Only compact the live slab when there are pending deletes — compaction
+        // copies all live data to a fresh file and rebuilds the id_pool, which is
+        // unnecessary (and very expensive) for pure insert workloads.
+        if self.has_pending_deletes {
+            self.live_compact_slab()?;
+            self.has_pending_deletes = false;
+        }
         self.live_codes.flush()?;
         if let Some(vraw) = &mut self.live_vraw {
             vraw.flush()?;
@@ -1547,11 +1535,14 @@ impl TurboQuantEngine {
         }
 
         self.live_codes = LiveCodesFile::open(live_codes_path, self.live_stride())?;
+        // The file was pre-allocated to GROW_SLOTS multiples; correct len to match
+        // the id_pool's slot count so the next alloc_slot() resumes at the right offset.
+        let slot_count = self.id_pool.slot_count();
+        self.live_codes.set_len(slot_count);
         if had_vraw {
-            self.live_vraw = Some(LiveCodesFile::open(
-                live_vraw_path,
-                self.live_vraw_stride(),
-            )?);
+            let mut vraw = LiveCodesFile::open(live_vraw_path, self.live_vraw_stride())?;
+            vraw.set_len(slot_count);
+            self.live_vraw = Some(vraw);
         }
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_active_count() as u64;
@@ -1561,6 +1552,13 @@ impl TurboQuantEngine {
 
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.flush_wal_to_segment()?;
+        // Trim pre-allocated capacity to the exact slot count so the on-disk and
+        // memory-mapped sizes are minimal after the database is closed.
+        let slot_count = self.id_pool.slot_count();
+        self.live_codes.truncate_to(slot_count)?;
+        if let Some(vraw) = &mut self.live_vraw {
+            vraw.truncate_to(slot_count)?;
+        }
         self.metadata.flush()?;
         self.persist_id_pool()?;
         self.maybe_persist_state(true)?;
@@ -2411,7 +2409,9 @@ mod tests {
         .unwrap();
 
         let query = Array1::from_vec(v_same);
-        let results = e.search_with_filter_and_ann(&query, 2, None, None).unwrap();
+        let results = e
+            .search_with_filter_and_ann(&query, 2, None, None, true)
+            .unwrap();
         assert!(!results.is_empty());
         // The "same" vector should score higher than "ortho"
         let top_id = &results[0].id;
@@ -2429,7 +2429,9 @@ mod tests {
         e.insert("zero".into(), &Array1::zeros(d), no_meta())
             .unwrap();
         let query = make_vec(d, 1.0);
-        let results = e.search_with_filter_and_ann(&query, 5, None, None).unwrap();
+        let results = e
+            .search_with_filter_and_ann(&query, 5, None, None, true)
+            .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].score, 0.0);
     }
@@ -2456,7 +2458,9 @@ mod tests {
             .unwrap();
 
         let query = Array1::from_vec(v_close);
-        let results = e.search_with_filter_and_ann(&query, 2, None, None).unwrap();
+        let results = e
+            .search_with_filter_and_ann(&query, 2, None, None, true)
+            .unwrap();
         assert!(!results.is_empty());
         // L2 scores are negative distances; "close" should have a higher (less negative) score
         assert_eq!(results[0].id, "close");
@@ -2481,7 +2485,7 @@ mod tests {
         let mut q = vec![0.0f64; d];
         q[0] = 1.0;
         let results = e
-            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None)
+            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
             .unwrap();
         assert!(!results.is_empty());
         assert!(results.len() <= 5);
@@ -2502,7 +2506,7 @@ mod tests {
         e.create_index_with_params(8, 32, 32, 1.2, 2).unwrap();
         let q = vec![0.0f64; d];
         let results = e
-            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None)
+            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
             .unwrap();
         assert!(!results.is_empty());
         assert!(results.len() <= 5);
@@ -2517,7 +2521,7 @@ mod tests {
         let mut e = open_default(p, 8);
         e.insert("a".into(), &make_vec(8, 0.5), no_meta()).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(8, 0.5), 0, None, None)
+            .search_with_filter_and_ann(&make_vec(8, 0.5), 0, None, None, true)
             .unwrap();
         assert!(results.is_empty());
     }
@@ -2528,7 +2532,7 @@ mod tests {
         let p = dir.path().to_str().unwrap();
         let e = open_default(p, 8);
         let results = e
-            .search_with_filter_and_ann(&make_vec(8, 0.5), 5, None, None)
+            .search_with_filter_and_ann(&make_vec(8, 0.5), 5, None, None, true)
             .unwrap();
         assert!(results.is_empty());
     }
@@ -2544,7 +2548,7 @@ mod tests {
         let mut filter = no_meta();
         filter.insert("tag".into(), json!("b"));
         let results = e
-            .search_with_filter_and_ann(&make_vec(8, 0.5), 5, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(8, 0.5), 5, Some(&filter), None, true)
             .unwrap();
         assert!(results.is_empty());
     }
@@ -2566,6 +2570,7 @@ mod tests {
             true,
             false,
             RerankPrecision::F16,
+            None,
         )
         .unwrap();
         let mut v = vec![0.0f64; d];
@@ -2574,7 +2579,7 @@ mod tests {
         e.insert("v1".into(), &Array1::from_vec(v.clone()), no_meta())
             .unwrap();
         let results = e
-            .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None)
+            .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None, true)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "v1");
@@ -2597,6 +2602,7 @@ mod tests {
             true,
             false,
             RerankPrecision::F16,
+            None,
         )
         .unwrap();
         // v = [0.1, 0.2, ..., 1.6]; expected IP = sum((0.1*i)^2) for i=1..=16
@@ -2605,7 +2611,7 @@ mod tests {
         e.insert("v1".into(), &Array1::from_vec(v.clone()), no_meta())
             .unwrap();
         let results = e
-            .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None)
+            .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None, true)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "v1");
@@ -2746,7 +2752,7 @@ mod tests {
             .unwrap();
         }
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 3, None, None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 3, None, None, true)
             .unwrap();
         assert!(!results.is_empty());
         assert!(e.manifest.fast_mode);
@@ -2803,6 +2809,7 @@ mod tests {
             false,
             false,
             RerankPrecision::Disabled,
+            None,
         )
         .unwrap();
         for i in 0..5u32 {
@@ -2810,7 +2817,7 @@ mod tests {
             e.insert(format!("v{i}"), &v, no_meta()).unwrap();
         }
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 3, None, None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 3, None, None, true)
             .unwrap();
         assert!(!results.is_empty());
         assert!(!e.rerank_enabled);
@@ -2933,6 +2940,7 @@ mod tests {
             false,
             false,
             RerankPrecision::Disabled,
+            None,
         )
         .unwrap();
         for i in 0..15u32 {
@@ -2950,7 +2958,7 @@ mod tests {
         assert!(e.stats().has_index);
         let q = vec![0.0f64; d];
         let results = e
-            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None)
+            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
             .unwrap();
         assert!(!results.is_empty());
     }
@@ -2976,7 +2984,7 @@ mod tests {
         filter.insert("cat".into(), json!("even"));
         let q = make_vec(d, 0.5);
         let results = e
-            .search_with_filter_and_ann(&q, 10, Some(&filter), None)
+            .search_with_filter_and_ann(&q, 10, Some(&filter), None, true)
             .unwrap();
         // All results should have cat=even
         for r in &results {
@@ -3002,7 +3010,7 @@ mod tests {
         let mut filter = no_meta();
         filter.insert("cat".into(), json!("z"));
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
             .unwrap();
         assert!(results.is_empty());
     }
@@ -3058,7 +3066,7 @@ mod tests {
         let mut filter = no_meta();
         filter.insert("score".into(), json!({"$gte": 3}));
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
             .unwrap();
         assert!(!results.is_empty());
         for r in &results {
@@ -3083,7 +3091,7 @@ mod tests {
             serde_json::from_str(r#"{"$or": [{"tag": {"$eq": "a"}}, {"tag": {"$eq": "b"}}]}"#)
                 .unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
             .unwrap();
         assert_eq!(results.len(), 2);
     }
@@ -3162,17 +3170,29 @@ mod tests {
         let dir = tempdir().unwrap();
         let p = dir.path().to_str().unwrap();
         let d = 8;
-        let mut e = TurboQuantEngine::open(p, p, d, 2, 42).unwrap();
-        // Fill up to wal_flush_threshold (100) to ensure next delete pushes over
+        // Use a low explicit threshold so this test is deterministic regardless of the default.
+        let mut e = TurboQuantEngine::open_with_options(
+            p,
+            p,
+            d,
+            2,
+            42,
+            DistanceMetric::Ip,
+            false,
+            false,
+            RerankPrecision::Disabled,
+            Some(100),
+        )
+        .unwrap();
         for i in 0..100 {
             e.insert(format!("v{i}"), &make_vec(d, 0.5), no_meta())
                 .unwrap();
         }
-        // This delete should trigger flush_wal_to_segment
+        // This delete pushes wal_buffer over the threshold and triggers flush_wal_to_segment
         e.delete("v0".to_string()).unwrap();
         // Engine must remain functional after the flush
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None, true)
             .unwrap();
         assert!(results.len() <= 5);
     }
@@ -3192,7 +3212,7 @@ mod tests {
         // n_refinements = 2 exercises the refinement loop in graph.rs
         e.create_index_with_params(4, 16, 16, 1.2, 2).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None, true)
             .unwrap();
         assert!(!results.is_empty());
     }
@@ -3216,6 +3236,7 @@ mod tests {
             true,
             false,
             RerankPrecision::F16,
+            None,
         )
         .unwrap();
         for i in 0..30u32 {
@@ -3230,7 +3251,7 @@ mod tests {
         let mut q = vec![0.0f64; d];
         q[0] = 1.0;
         let results = e
-            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None)
+            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
             .unwrap();
         assert!(!results.is_empty());
     }
@@ -3250,6 +3271,7 @@ mod tests {
             true,
             false,
             RerankPrecision::F16,
+            None,
         )
         .unwrap();
         for i in 0..30u32 {
@@ -3263,7 +3285,7 @@ mod tests {
         let mut q = vec![0.0f64; d];
         q[0] = 1.0;
         let results = e
-            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None)
+            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
             .unwrap();
         assert!(!results.is_empty());
     }
@@ -3286,6 +3308,7 @@ mod tests {
             false, // rerank disabled → no raw vectors → uses precomputed_l2
             false,
             RerankPrecision::Disabled,
+            None,
         )
         .unwrap();
         for i in 0..30u32 {
@@ -3297,7 +3320,9 @@ mod tests {
         // build_scorer L2 without vraw → !precomputed_l2.is_empty() path (lines 812-822)
         e.create_index_with_params(8, 32, 32, 1.2, 1).unwrap();
         let q = Array1::from_vec(vec![0.0f64; d]);
-        let results = e.search_with_filter_and_ann(&q, 5, None, None).unwrap();
+        let results = e
+            .search_with_filter_and_ann(&q, 5, None, None, true)
+            .unwrap();
         assert!(!results.is_empty());
         // L2 scores are negative distances
         for r in &results {
@@ -3327,6 +3352,7 @@ mod tests {
             true,
             false,
             RerankPrecision::F32,
+            None,
         )
         .unwrap();
         e.insert(
@@ -3341,7 +3367,9 @@ mod tests {
             .unwrap();
         // Exhaustive search (no ANN index) → exercises L2 dequant path + raw rerank
         let q = Array1::from_vec(vec![0.0f64; d]);
-        let results = e.search_with_filter_and_ann(&q, 2, None, None).unwrap();
+        let results = e
+            .search_with_filter_and_ann(&q, 2, None, None, true)
+            .unwrap();
         assert_eq!(results.len(), 2);
         // "origin" should score 0 (no distance), "far" should score -10 (negative distance)
         assert_eq!(results[0].id, "origin", "origin should be closest for L2");
@@ -3401,6 +3429,7 @@ mod tests {
             true,
             false,
             RerankPrecision::Disabled,
+            None,
         )
         .unwrap();
         e.insert("a".into(), &Array1::from_vec(vec![0.0f64; d]), no_meta())
@@ -3410,7 +3439,9 @@ mod tests {
         e.insert("b".into(), &Array1::from_vec(b), no_meta())
             .unwrap();
         let q = Array1::from_vec(vec![0.0f64; d]);
-        let results = e.search_with_filter_and_ann(&q, 2, None, None).unwrap();
+        let results = e
+            .search_with_filter_and_ann(&q, 2, None, None, true)
+            .unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, "a");
     }
@@ -3431,7 +3462,7 @@ mod tests {
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"$and": "not-an-array"}"#).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
             .unwrap();
         assert!(results.is_empty(), "non-array $and should match nothing");
     }
@@ -3449,7 +3480,7 @@ mod tests {
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"$and": [42]}"#).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
             .unwrap();
         assert!(
             results.is_empty(),
@@ -3470,7 +3501,7 @@ mod tests {
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"$or": "not-an-array"}"#).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
             .unwrap();
         assert!(results.is_empty(), "non-array $or should match nothing");
     }
@@ -3488,7 +3519,7 @@ mod tests {
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"$or": ["not-an-object"]}"#).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
             .unwrap();
         assert!(
             results.is_empty(),
@@ -3513,7 +3544,7 @@ mod tests {
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"a.b": 1}"#).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
             .unwrap();
         assert!(
             results.is_empty(),
@@ -3535,7 +3566,7 @@ mod tests {
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"a.b.c": 1}"#).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
             .unwrap();
         assert!(
             results.is_empty(),
@@ -3566,7 +3597,7 @@ mod tests {
         let filter_gt: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"name": {"$gt": "alpha"}}"#).unwrap();
         let r_gt = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_gt), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_gt), None, true)
             .unwrap();
         assert_eq!(r_gt.len(), 2, "$gt string: expected 2 matches");
 
@@ -3574,7 +3605,7 @@ mod tests {
         let filter_gte: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"name": {"$gte": "beta"}}"#).unwrap();
         let r_gte = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_gte), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_gte), None, true)
             .unwrap();
         assert_eq!(r_gte.len(), 2, "$gte string: expected 2 matches");
 
@@ -3582,7 +3613,7 @@ mod tests {
         let filter_lt: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"name": {"$lt": "beta"}}"#).unwrap();
         let r_lt = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_lt), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_lt), None, true)
             .unwrap();
         assert_eq!(r_lt.len(), 1, "$lt string: expected 1 match");
 
@@ -3590,7 +3621,7 @@ mod tests {
         let filter_lte: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"name": {"$lte": "alpha"}}"#).unwrap();
         let r_lte = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_lte), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_lte), None, true)
             .unwrap();
         assert_eq!(r_lte.len(), 1, "$lte string: expected 1 match");
     }
@@ -3655,7 +3686,7 @@ mod tests {
         let mut q = vec![0.0f64; d];
         q[0] = 1.0;
         let results = e
-            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None)
+            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
             .unwrap();
         assert!(!results.is_empty());
     }
@@ -3689,7 +3720,7 @@ mod tests {
         let mut q = vec![0.0f64; d];
         q[0] = 1.0;
         let results = e
-            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None)
+            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
             .unwrap();
         assert!(!results.is_empty());
     }
@@ -3713,7 +3744,7 @@ mod tests {
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"tag": "no"}"#).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
             .unwrap();
         assert!(
             results.is_empty(),
@@ -3749,7 +3780,7 @@ mod tests {
         let mut q = vec![0.0f64; d];
         q[0] = 1.0;
         let results = e
-            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None)
+            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
             .unwrap();
         assert!(!results.is_empty());
     }
@@ -3775,7 +3806,7 @@ mod tests {
         let mut q = vec![0.0f64; d];
         q[0] = 1.0;
         let results = e
-            .search_with_filter_and_ann(&Array1::from_vec(q), 10, None, None)
+            .search_with_filter_and_ann(&Array1::from_vec(q), 10, None, None, true)
             .unwrap();
         assert!(
             !results.is_empty(),
@@ -3810,7 +3841,9 @@ mod tests {
         }
         e.create_index_with_params(8, 32, 32, 1.2, 0).unwrap();
         let q = Array1::from_vec(vec![0.0f64; d]);
-        let results = e.search_with_filter_and_ann(&q, 5, None, None).unwrap();
+        let results = e
+            .search_with_filter_and_ann(&q, 5, None, None, true)
+            .unwrap();
         assert!(!results.is_empty());
     }
 
@@ -3829,7 +3862,7 @@ mod tests {
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"tag": "absent"}"#).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
             .unwrap();
         assert!(
             results.is_empty(),
@@ -3855,6 +3888,7 @@ mod tests {
             true, // rerank_enabled=true
             false,
             RerankPrecision::Disabled, // no raw vecs → live_vraw=None
+            None,
         )
         .unwrap();
         for i in 0..30u32 {
@@ -3867,7 +3901,7 @@ mod tests {
         let mut q = vec![0.0f64; d];
         q[0] = 1.0;
         let results = e
-            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None)
+            .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
             .unwrap();
         assert!(!results.is_empty());
     }
@@ -4039,7 +4073,7 @@ mod tests {
         // This delete brings buffer to 100 → flush (line 568)
         e.delete("w0".to_string()).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None, true)
             .unwrap();
         assert!(results.len() <= 5);
     }
@@ -4061,7 +4095,104 @@ mod tests {
         assert_eq!(e.vector_count(), 98);
     }
 
-    // ── insert_many WAL flush at buffer==threshold (line 1859) ───────────────
+    #[test]
+    fn delete_batch_sets_has_pending_deletes_so_compaction_runs_on_flush() {
+        // Regression: delete_batch previously did NOT set has_pending_deletes,
+        // so flush_wal_to_segment skipped live_compact_slab and deleted slots
+        // remained in the live slab even after a WAL flush.
+        //
+        // The test proves compaction ran by checking live_slot_count == vector_count:
+        // - With fix:    compaction removes 5 deleted slots → live_slot_count == 4994
+        // - Without fix: deleted slots linger          → live_slot_count == 4999 != 4994
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let n = 5usize;
+        {
+            let mut e = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+            let threshold = e.wal_flush_threshold;
+
+            // Fill WAL buffer to threshold - 1 (no flush yet).
+            for i in 0..threshold - 1 {
+                e.insert(format!("v{i}"), &make_vec(d, 0.5), no_meta())
+                    .unwrap();
+            }
+
+            // delete_batch adds n entries → buffer reaches threshold → flush triggered.
+            let to_delete: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
+            let deleted = e.delete_batch(to_delete).unwrap();
+            assert_eq!(deleted, n, "all requested ids should be deleted");
+
+            // Compaction should have reduced live_slot_count to match vector_count.
+            let stats = e.stats();
+            assert_eq!(
+                stats.live_slot_count as u64, stats.vector_count,
+                "live_slot_count must equal vector_count after compaction (no ghost slots)"
+            );
+            assert_eq!(stats.vector_count, (threshold - 1 - n) as u64);
+        }
+        // Confirm deleted IDs are gone after reload.
+        let e2 = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+        for i in 0..n {
+            assert!(
+                e2.get(&format!("v{i}")).unwrap().is_none(),
+                "v{i} should be deleted after reopen"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_batch_deferred_flush_compacts_when_later_insert_triggers_wal_flush() {
+        // Companion to the test above: delete_batch does NOT trigger the WAL flush
+        // itself (buffer stays below threshold), but has_pending_deletes=true is still
+        // set, so when a later insert causes the flush, compaction runs correctly.
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let n = 3usize;
+        {
+            let mut e = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+            let threshold = e.wal_flush_threshold;
+
+            // Insert just a few vectors — WAL buffer stays well below threshold.
+            for i in 0..10usize {
+                e.insert(format!("v{i}"), &make_vec(d, 0.5), no_meta())
+                    .unwrap();
+            }
+
+            // delete_batch: buffer stays below threshold (10 + n << threshold).
+            let to_delete: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
+            let deleted = e.delete_batch(to_delete).unwrap();
+            assert_eq!(deleted, n);
+
+            // Now flood inserts until we cross the threshold — this triggers the WAL flush.
+            let remaining = threshold - (10 + n); // how many more to cross threshold
+            for i in 10..10 + remaining {
+                e.insert(format!("w{i}"), &make_vec(d, 0.5), no_meta())
+                    .unwrap();
+            }
+
+            // Compaction must have run: live_slot_count == vector_count (no ghost slots).
+            let stats = e.stats();
+            assert_eq!(
+                stats.live_slot_count as u64, stats.vector_count,
+                "compaction must run during flush triggered by inserts after delete_batch"
+            );
+            assert_eq!(
+                stats.vector_count,
+                (10 - n + remaining) as u64,
+                "vector count must be correct after deferred compaction"
+            );
+        }
+        // Confirm deleted IDs are gone after reload.
+        let e2 = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+        for i in 0..n {
+            assert!(
+                e2.get(&format!("v{i}")).unwrap().is_none(),
+                "v{i} should be deleted after deferred-flush compaction and reopen"
+            );
+        }
+    }
 
     #[test]
     fn insert_many_at_threshold_triggers_wal_flush() {
@@ -4116,7 +4247,7 @@ mod tests {
         // Search with zero query → query_norm=0 → line 1072
         let zero_q = Array1::<f64>::zeros(d);
         let _results = e
-            .search_with_filter_and_ann(&zero_q, 5, None, None)
+            .search_with_filter_and_ann(&zero_q, 5, None, None, true)
             .unwrap();
     }
 
@@ -4139,7 +4270,7 @@ mod tests {
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"$and": [{"score": {"$gte": 2}}, {"tag": "good"}]}"#).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
             .unwrap();
         assert!(!results.is_empty());
     }
@@ -4161,7 +4292,7 @@ mod tests {
         let mut filter = no_meta();
         filter.insert("tag".into(), json!({"$ne": "a"}));
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
             .unwrap();
         assert_eq!(results.len(), 2);
     }
@@ -4184,7 +4315,7 @@ mod tests {
         let mut f1 = no_meta();
         f1.insert("n".into(), json!({"$lt": 3}));
         let r1 = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&f1), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&f1), None, true)
             .unwrap();
         assert_eq!(r1.len(), 3); // n=0,1,2
 
@@ -4192,7 +4323,7 @@ mod tests {
         let mut f2 = no_meta();
         f2.insert("n".into(), json!({"$lte": 2}));
         let r2 = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&f2), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&f2), None, true)
             .unwrap();
         assert_eq!(r2.len(), 3); // n=0,1,2
     }
@@ -4212,7 +4343,7 @@ mod tests {
         let mut filter = no_meta();
         filter.insert("name".into(), json!({"$gte": 5}));
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
             .unwrap();
         assert!(results.is_empty());
     }
@@ -4232,7 +4363,7 @@ mod tests {
         let mut filter = no_meta();
         filter.insert("x".into(), json!({"$bogus": 1}));
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
             .unwrap();
         assert!(results.is_empty());
     }
@@ -4254,7 +4385,7 @@ mod tests {
         let mut filter = no_meta();
         filter.insert("a.b.c".into(), json!(42));
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
             .unwrap();
         assert_eq!(results.len(), 1);
     }
@@ -4311,7 +4442,7 @@ mod tests {
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"tag": {"$in": ["ml", "cv"]}}"#).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
             .unwrap();
         let ids: Vec<_> = results.iter().map(|r| r.id.as_str()).collect();
         assert!(ids.contains(&"a"), "$in: expected 'a'");
@@ -4330,7 +4461,7 @@ mod tests {
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"tag": {"$in": ["ml"]}}"#).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
             .unwrap();
         assert!(results.is_empty(), "$in on missing field should not match");
     }
@@ -4353,7 +4484,7 @@ mod tests {
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"tag": {"$nin": ["ml", "cv"]}}"#).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
             .unwrap();
         let ids: Vec<_> = results.iter().map(|r| r.id.as_str()).collect();
         assert!(!ids.contains(&"a"), "$nin: 'a' should be excluded");
@@ -4372,7 +4503,7 @@ mod tests {
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"tag": {"$nin": ["ml"]}}"#).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
             .unwrap();
         assert_eq!(results.len(), 1, "$nin on missing field should match");
     }
@@ -4392,7 +4523,7 @@ mod tests {
         let filter_true: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"tag": {"$exists": true}}"#).unwrap();
         let r = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter_true), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter_true), None, true)
             .unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].id, "has");
@@ -4400,7 +4531,7 @@ mod tests {
         let filter_false: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"tag": {"$exists": false}}"#).unwrap();
         let r2 = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter_false), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter_false), None, true)
             .unwrap();
         assert_eq!(r2.len(), 1);
         assert_eq!(r2[0].id, "missing");
@@ -4427,7 +4558,7 @@ mod tests {
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"title": {"$contains": "GPU"}}"#).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
             .unwrap();
         let ids: Vec<_> = results.iter().map(|r| r.id.as_str()).collect();
         assert!(ids.contains(&"a"), "$contains: expected 'a'");
@@ -4447,7 +4578,7 @@ mod tests {
         let filter: HashMap<String, serde_json::Value> =
             serde_json::from_str(r#"{"score": {"$contains": "4"}}"#).unwrap();
         let results = e
-            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None)
+            .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
             .unwrap();
         assert!(
             results.is_empty(),
@@ -4605,7 +4736,7 @@ mod tests {
         }
         let q1 = make_vec(d, 0.1);
         let q2 = make_vec(d, 0.9);
-        let results = e.search_batch(&[q1, q2], 2, None, None).unwrap();
+        let results = e.search_batch(&[q1, q2], 2, None, None, true).unwrap();
         assert_eq!(results.len(), 2, "one result set per query");
         assert_eq!(results[0].len(), 2, "top_k=2 for first query");
         assert_eq!(results[1].len(), 2, "top_k=2 for second query");
@@ -4617,7 +4748,7 @@ mod tests {
         let p = dir.path().to_str().unwrap();
         let d = 8;
         let e = open_default(p, d);
-        let results = e.search_batch(&[], 5, None, None).unwrap();
+        let results = e.search_batch(&[], 5, None, None, true).unwrap();
         assert!(results.is_empty());
     }
 }

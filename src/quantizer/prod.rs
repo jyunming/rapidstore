@@ -398,18 +398,25 @@ impl ProdQuantizer {
         let qjl_ptr = qjl.as_ptr();
         let qjl_len = qjl.len();
 
+        // Constants hoisted out of the loop for integer SIMD sign expansion.
+        let bit_masks = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+        let zero_si = _mm256_setzero_si256();
+        let pos_one = _mm256_set1_ps(1.0f32);
+        let neg_one = _mm256_set1_ps(-1.0f32);
+
         let mut b = 0;
         while b < qjl_len {
             let byte = unsafe { *qjl_ptr.add(b) as i32 };
             let base_i = b << 3;
             if base_i + 7 < self.n {
                 let s_vec = _mm256_loadu_ps(unsafe { sq.add(base_i) });
-                let mut signs = [0.0f32; 8];
-                for bit in 0..8 {
-                    signs[bit] = if (byte & (1 << bit)) != 0 { 1.0 } else { -1.0 };
-                }
-                let sign_vec = _mm256_loadu_ps(signs.as_ptr());
-                qjl_acc = _mm256_add_ps(qjl_acc, _mm256_mul_ps(s_vec, sign_vec));
+                // Expand 8 packed sign bits → [±1.0; 8] using integer SIMD blend.
+                // This replaces a scalar 8-iteration loop that wrote to a stack array.
+                let byte_broadcast = _mm256_set1_epi32(byte);
+                let masked = _mm256_and_si256(byte_broadcast, bit_masks);
+                let is_zero = _mm256_cmpeq_epi32(masked, zero_si);
+                let signs = _mm256_blendv_ps(pos_one, neg_one, _mm256_castsi256_ps(is_zero));
+                qjl_acc = _mm256_fmadd_ps(signs, s_vec, qjl_acc);
             } else {
                 let mut qs = 0.0f32;
                 for bit in 0..8 {
@@ -542,6 +549,56 @@ impl ProdQuantizer {
             bit_pos += bits_per_idx;
         }
     }
+
+    /// Compute the query's QJL residual bits for use as a fast navigation fingerprint
+    /// during HNSW graph traversal (see [`hamming_score`]).
+    ///
+    /// Encodes the query through the full `quantize()` pipeline and returns the
+    /// bit-packed QJL codes of the MSE residual — the same representation stored
+    /// per-vector in `live_codes.bin`. Comparing these bits against stored QJL codes
+    /// with Hamming distance gives a fast (~64× cheaper than LUT) proxy for inner
+    /// product proximity, enabling fast HNSW navigation followed by accurate LUT
+    /// re-scoring of the final candidate set.
+    pub(crate) fn prepare_navigation_bits(&self, query: &Array1<f64>) -> Vec<u8> {
+        let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
+        let (_, qjl_bits, _) = self.quantize(&query_f32);
+        qjl_bits
+    }
+}
+
+/// Normalized Hamming similarity between two bit-packed byte slices.
+///
+/// Returns `(agreements - disagreements) / n_bits` ∈ [-1.0, 1.0].  A score of
+/// 1.0 means identical bit patterns; −1.0 means all bits flipped.  Processing
+/// is done in 64-bit words (8 bytes at a time) to exploit native `POPCNT`.
+///
+/// The shorter slice determines the number of bits compared; any extra bytes in
+/// the longer slice are ignored.
+pub(crate) fn hamming_score(a: &[u8], b: &[u8]) -> f64 {
+    let n_bytes = a.len().min(b.len());
+    if n_bytes == 0 {
+        return 0.0;
+    }
+
+    let mut disagreements = 0u32;
+    let mut i = 0usize;
+
+    // Process 8 bytes at a time as u64 for native POPCNT throughput.
+    while i + 8 <= n_bytes {
+        let wa = u64::from_le_bytes(a[i..i + 8].try_into().unwrap());
+        let wb = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        disagreements += (wa ^ wb).count_ones();
+        i += 8;
+    }
+
+    // Scalar tail for remaining bytes.
+    while i < n_bytes {
+        disagreements += (a[i] ^ b[i]).count_ones();
+        i += 1;
+    }
+
+    let n_bits = (n_bytes * 8) as f64;
+    1.0 - 2.0 * disagreements as f64 / n_bits
 }
 
 #[cfg(test)]
@@ -1008,6 +1065,95 @@ mod tests {
             tau,
             concordant,
             total
+        );
+    }
+
+    // ── QJL-Hamming navigation tests ──────────────────────────────────────────
+
+    #[test]
+    fn prepare_navigation_bits_returns_correct_length() {
+        let d = 64;
+        let pq = make_pq(d);
+        let query = Array1::from_iter((0..d).map(|i| i as f64 * 0.01));
+        let bits = pq.prepare_navigation_bits(&query);
+        assert_eq!(bits.len(), pq.n.div_ceil(8));
+    }
+
+    #[test]
+    fn hamming_score_identical_bits_returns_one() {
+        let a = vec![0b10110011u8, 0b01001100u8, 0xFF, 0x00];
+        assert!(
+            (hamming_score(&a, &a) - 1.0).abs() < 1e-9,
+            "identical bits → score 1.0"
+        );
+    }
+
+    #[test]
+    fn hamming_score_all_flipped_returns_minus_one() {
+        let a = vec![0xAAu8; 8];
+        let b: Vec<u8> = a.iter().map(|x| !x).collect();
+        let s = hamming_score(&a, &b);
+        assert!(
+            (s - (-1.0)).abs() < 1e-9,
+            "all bits flipped → score −1.0, got {}",
+            s
+        );
+    }
+
+    #[test]
+    fn hamming_score_is_symmetric() {
+        let a = vec![0b10101010u8, 0b11001100u8, 0x42, 0x99];
+        let b = vec![0b01010101u8, 0b00110011u8, 0x24, 0x66];
+        assert!(
+            (hamming_score(&a, &b) - hamming_score(&b, &a)).abs() < 1e-12,
+            "hamming_score must be symmetric"
+        );
+    }
+
+    #[test]
+    fn hamming_score_in_range() {
+        let a = vec![0x5Au8; 32];
+        let b = vec![0x3Cu8; 32];
+        let s = hamming_score(&a, &b);
+        assert!(
+            (-1.0..=1.0).contains(&s),
+            "hamming_score must be in [-1, 1], got {}",
+            s
+        );
+    }
+
+    #[test]
+    fn navigation_bits_similar_vectors_closer_than_orthogonal() {
+        // Query direction: uniform unit vector.
+        // v_parallel ≈ query direction → high Hamming agreement.
+        // v_orthogonal ⊥ query → ~random bit agreement (Hamming ≈ 0.0).
+        let d = 128;
+        let pq = make_pq(d);
+        let scale = 1.0_f64 / (d as f64).sqrt();
+        let query = Array1::from_iter(vec![scale; d]);
+        let v_parallel: Vec<f32> = vec![scale as f32 * 0.9; d];
+        let v_orthogonal: Vec<f32> = (0..d)
+            .map(|i| {
+                if i < d / 2 {
+                    scale as f32
+                } else {
+                    -scale as f32
+                }
+            })
+            .collect();
+
+        let q_bits = pq.prepare_navigation_bits(&query);
+        let (_, qjl_par, _) = pq.quantize(&v_parallel);
+        let (_, qjl_orth, _) = pq.quantize(&v_orthogonal);
+
+        let s_par = hamming_score(&q_bits, &qjl_par);
+        let s_orth = hamming_score(&q_bits, &qjl_orth);
+
+        assert!(
+            s_par > s_orth,
+            "similar vector (score {:.3}) should beat orthogonal vector (score {:.3}) on Hamming",
+            s_par,
+            s_orth
         );
     }
 }

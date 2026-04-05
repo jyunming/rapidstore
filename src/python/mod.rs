@@ -41,6 +41,11 @@ impl Database {
     ///         - ``None`` (default): dequantization reranking — no extra disk/RAM.
     ///         - ``"f16"``: store raw vectors as float16 (+n×d×2 bytes), exact reranking.
     ///         - ``"f32"``: store raw vectors as float32 (+n×d×4 bytes), maximum precision.
+    ///     wal_flush_threshold: Number of buffered vectors before flushing WAL to a segment file.
+    ///         Higher values give faster bulk ingest (fewer flush cycles) at the cost of more
+    ///         data at risk if the process crashes before flush. Default ``5000``.
+    ///         Set to ``100`` to restore old conservative behaviour (more flushes, same final
+    ///         disk/RAM — ``close()`` always trims the file to the exact slot count).
     ///
     /// Returns:
     ///     An open :class:`Database` instance.
@@ -49,7 +54,7 @@ impl Database {
     ///
     ///     db = Database.open("mydb", dimension=1536, bits=4, metric="cosine")
     #[staticmethod]
-    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None))]
+    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None))]
     fn open(
         path: String,
         dimension: usize,
@@ -60,6 +65,7 @@ impl Database {
         fast_mode: bool,
         rerank_precision: Option<&str>,
         collection: Option<&str>,
+        wal_flush_threshold: Option<usize>,
     ) -> PyResult<Self> {
         let engine_path = match collection {
             Some(col) if !col.is_empty() => {
@@ -108,6 +114,7 @@ impl Database {
             rerank,
             fast_mode,
             precision,
+            wal_flush_threshold,
         )
         .map_err(to_py_runtime)?;
         Ok(Self {
@@ -356,7 +363,26 @@ impl Database {
         Ok(engine.list_all())
     }
 
-    #[pyo3(signature = (query, top_k, filter=None, _use_ann=true, ann_search_list_size=None, include=None))]
+    /// Search for the nearest neighbours of a query vector.
+    ///
+    /// The HNSW index is used when an index has been built via
+    /// :meth:`create_index` **and** ``_use_ann=True`` is passed.
+    /// With ``_use_ann=False`` (the default) the search always uses exhaustive
+    /// brute-force scoring, which gives the highest recall at the cost of
+    /// linear scan time.
+    ///
+    /// Args:
+    ///     query: Query vector (1-D numpy array, float32 or float64).
+    ///     top_k: Number of results to return.
+    ///     filter: Optional metadata filter dict.
+    ///     ann_search_list_size: HNSW ef_search override (larger = more recall, slower).
+    ///         Only relevant when ``_use_ann=True`` and an index exists.
+    ///     include: Subset of fields to return — ``["id", "score", "metadata", "document"]``.
+    ///              Defaults to all four.
+    ///
+    /// Returns:
+    ///     List of dicts, each with keys ``id``, ``score``, ``metadata``, ``document``.
+    #[pyo3(signature = (query, top_k, filter=None, _use_ann=false, ann_search_list_size=None, include=None))]
     fn search(
         &self,
         py: Python<'_>,
@@ -387,7 +413,7 @@ impl Database {
         let results = py.allow_threads(|| {
             let engine = self.engine.read().unwrap();
             engine
-                .search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size)
+                .search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size, _use_ann)
                 .map_err(to_py_runtime)
         })?;
 
@@ -538,8 +564,12 @@ impl Database {
     ///     query_embeddings: 2-D array of shape ``(N, D)``.
     ///     n_results: Number of results per query. Default 10.
     ///     where_filter: Optional metadata filter (same syntax as :meth:`search`).
-    ///     _use_ann: Use HNSW index if available. Default ``True``.
-    ///     ann_search_list_size: HNSW ef_search override.
+    ///     ann_search_list_size: HNSW ef_search override (larger = more recall, slower).
+    ///         Only relevant when ``_use_ann=True`` and an index exists.
+    ///
+    /// Note:
+    ///     Pass ``_use_ann=True`` to engage the HNSW index (must be built first via
+    ///     :meth:`create_index`). Default is ``False`` (exhaustive brute-force).
     ///
     /// Returns:
     ///     List of N result lists, each in the same format as :meth:`search`.
@@ -550,7 +580,7 @@ impl Database {
     ///         query_embeddings=np.stack([q1, q2, q3]),
     ///         n_results=5,
     ///     )
-    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=true, ann_search_list_size=None))]
+    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=false, ann_search_list_size=None))]
     fn query(
         &self,
         py: Python<'_>,
@@ -589,7 +619,13 @@ impl Database {
         let batch = py.allow_threads(|| {
             let engine = self.engine.read().unwrap();
             engine
-                .search_batch(&queries, n_results, filter_ref, ann_search_list_size)
+                .search_batch(
+                    &queries,
+                    n_results,
+                    filter_ref,
+                    ann_search_list_size,
+                    _use_ann,
+                )
                 .map_err(to_py_runtime)
         })?;
 
