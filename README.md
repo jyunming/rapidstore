@@ -60,19 +60,19 @@ from tqdb import Database
 # High Quality — best recall, exact reranking
 db = Database.open(path, dimension=DIM, bits=4, rerank=True, rerank_precision="f16")
 db.create_index(max_degree=32, ef_construction=200, n_refinements=8)
-results = db.search(query, top_k=10, ann_search_list_size=200)
+results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
 # ~100% Recall@10 at 100k×1536  |  401 MB disk  |  38ms p50 (brute-force)
 
 # Balanced — recommended default (dequant reranking, zero extra disk)
 db = Database.open(path, dimension=DIM, bits=4, rerank=True)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
-results = db.search(query, top_k=10, ann_search_list_size=200)
+results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
 # ~99.4% Recall@5 at 100k×1536  |  117 MB disk  |  59ms rerank / 8ms no-rerank
 
 # Fast ANN — lowest latency, good recall
 db = Database.open(path, dimension=DIM, bits=4, rerank=False)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
-results = db.search(query, top_k=10, ann_search_list_size=200)
+results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
 # ~96% Recall@10 at 100k×1536  |  117 MB disk  |  8ms p50
 ```
 
@@ -154,7 +154,7 @@ db.search(query, top_k=5, filter={"$and": [{"topic": "ml"}, {"year": {"$gte": 20
 ```python
 db = Database.open(path, dimension=DIM, bits=4, rerank=True, rerank_precision="f16")
 db.create_index(max_degree=32, ef_construction=200, n_refinements=8)
-results = db.search(query, top_k=10, ann_search_list_size=200)
+results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
 # 100% Recall@10 at 100k×1536  |  38ms p50 (brute-force)  |  401 MB disk
 ```
 
@@ -163,7 +163,7 @@ results = db.search(query, top_k=10, ann_search_list_size=200)
 ```python
 db = Database.open(path, dimension=DIM, bits=4, rerank=True)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
-results = db.search(query, top_k=10, ann_search_list_size=200)
+results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
 # 99.4% Recall@5, 96% Recall@10 at 100k×1536  |  117 MB disk  |  8ms (ANN) / 45ms (brute+dequant)
 ```
 
@@ -172,7 +172,7 @@ results = db.search(query, top_k=10, ann_search_list_size=200)
 ```python
 db = Database.open(path, dimension=DIM, bits=2, rerank=True)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
-results = db.search(query, top_k=10, ann_search_list_size=200)
+results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
 # 96.4% Recall@10 at 100k×1536  |  68 MB disk (8.7× smaller than float32)  |  7ms p50
 ```
 

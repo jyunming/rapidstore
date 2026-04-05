@@ -8,12 +8,24 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ## [Unreleased]
 
+---
+
+## [0.2.1] — 2026-04-05
+
+### Fixed
+
+- **`_use_ann` flag now works** — previously the parameter was silently ignored (Rust `_` prefix convention); the engine always used HNSW when an index existed. Now `_use_ann=False` (the default) always uses brute-force scoring regardless of whether an index has been built. Pass `_use_ann=True` to engage the HNSW index.
+- **Disk measurement inflation in ingest benchmarks** — `GROW_SLOTS` pre-allocation inflated reported disk sizes by ~18%. Fixed by calling `db.close()` (triggers `truncate_to(slot_count)`) before measuring file sizes in `precommit_perf_check.py` and `paper_recall_bench.py`.
+- **UnicodeEncodeError on Windows** — benchmark scripts now reconfigure stdout to UTF-8 on startup, fixing crashes on cp1252 consoles.
+
+### Performance
+
+- **Skip compaction on pure inserts** — compaction is now skipped when no deletes are pending, eliminating unnecessary segment merges during bulk ingest. Throughput improvement: 2–3×.
+
 ### Infrastructure
 
-- Comprehensive benchmark system (`benchmarks/paper_recall_bench.py`, `bench_core.py`, `perf_tracker.py`) reproducing Section 4.4 of arXiv:2504.19874 across GloVe-200, DBpedia-1536, and DBpedia-3072
-- Public README benchmark tables (R@1–64, throughput, latency, disk, RAM, MRR) and embedded recall-curve plots
-- Performance history tracking (`perf_history.json`) with HTML trend viewer
-- CI: brute-force recall quality gate threshold calibrated per benchmark dimension
+- Benchmark scripts auto-regenerate `_perf_history.html` after every `--track` run.
+- README ANN search examples updated to include `_use_ann=True` where applicable.
 
 ---
 
