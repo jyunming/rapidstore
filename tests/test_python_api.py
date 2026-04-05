@@ -341,6 +341,8 @@ class TestStats:
         assert "ram_estimate_bytes" in s
         assert s["vector_count"] == 10
         assert s["has_index"] is False
+        assert s["dimension"] == 16
+        assert s["bits"] == 4
 
     def test_stats_after_index(self, tmp_path):
         db = open_db(str(tmp_path / "db"), d=16)

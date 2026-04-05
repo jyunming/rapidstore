@@ -1309,24 +1309,45 @@ impl TurboQuantEngine {
             if out.len() > top_k {
                 out.truncate(top_k);
             }
+
+            // Hybrid: score any vectors inserted after create_index() ("dark slots")
+            // that are not in the HNSW graph. Without this, new inserts are silently
+            // invisible to ANN search.
+            let indexed_set: std::collections::HashSet<u32> =
+                self.index_ids.iter().copied().collect();
+            let dark_slots: Vec<u32> = self
+                .id_pool
+                .iter_active()
+                .iter()
+                .map(|(_, s)| *s)
+                .filter(|s| !indexed_set.contains(s))
+                .collect();
+            if !dark_slots.is_empty() {
+                let mut dark_results =
+                    self.exhaustive_search_simd(query, top_k, filter, Some(dark_slots))?;
+                out.append(&mut dark_results);
+                out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+                out.truncate(top_k);
+            }
+
             return Ok(out);
         }
 
         // Exhaustive search path (SIMD Optimized)
-        self.exhaustive_search_simd(query, top_k, filter)
+        self.exhaustive_search_simd(query, top_k, filter, None)
     }
 
+    /// Score a set of candidate slots against `query` and return the top-`top_k` results.
+    ///
+    /// `forced_slots`: when `Some`, these slots are scored directly (after optional filter).
+    /// When `None`, all active slots from `id_pool` are used (the normal brute-force path).
     fn exhaustive_search_simd(
         &self,
         query: &Array1<f64>,
         top_k: usize,
         filter: Option<&HashMap<String, JsonValue>>,
+        forced_slots: Option<Vec<u32>>,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
-        let active = self.id_pool.iter_active();
-        if active.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let internal_k = if self.rerank_enabled {
             top_k * 10
         } else {
@@ -1334,22 +1355,44 @@ impl TurboQuantEngine {
         };
         let q_norm = query.iter().map(|x| x * x).sum::<f64>().sqrt();
 
+        // Build candidate slot list: either from the forced set or all active slots.
         // Pre-filter slots upfront to keep the hot scoring loop filter-free.
-        // For the no-filter path this is just a collect; for filter it does one
-        // bulk metadata read (cheaper than per-slot reads inside the parallel loop).
-        let candidate_slots: Vec<u32> = if let Some(f) = filter {
-            let all_slots: Vec<u32> = active.iter().map(|(_, s)| *s).collect();
-            let meta_map = self.metadata.get_many(&all_slots)?;
-            all_slots
-                .into_iter()
-                .filter(|s| {
-                    meta_map
-                        .get(s)
-                        .is_some_and(|m| metadata_matches_filter(&m.properties, f))
-                })
-                .collect()
-        } else {
-            active.iter().map(|(_, s)| *s).collect()
+        let candidate_slots: Vec<u32> = match forced_slots {
+            Some(slots) => {
+                if let Some(f) = filter {
+                    let meta_map = self.metadata.get_many(&slots)?;
+                    slots
+                        .into_iter()
+                        .filter(|s| {
+                            meta_map
+                                .get(s)
+                                .is_some_and(|m| metadata_matches_filter(&m.properties, f))
+                        })
+                        .collect()
+                } else {
+                    slots
+                }
+            }
+            None => {
+                let active = self.id_pool.iter_active();
+                if active.is_empty() {
+                    return Ok(Vec::new());
+                }
+                if let Some(f) = filter {
+                    let all_slots: Vec<u32> = active.iter().map(|(_, s)| *s).collect();
+                    let meta_map = self.metadata.get_many(&all_slots)?;
+                    all_slots
+                        .into_iter()
+                        .filter(|s| {
+                            meta_map
+                                .get(s)
+                                .is_some_and(|m| metadata_matches_filter(&m.properties, f))
+                        })
+                        .collect()
+                } else {
+                    active.iter().map(|(_, s)| *s).collect()
+                }
+            }
         };
 
         if candidate_slots.is_empty() {
@@ -4826,5 +4869,54 @@ mod tests {
         let e = open_default(p, d);
         let results = e.search_batch(&[], 5, None, None, true).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn hybrid_search_finds_post_index_vectors() {
+        // Regression test for the "dark vector" bug:
+        // Vectors inserted AFTER create_index() must still appear in ANN search results.
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 32;
+        let mut e = open_default(p, d);
+
+        // Insert 200 diverse vectors and build index.
+        // Use deterministic vectors spread across the space so the search is meaningful.
+        for i in 0..200u32 {
+            let mut v = vec![0.0f64; d];
+            // Spread vectors: cycle through dimensions with varying magnitudes.
+            v[i as usize % d] = 1.0;
+            v[(i as usize + 1) % d] = 0.5 * ((i as f64 * 0.1).sin());
+            e.insert(format!("pre_{i}"), &Array1::from_vec(v), no_meta())
+                .unwrap();
+        }
+        e.create_index_with_params(16, 100, 64, 1.2, 2).unwrap();
+
+        // Insert 20 vectors AFTER the index is built — these are "dark" slots.
+        // Place them near the query direction so they should rank in the top results.
+        let mut dark_ids = Vec::new();
+        for i in 0..20u32 {
+            let mut v = vec![0.0f64; d];
+            v[0] = 0.8 + (i as f64) * 0.01; // near query direction
+            let id = format!("dark_{i}");
+            e.insert(id.clone(), &Array1::from_vec(v), no_meta())
+                .unwrap();
+            dark_ids.push(id);
+        }
+
+        // Search near the direction of the dark vectors; they must appear in results.
+        let mut q = vec![0.0f64; d];
+        q[0] = 1.0;
+        let results = e
+            .search_with_filter_and_ann(&Array1::from_vec(q), 30, None, None, true)
+            .unwrap();
+
+        let result_ids: std::collections::HashSet<&str> =
+            results.iter().map(|r| r.id.as_str()).collect();
+        let dark_found = dark_ids.iter().any(|id| result_ids.contains(id.as_str()));
+        assert!(
+            dark_found,
+            "at least one post-index vector must appear in ANN results (hybrid search)"
+        );
     }
 }
