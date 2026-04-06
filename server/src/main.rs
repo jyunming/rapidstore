@@ -24,6 +24,9 @@ struct AppState {
     storage: StorageConfig,
     job_worker_concurrency: usize,
     metrics_handle: PrometheusHandle,
+    /// Last time `collect_collection_gauges` ran.  Shared across clones so
+    /// concurrent requests do not all trigger a full directory scan.
+    last_gauge_collect: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 #[derive(Clone)]
@@ -532,6 +535,7 @@ fn build_app(state: AppState) -> Router {
         .route("/v1/jobs/:job_id", get(get_job_status))
         .route("/v1/jobs/:job_id/cancel", post(cancel_job))
         .route("/v1/jobs/:job_id/retry", post(retry_job))
+        .route("/metrics", get(metrics_handler))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -540,7 +544,6 @@ fn build_app(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/metrics", get(metrics_handler))
         .merge(protected)
         .with_state(state)
 }
@@ -756,6 +759,7 @@ async fn main() {
         },
         job_worker_concurrency,
         metrics_handle,
+        last_gauge_collect: Arc::new(Mutex::new(None)),
     };
 
     dispatch_queued_jobs(&state);
@@ -778,8 +782,21 @@ async fn healthz() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
+/// Minimum interval between full gauge collection passes.  A directory scan
+/// that opens every engine is too expensive to run on every scrape.
+const GAUGE_COLLECT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    collect_collection_gauges(&state);
+    // Only re-scan if the TTL has elapsed since the last collection.
+    let should_collect = {
+        let last = state.last_gauge_collect.lock().unwrap_or_else(|e| e.into_inner());
+        last.map_or(true, |t| t.elapsed() >= GAUGE_COLLECT_TTL)
+    };
+    if should_collect {
+        collect_collection_gauges(&state);
+        *state.last_gauge_collect.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::time::Instant::now());
+    }
     (
         [(
             header::CONTENT_TYPE,
