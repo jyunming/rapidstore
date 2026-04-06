@@ -144,12 +144,30 @@ db.update_metadata(
     document=None,               # str | None — replaces document; None = keep existing
 )
 
-db.stats()                       # dict — vector_count, disk_bytes, has_index, …
+db.stats()                       # dict — see Stats Keys below
+db.flush()                       # flush WAL to a segment file immediately
+db.close()                       # flush and release all file handles
 
 # Python container protocol
 len(db)                          # int — number of active vectors
 "my-id" in db                    # bool — True if id exists
 ```
+
+**Stats keys** returned by `db.stats()`:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `vector_count` | `int` | Total active (non-deleted) vectors |
+| `segment_count` | `int` | Number of immutable segment files |
+| `buffered_vectors` | `int` | Vectors in the WAL (not yet flushed) |
+| `dimension` | `int` | Vector dimension |
+| `bits` | `int` | Quantization bits |
+| `total_disk_bytes` | `int` | Total on-disk footprint in bytes |
+| `has_index` | `bool` | Whether a HNSW index has been built |
+| `index_nodes` | `int` | Number of nodes in the HNSW graph |
+| `live_codes_bytes` | `int` | Size of the in-memory quantized codes buffer |
+| `live_slot_count` | `int` | Allocated slots in the live slab |
+| `ram_estimate_bytes` | `int` | Estimated total in-memory footprint |
 
 ---
 
@@ -262,11 +280,11 @@ Filter semantics:
 Use `list_metadata_values` to discover all distinct values for a field — useful for building filter UIs or faceted search:
 
 ```python
-topics = db.list_metadata_values("topic")
-# ["finance", "ml", "sports", ...]
+counts = db.list_metadata_values("topic")
+# {"finance": 120, "ml": 84, "sports": 31, ...}
 ```
 
-Returns a `list` of all distinct non-null values stored for that field across active vectors.
+Returns a `dict[str, int]` mapping each distinct non-null value to its occurrence count across active vectors. Supports dotted paths (e.g. `"profile.region"`). Non-string values are stringified via their JSON representation.
 
 ---
 
