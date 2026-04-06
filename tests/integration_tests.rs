@@ -683,10 +683,10 @@ fn test_search_ann_override_api_and_high_beam_matches_bruteforce_top1() {
 
     let default_hits = engine.search(&query, 5).unwrap();
     let forced_small = engine
-        .search_with_filter_and_ann(&query, 5, None, Some(1))
+        .search_with_filter_and_ann(&query, 5, None, Some(1), true)
         .unwrap();
     let forced_large = engine
-        .search_with_filter_and_ann(&query, 5, None, Some(64))
+        .search_with_filter_and_ann(&query, 5, None, Some(64), true)
         .unwrap();
 
     let default_ids: Vec<_> = default_hits.iter().map(|r| r.id.clone()).collect();
@@ -873,6 +873,7 @@ fn test_rerank_disabled_behavior() {
         false,
         RerankPrecision::Disabled,
         None,
+        false,
     )
     .unwrap();
 
@@ -965,6 +966,7 @@ fn test_rerank_precision_f16_roundtrip() {
         false,
         RerankPrecision::F16,
         None,
+        false,
     )
     .unwrap();
 
@@ -1025,6 +1027,7 @@ fn test_rerank_precision_f32_file_size() {
         false,
         RerankPrecision::F32,
         None,
+        false,
     )
     .unwrap();
 
@@ -1079,6 +1082,7 @@ fn test_rerank_precision_f16_vs_f32_size_ratio() {
             false,
             *precision,
             None,
+            false,
         )
         .unwrap();
 
@@ -1130,6 +1134,7 @@ fn test_rerank_precision_disabled_no_file() {
         false,
         RerankPrecision::Disabled,
         None,
+        false,
     )
     .unwrap();
 

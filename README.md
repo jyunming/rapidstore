@@ -52,27 +52,24 @@ pip install tqdb
 
 ## Recommended Setup
 
-Three presets covering the main use cases — pick one and you're ready:
+Two presets cover most use cases — no indexing required to get started:
 
 ```python
 from tqdb import Database
 
-# High Quality — maximum recall via exact brute-force + raw f16 reranking
-db = Database.open(path, dimension=DIM, bits=4, rerank=True, rerank_precision="f16")
-results = db.search(query, top_k=10, _use_ann=False)
-# ~100% Recall@10 at 100k×1536  |  401 MB disk  |  ~38ms p50
-
-# Balanced — recommended default (dequant reranking, zero extra disk)
+# Recommended — brute-force with dequantization reranking
 db = Database.open(path, dimension=DIM, bits=4, rerank=True)
-db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
-results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
-# ~99.4% Recall@5 at 100k×1536  |  117 MB disk  |  8ms (ANN) / 59ms (brute+dequant)
+results = db.search(query, top_k=10)
+# 95.5% Recall@1, 100% Recall@4 at 100k×1536  |  108 MB disk  |  ~50ms p50
 
-# Fast ANN — lowest latency, good recall
-db = Database.open(path, dimension=DIM, bits=4, rerank=False)
-db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
-results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
-# ~96% Recall@10 at 100k×1536  |  117 MB disk  |  8ms p50
+# Minimum disk — 9.9× compression, still excellent recall
+db = Database.open(path, dimension=DIM, bits=2, rerank=True)
+results = db.search(query, top_k=10)
+# 86.8% Recall@1, 99.3% Recall@4 at 100k×1536  |  60 MB disk  |  ~43ms p50
+
+# Optional: build an HNSW index after bulk load for sub-10ms queries
+db.create_index()
+results = db.search(query, top_k=10, _use_ann=True)
 ```
 
 Full parameter reference: [`docs/PYTHON_API.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md)
@@ -148,30 +145,28 @@ db.search(query, top_k=5, filter={"$and": [{"topic": "ml"}, {"year": {"$gte": 20
 
 ## Recommended Presets
 
-### High Quality — exact reranking
-
-```python
-db = Database.open(path, dimension=DIM, bits=4, rerank=True, rerank_precision="f16")
-results = db.search(query, top_k=10, _use_ann=False)
-# 100% Recall@10 at 100k×1536  |  ~38ms p50 (brute-force)  |  401 MB disk
-```
-
-### Balanced — default recommendation
+### Recommended — brute-force + reranking
 
 ```python
 db = Database.open(path, dimension=DIM, bits=4, rerank=True)
-db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
-results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
-# 99.4% Recall@5, 96% Recall@10 at 100k×1536  |  117 MB disk  |  8ms (ANN) / 59ms (brute+dequant)
+results = db.search(query, top_k=10, _use_ann=False)
+# 95.5% Recall@1, 100% Recall@4 at 100k×1536  |  108 MB disk  |  ~50ms p50 (brute-force)
 ```
 
 ### Minimum Disk — compress aggressively
 
 ```python
 db = Database.open(path, dimension=DIM, bits=2, rerank=True)
-db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
+results = db.search(query, top_k=10, _use_ann=False)
+# 86.8% Recall@1, 99.3% Recall@4 at 100k×1536  |  60 MB disk (9.9× smaller)  |  ~43ms p50
+```
+
+### Optional — ANN index for lower latency
+
+```python
+# Build once after inserting data; recall scales with ann_search_list_size
+db.create_index()
 results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
-# 96.4% Recall@10 at 100k×1536  |  68 MB disk (8.7× smaller than float32)  |  7ms p50
 ```
 
 ---

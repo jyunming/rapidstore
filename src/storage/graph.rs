@@ -254,7 +254,11 @@ impl GraphManager {
 
             while let Some(current) = candidates.pop() {
                 if layer_results.len() >= EF_UPPER
-                    && current.score < layer_results.peek().unwrap().0.score
+                    && current.score
+                        < layer_results
+                            .peek()
+                            .map(|p| p.0.score)
+                            .unwrap_or(f64::NEG_INFINITY)
                 {
                     break;
                 }
@@ -269,7 +273,11 @@ impl GraphManager {
                         let score = scorer(nb);
                         let cand = SearchCandidate { id: nb, score };
                         if layer_results.len() < EF_UPPER
-                            || score > layer_results.peek().unwrap().0.score
+                            || score
+                                > layer_results
+                                    .peek()
+                                    .map(|p| p.0.score)
+                                    .unwrap_or(f64::NEG_INFINITY)
                         {
                             candidates.push(cand);
                             layer_results.push(OrderingWrapper(cand));
@@ -308,7 +316,12 @@ impl GraphManager {
         }
 
         while let Some(current) = candidates.pop() {
-            if results.len() >= search_list_size && current.score < results.peek().unwrap().0.score
+            if results.len() >= search_list_size
+                && current.score
+                    < results
+                        .peek()
+                        .map(|p| p.0.score)
+                        .unwrap_or(f64::NEG_INFINITY)
             {
                 break;
             }
@@ -330,7 +343,11 @@ impl GraphManager {
                     let matches = if let Some(f) = &filter { f(nb) } else { true };
                     if matches {
                         if results.len() < search_list_size
-                            || cand.score > results.peek().unwrap().0.score
+                            || cand.score
+                                > results
+                                    .peek()
+                                    .map(|p| p.0.score)
+                                    .unwrap_or(f64::NEG_INFINITY)
                         {
                             results.push(OrderingWrapper(cand));
                             if results.len() > search_list_size {

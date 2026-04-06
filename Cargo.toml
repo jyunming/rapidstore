@@ -1,6 +1,6 @@
 [package]
 name = "tqdb"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -19,6 +19,7 @@ rand_distr = "0.4.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bincode = "1.3.3"
+crc32fast = "1"
 
 # --- Storage Layer ---
 memmap2 = "0.9"
@@ -33,8 +34,12 @@ mimalloc = { version = "0.1", default-features = false }
 pyo3 = { version = "0.21.0", features = ["extension-module"] }
 numpy = "0.21.0"
 
+object_store = { version = "0.11", features = ["aws"], optional = true }
+tokio = { version = "1", features = ["rt", "macros"], optional = true }
+futures = { version = "0.3", optional = true }
+
 [features]
-cloud = []
+cloud = ["object_store", "tokio", "futures"]
 
 [build-dependencies]
 pyo3-build-config = "0.21.0"

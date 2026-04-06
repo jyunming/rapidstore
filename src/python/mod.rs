@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::storage::engine::{
-    BatchWriteItem, BatchWriteMode, DistanceMetric, GetResult, RerankPrecision, TurboQuantEngine,
+    BatchWriteItem, BatchWriteMode, DistanceMetric, GetResult, Manifest, RerankPrecision,
+    TurboQuantEngine,
 };
 
 /// Thread-safe handle to a TurboQuantDB database.
@@ -46,6 +47,10 @@ impl Database {
     ///         data at risk if the process crashes before flush. Default ``5000``.
     ///         Set to ``100`` to restore old conservative behaviour (more flushes, same final
     ///         disk/RAM — ``close()`` always trims the file to the exact slot count).
+    ///     normalize: When ``True`` the engine L2-normalises every inserted vector and every
+    ///         query vector internally so that IP scoring equals cosine similarity.  Callers
+    ///         that already emit unit vectors can set this to avoid repeating the normalisation
+    ///         themselves.  Default ``False``.
     ///
     /// Returns:
     ///     An open :class:`Database` instance.
@@ -53,11 +58,15 @@ impl Database {
     /// Example::
     ///
     ///     db = Database.open("mydb", dimension=1536, bits=4, metric="cosine")
+    ///     # Re-open an existing database without specifying parameters:
+    ///     db = Database.open("mydb")
+    ///     # Equivalent cosine-via-IP with auto-normalization:
+    ///     db = Database.open("mydb", dimension=1536, bits=4, metric="ip", normalize=True)
     #[staticmethod]
-    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None))]
+    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false))]
     fn open(
         path: String,
-        dimension: usize,
+        dimension: Option<usize>,
         bits: usize,
         seed: u64,
         metric: &str,
@@ -66,6 +75,7 @@ impl Database {
         rerank_precision: Option<&str>,
         collection: Option<&str>,
         wal_flush_threshold: Option<usize>,
+        normalize: bool,
     ) -> PyResult<Self> {
         let engine_path = match collection {
             Some(col) if !col.is_empty() => {
@@ -77,14 +87,34 @@ impl Database {
         std::fs::create_dir_all(&engine_path)
             .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
 
-        let dist_metric = match metric.to_lowercase().as_str() {
+        // If dimension is not provided, load it (and other fixed params) from
+        // the existing manifest.  This allows callers to reopen a database
+        // with just its path: `Database.open("./mydb")`.
+        let manifest_path = format!("{}/manifest.json", engine_path);
+        let (dimension, bits, seed, metric_str) = if let Some(d) = dimension {
+            (d, bits, seed, metric.to_string())
+        } else if std::path::Path::new(&manifest_path).exists() {
+            let m = Manifest::load(&manifest_path).map_err(to_py_runtime)?;
+            let m_metric = match m.metric {
+                DistanceMetric::Ip => "ip",
+                DistanceMetric::Cosine => "cosine",
+                DistanceMetric::L2 => "l2",
+            };
+            (m.d, m.b, m.seed, m_metric.to_string())
+        } else {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "dimension is required when opening a new database",
+            ));
+        };
+
+        let dist_metric = match metric_str.to_lowercase().as_str() {
             "ip" => DistanceMetric::Ip,
             "cosine" => DistanceMetric::Cosine,
             "l2" => DistanceMetric::L2,
             _ => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Invalid metric: {}",
-                    metric
+                    metric_str
                 )));
             }
         };
@@ -115,6 +145,7 @@ impl Database {
             fast_mode,
             precision,
             wal_flush_threshold,
+            normalize,
         )
         .map_err(to_py_runtime)?;
         Ok(Self {
@@ -142,7 +173,7 @@ impl Database {
         };
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine
                 .insert_with_document(id, &vec, props, document)
                 .map_err(to_py_runtime)
@@ -187,7 +218,7 @@ impl Database {
                     });
                 }
                 py.allow_threads(|| {
-                    let mut engine = self.engine.write().unwrap();
+                    let mut engine = self.write_engine()?;
                     engine
                         .insert_many_with_mode(chunk_items, b_mode)
                         .map_err(to_py_runtime)
@@ -215,7 +246,7 @@ impl Database {
                     });
                 }
                 py.allow_threads(|| {
-                    let mut engine = self.engine.write().unwrap();
+                    let mut engine = self.write_engine()?;
                     engine
                         .insert_many_with_mode(chunk_items, b_mode)
                         .map_err(to_py_runtime)
@@ -243,7 +274,7 @@ impl Database {
         };
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine
                 .upsert_with_document(id, &vec, props, document)
                 .map_err(to_py_runtime)
@@ -268,7 +299,7 @@ impl Database {
         };
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine
                 .update_with_document(id, &vec, props, document)
                 .map_err(to_py_runtime)
@@ -277,7 +308,7 @@ impl Database {
 
     fn delete(&self, py: Python<'_>, id: String) -> PyResult<bool> {
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine.delete(id).map_err(to_py_runtime)
         })
     }
@@ -286,6 +317,11 @@ impl Database {
     ///
     /// Args:
     ///     ids: List of IDs to delete. IDs not present are silently skipped.
+    ///         May be empty when ``where_filter`` is provided.
+    ///     where_filter: Optional metadata filter (same syntax as :meth:`search`).
+    ///         When provided, all vectors matching the filter are deleted in
+    ///         addition to any explicitly listed IDs.  Overlapping entries are
+    ///         not double-counted.
     ///
     /// Returns:
     ///     The number of vectors that were found and deleted.
@@ -293,10 +329,28 @@ impl Database {
     /// Example::
     ///
     ///     deleted = db.delete_batch(["id1", "id2", "id3"])
-    fn delete_batch(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<usize> {
+    ///     # Delete all vectors older than 2020:
+    ///     deleted = db.delete_batch(where_filter={"year": {"$lt": 2020}})
+    #[pyo3(signature = (ids=vec![], where_filter=None))]
+    fn delete_batch(
+        &self,
+        py: Python<'_>,
+        ids: Vec<String>,
+        where_filter: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<usize> {
+        let has_filter = where_filter.is_some();
+        let parsed_filter = parse_pydict(where_filter)?;
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
-            engine.delete_batch(ids).map_err(to_py_runtime)
+            let mut engine = self.write_engine()?;
+            let mut deleted = if !ids.is_empty() {
+                engine.delete_batch(ids).map_err(to_py_runtime)?
+            } else {
+                0
+            };
+            if has_filter {
+                deleted += engine.delete_where(&parsed_filter).map_err(to_py_runtime)?;
+            }
+            Ok(deleted)
         })
     }
 
@@ -327,14 +381,14 @@ impl Database {
             Some(&parsed_filter)
         };
         py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine.count_with_filter(filter_ref).map_err(to_py_runtime)
         })
     }
 
     fn get(&self, py: Python<'_>, id: String) -> PyResult<Option<PyObject>> {
         let got = py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine.get(&id).map_err(to_py_runtime)
         })?;
         Ok(match got {
@@ -345,7 +399,7 @@ impl Database {
 
     fn get_many(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<PyObject> {
         let results = py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine.get_many(&ids).map_err(to_py_runtime)
         })?;
         let py_list = PyList::empty_bound(py);
@@ -359,7 +413,7 @@ impl Database {
     }
 
     fn list_all(&self, _py: Python<'_>) -> PyResult<Vec<String>> {
-        let engine = self.engine.read().unwrap();
+        let engine = self.read_engine()?;
         Ok(engine.list_all())
     }
 
@@ -411,7 +465,7 @@ impl Database {
         let inc = parse_include_set(include, &["id", "score", "metadata", "document"]);
 
         let results = py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine
                 .search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size, _use_ann)
                 .map_err(to_py_runtime)
@@ -454,7 +508,7 @@ impl Database {
         n_refinements: Option<usize>,
     ) -> PyResult<()> {
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine
                 .create_index_with_params(
                     max_degree.unwrap_or(32),
@@ -469,7 +523,7 @@ impl Database {
 
     fn stats(&self, py: Python<'_>) -> PyResult<PyObject> {
         let stats = {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine.stats()
         };
         let dict = PyDict::new_bound(py);
@@ -503,28 +557,28 @@ impl Database {
 
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine.flush_wal_to_segment().map_err(to_py_runtime)
         })
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine.close().map_err(to_py_runtime)
         })
     }
 
     /// `len(db)` — total number of active vectors.
     fn __len__(&self) -> PyResult<usize> {
-        let engine = self.engine.read().unwrap();
+        let engine = self.read_engine()?;
         engine.count_with_filter(None).map_err(to_py_runtime)
     }
 
     /// `id in db` — True if the ID exists in the database.
     fn __contains__(&self, py: Python<'_>, id: String) -> PyResult<bool> {
         py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine.get(&id).map(|r| r.is_some()).map_err(to_py_runtime)
         })
     }
@@ -551,7 +605,7 @@ impl Database {
     ) -> PyResult<()> {
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine
                 .update_metadata_only(&id, props, document)
                 .map_err(to_py_runtime)
@@ -617,7 +671,7 @@ impl Database {
         };
 
         let batch = py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine
                 .search_batch(
                     &queries,
@@ -680,10 +734,56 @@ impl Database {
             Some(&parsed_filter)
         };
         py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine
                 .list_with_filter_page(filter_ref, limit, offset)
                 .map_err(to_py_runtime)
+        })
+    }
+
+    /// Return a ``{value: count}`` dict of all unique values of *field* across active vectors.
+    ///
+    /// Useful for enumerating distinct sources, categories, or any other metadata dimension
+    /// without a full ``list_all()`` scan.  Supports dotted paths (e.g. ``"meta.source"``).
+    /// Non-string values are stringified via their JSON representation.
+    ///
+    /// Args:
+    ///     field: Metadata field name (or dotted path) to aggregate.
+    ///
+    /// Returns:
+    ///     Dict mapping each unique field value to its occurrence count.
+    ///
+    /// Example::
+    ///
+    ///     counts = db.list_metadata_values("source")
+    ///     # → {"docs/readme.md": 42, "src/main.py": 17}
+    fn list_metadata_values(&self, py: Python<'_>, field: String) -> PyResult<PyObject> {
+        let counts = py.allow_threads(|| {
+            let engine = self.read_engine()?;
+            engine.list_metadata_values(&field).map_err(to_py_runtime)
+        })?;
+        let dict = PyDict::new_bound(py);
+        for (k, v) in counts {
+            dict.set_item(k, v)?;
+        }
+        Ok(dict.into())
+    }
+}
+
+impl Database {
+    fn read_engine(&self) -> PyResult<std::sync::RwLockReadGuard<'_, TurboQuantEngine>> {
+        self.engine.read().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "database lock poisoned: a previous operation panicked; re-open the database",
+            )
+        })
+    }
+
+    fn write_engine(&self) -> PyResult<std::sync::RwLockWriteGuard<'_, TurboQuantEngine>> {
+        self.engine.write().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "database lock poisoned: a previous operation panicked; re-open the database",
+            )
         })
     }
 }

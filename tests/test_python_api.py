@@ -341,6 +341,8 @@ class TestStats:
         assert "ram_estimate_bytes" in s
         assert s["vector_count"] == 10
         assert s["has_index"] is False
+        assert s["dimension"] == 16
+        assert s["bits"] == 4
 
     def test_stats_after_index(self, tmp_path):
         db = open_db(str(tmp_path / "db"), d=16)
@@ -448,6 +450,24 @@ class TestPersistence:
         assert got["metadata"]["key"] == "value"
         assert got["document"] == "doc text"
 
+    def test_open_parameterless_reopen(self, tmp_path):
+        path = str(tmp_path / "db")
+        db = Database.open(path, dimension=16, bits=4, metric="cosine")
+        db.insert("a", np.ones(16, dtype=np.float32))
+        del db
+
+        # Reopen without specifying any parameters — reads from manifest.json
+        db2 = Database.open(path)
+        assert db2.count() == 1
+        assert db2.get("a") is not None
+        stats = db2.stats()
+        assert stats["dimension"] == 16
+
+    def test_open_parameterless_new_db_raises(self, tmp_path):
+        path = str(tmp_path / "newdb")
+        with pytest.raises(Exception, match="dimension"):
+            Database.open(path)  # no manifest, no dimension → error
+
 
 # ---------------------------------------------------------------------------
 # count()
@@ -521,6 +541,35 @@ class TestDeleteBatch:
         assert db2.get("1") is not None
         assert db2.get("3") is not None
         assert db2.get("0") is None
+
+    def test_delete_batch_where_filter(self, tmp_path):
+        db = open_db(str(tmp_path / "db"), d=8)
+        db.insert("keep-1", np.ones(8, dtype=np.float32), metadata={"tag": "keep"})
+        db.insert("keep-2", np.ones(8, dtype=np.float32), metadata={"tag": "keep"})
+        db.insert("del-1",  np.ones(8, dtype=np.float32), metadata={"tag": "old"})
+        db.insert("del-2",  np.ones(8, dtype=np.float32), metadata={"tag": "old"})
+        deleted = db.delete_batch(where_filter={"tag": {"$eq": "old"}})
+        assert deleted == 2
+        assert db.count() == 2
+        assert db.get("keep-1") is not None
+        assert db.get("del-1") is None
+
+    def test_delete_batch_ids_and_filter_no_double_count(self, tmp_path):
+        db = open_db(str(tmp_path / "db"), d=8)
+        db.insert("a", np.ones(8, dtype=np.float32), metadata={"x": 1})
+        db.insert("b", np.ones(8, dtype=np.float32), metadata={"x": 1})
+        db.insert("c", np.ones(8, dtype=np.float32), metadata={"x": 2})
+        # "a" is in both ids and matches filter — should be counted once
+        deleted = db.delete_batch(["a"], where_filter={"x": {"$eq": 1}})
+        assert deleted == 2  # "a" + "b" (no double-count)
+        assert db.count() == 1
+        assert db.get("c") is not None
+
+    def test_delete_batch_filter_no_match(self, tmp_path):
+        db = open_db(str(tmp_path / "db"), d=8)
+        db.insert("a", np.ones(8, dtype=np.float32), metadata={"x": 1})
+        assert db.delete_batch(where_filter={"x": {"$eq": 99}}) == 0
+        assert db.count() == 1
 
 
 # ---------------------------------------------------------------------------

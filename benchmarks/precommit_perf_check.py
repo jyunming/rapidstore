@@ -104,17 +104,29 @@ HISTORY_PATH = BENCH_DIR / "perf_history.json"
 
 # Datasets run for history tracking (smaller n than full benchmark for speed)
 HISTORY_DS_CONFIGS: list[tuple[str, int, int, int]] = [
-    # (ds_label, n, d, n_queries)
-    ("glove-200",    10_000, 200,  100),
-    ("dbpedia-1536",  2_000, 1536,  30),
-    ("dbpedia-3072",  1_000, 3072,  20),
+    # (ds_label, n, d, n_queries)  — full 100k corpus
+    ("glove-200",    100_000, 200,  10_000),
+    ("dbpedia-1536", 100_000, 1536,  1_000),
+    # dbpedia-3072 (d=3072) omitted — ~6 hrs/commit, too expensive for CI history
 ]
 
-# Same config set tracked by perf_tracker.py CONFIGS (brute only for precommit speed)
-HISTORY_BENCH_CONFIGS: list[tuple[int, bool]] = [
-    (4, False),  # b=4 rerank=F brute
-    (4, True),   # b=4 rerank=T brute
+# Full config set matching perf_tracker.py CONFIGS: (bits, rerank, ann)
+HISTORY_BENCH_CONFIGS: list[tuple[int, bool, bool]] = [
+    (2, False, False),  # b=2 rerank=F brute
+    (2, True,  False),  # b=2 rerank=T brute
+    (4, False, False),  # b=4 rerank=F brute
+    (4, True,  False),  # b=4 rerank=T brute
+    (2, False, True),   # b=2 rerank=F ANN
+    (2, True,  True),   # b=2 rerank=T ANN
+    (4, False, True),   # b=4 rerank=F ANN
+    (4, True,  True),   # b=4 rerank=T ANN
 ]
+
+# ANN index params (consistent with "Balanced" preset in README)
+ANN_MAX_DEGREE      = 32
+ANN_EF_CONSTRUCTION = 200
+ANN_N_REFINEMENTS   = 5
+ANN_SEARCH_LIST     = 200
 
 HISTORY_QUERY_ROUNDS = 3  # fewer rounds than gate check; just for trending
 
@@ -133,10 +145,11 @@ def _git_info() -> tuple[str, str]:
     )
 
 
-def _config_key(bits: int, rerank: bool) -> str:
-    """Key prefix matching paper_recall_bench.py config_label format."""
+def _config_key(bits: int, rerank: bool, ann: bool = False) -> str:
+    """Key prefix matching perf_tracker.py CONFIGS format."""
     rr = "rerankT" if rerank else "rerankF"
-    return f"b{bits}_{rr}_brute"
+    mode = "ANN" if ann else "brute"
+    return f"b{bits}_{rr}_{mode}"
 
 
 def _run_one_config_for_history(
@@ -145,6 +158,7 @@ def _run_one_config_for_history(
     true_top1s: list[str],
     bits: int,
     rerank: bool,
+    ann: bool = False,
 ) -> dict:
     """Run one config, return metrics matching perf_history.json key suffixes."""
     import tqdb as tq  # noqa: PLC0415
@@ -153,26 +167,54 @@ def _run_one_config_for_history(
     ids = [f"vec_{i}" for i in range(n)]
     max_k = 8
 
+    # Lazy-import CpuRamSampler for realistic RSS-delta RAM measurement
+    _CpuRamSampler = None
+    try:
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location("bench_core", Path(__file__).parent / "bench_core.py")
+        if _spec is not None:
+            _bc = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_bc)  # type: ignore[union-attr]
+            _CpuRamSampler = _bc.CpuRamSampler
+    except Exception:
+        pass
+
     # Ingest pass — single round (trending, not gating)
     with tempfile.TemporaryDirectory() as db_dir:
-        db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip")
-        t0 = time.perf_counter()
-        for start in range(0, n, CHUNK_SIZE):
-            db.insert_batch(ids[start:start + CHUNK_SIZE], corpus[start:start + CHUNK_SIZE])
-        db.flush()
-        ingest_s = time.perf_counter() - t0
-        ram_mb = db.stats()["ram_estimate_bytes"] / (1 << 20)
-        db.close()
-        disk_mb = sum(
-            p.stat().st_size for p in Path(db_dir).iterdir() if p.is_file()
-        ) / (1 << 20)
+        sampler = _CpuRamSampler() if _CpuRamSampler else None
+        try:
+            if sampler:
+                sampler.start()
+            db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip")
+            t0 = time.perf_counter()
+            for start in range(0, n, CHUNK_SIZE):
+                db.insert_batch(ids[start:start + CHUNK_SIZE], corpus[start:start + CHUNK_SIZE])
+            db.flush()
+            ingest_s = time.perf_counter() - t0
+            # Use deterministic structural estimate — avoids RSS noise from GC/mmap faulting
+            ram_mb = db.stats()["ram_estimate_bytes"] / (1 << 20)
+            db.close()
+            # Reopen then close to trim pre-allocated mmap capacity before measuring disk
+            tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip").close()
+            disk_mb = sum(
+                p.stat().st_size for p in Path(db_dir).iterdir() if p.is_file()
+            ) / (1 << 20)
+        finally:
+            if sampler:
+                sampler.stop()
 
-    # Query pass
+    # Query pass (with optional ANN index)
     with tempfile.TemporaryDirectory() as db_dir:
         db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip")
         for start in range(0, n, CHUNK_SIZE):
             db.insert_batch(ids[start:start + CHUNK_SIZE], corpus[start:start + CHUNK_SIZE])
         db.flush()
+        if ann:
+            db.create_index(
+                max_degree=ANN_MAX_DEGREE,
+                ef_construction=ANN_EF_CONSTRUCTION,
+                n_refinements=ANN_N_REFINEMENTS,
+            )
 
         min_lats = [float("inf")] * len(qs)
         last_returned: list[list[str]] = []
@@ -180,7 +222,11 @@ def _run_one_config_for_history(
             round_ret: list[list[str]] = []
             for j, q in enumerate(qs):
                 t0 = time.perf_counter()
-                results = db.search(q, top_k=max_k)
+                results = db.search(
+                    q, top_k=max_k,
+                    _use_ann=ann,
+                    ann_search_list_size=ANN_SEARCH_LIST if ann else None,
+                )
                 min_lats[j] = min(min_lats[j], (time.perf_counter() - t0) * 1000)
                 round_ret.append([r["id"] for r in results])
             if rnd == HISTORY_QUERY_ROUNDS - 1:
@@ -202,12 +248,12 @@ def _run_one_config_for_history(
             mrr_vals.append(0.0)
 
     return {
-        "r1at1":        round(r1at1, 4),
-        "throughput":   round(n / ingest_s),
-        "p50_ms":       round(float(np.percentile(lats, 50)), 3),
-        "disk_mb":      round(disk_mb, 2),
-        "ram_delta_mb": round(ram_mb, 1),
-        "mrr":          round(float(np.mean(mrr_vals)), 4),
+        "r1at1":          round(r1at1, 4),
+        "throughput":     round(n / ingest_s),
+        "p50_ms":         round(float(np.percentile(lats, 50)), 3),
+        "disk_mb":        round(disk_mb, 2),
+        "ram_estimate_mb": round(ram_mb, 1),
+        "mrr":            round(float(np.mean(mrr_vals)), 4),
     }
 
 
@@ -236,15 +282,32 @@ def _append_perf_history() -> None:
         "results":    {},
     }
 
+    # Cache dir is gitignored and survives git checkouts — safe to read at any commit
+    _CACHE_DIR = Path(__file__).parent / "_paper_bench_cache"
+
     for ds_label, n, d, n_queries in HISTORY_DS_CONFIGS:
         print(f"  [history] {ds_label}  n={n:,}  d={d}", flush=True)
-        corpus, qs, _ = load_data(n, d, n_queries, seed=42)
+        corpus: "np.ndarray"
+        qs: "np.ndarray"
+        if ds_label.startswith("dbpedia-"):
+            dim = int(ds_label.split("-")[1])
+            tag = f"dbpedia{dim}"
+            _ckpt_vecs  = _CACHE_DIR / f"{tag}_100000_vecs.npy"
+            _ckpt_qvecs = _CACHE_DIR / f"{tag}_1000_qvecs.npy"
+            if _ckpt_vecs.exists() and _ckpt_qvecs.exists():
+                corpus = np.load(_ckpt_vecs)[:n]
+                qs     = np.load(_ckpt_qvecs)[:n_queries]
+                print(f"  data: DBpedia-{dim} ({corpus.shape[0]:,} corpus, {qs.shape[0]} queries)", flush=True)
+            else:
+                corpus, qs, _ = load_data(n, d, n_queries, seed=42)
+        else:
+            corpus, qs, _ = load_data(n, d, n_queries, seed=42)
         true_top1s = [f"vec_{int(np.argmax(corpus @ q))}" for q in qs]
         ds_snap: dict = {}
-        for bits, rerank in HISTORY_BENCH_CONFIGS:
-            key = _config_key(bits, rerank)
+        for bits, rerank, ann in HISTORY_BENCH_CONFIGS:
+            key = _config_key(bits, rerank, ann)
             print(f"    {key} ...", flush=True)
-            metrics = _run_one_config_for_history(corpus, qs, true_top1s, bits, rerank)
+            metrics = _run_one_config_for_history(corpus, qs, true_top1s, bits, rerank, ann)
             for suffix, val in metrics.items():
                 ds_snap[f"{key}_{suffix}"] = val
         entry["results"][ds_label] = ds_snap
@@ -555,6 +618,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Exit 0 even on regression (records override; use for intentional tradeoffs)",
     )
+    p.add_argument(
+        "--track",
+        action="store_true",
+        help="Run full paper benchmark (N=100k, ~20 min) and append to perf_history.json. "
+             "Use before merging to main. Also enabled by TQDB_TRACK=1.",
+    )
     return p.parse_args()
 
 
@@ -610,9 +679,16 @@ def main() -> None:
         save_doc(baseline_path, doc)
         print(f"[pre-commit] ↑ baseline raised → stage: git add {baseline_path}")
 
+    # History tracking (paper benchmark, N=100k, ~20 min) is opt-in.
+    # Set TQDB_TRACK=1 or pass --track to run it.  Never runs automatically
+    # in the pre-commit hook — call manually before merging to main:
+    #   TQDB_TRACK=1 python benchmarks/precommit_perf_check.py
+    track = getattr(args, "track", False) or os.environ.get("TQDB_TRACK", "").strip() not in ("", "0")
+
     if not failures:
         print("[pre-commit] ✓ all metrics within 5% of best")
-        _append_perf_history()
+        if track:
+            _append_perf_history()
         return
 
     print("\n[pre-commit] FAIL — regression(s) detected:")
@@ -624,7 +700,8 @@ def main() -> None:
             "\n[pre-commit] ⚠ override active (--force / TQDB_PERF_SKIP=1) — "
             "proceeding despite regression"
         )
-        _append_perf_history()
+        if track:
+            _append_perf_history()
         return
 
     print(

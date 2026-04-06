@@ -21,7 +21,9 @@ from tqdb import Database
 
 db = Database.open(
     path,                    # str — base directory path, created if it doesn't exist
-    dimension,               # int — vector dimension, must match on every reopen
+    dimension=None,          # int|None — vector dimension. Required for new databases.
+                             #            Omit to reopen an existing database — the
+                             #            dimension and fixed params are loaded from manifest.json.
     bits=4,                  # int — quantization bits (any int >= 2; 2 = highest compression,
                              #        4 = better recall (default), 8 = near-lossless)
     seed=42,                 # int — RNG seed for quantizer, must stay the same across sessions
@@ -33,10 +35,18 @@ db = Database.open(
                              #            "f32" = float32 exact reranking (+n×d×4 bytes)
     collection=None,         # str|None — subdirectory name for the collection; if given,
                              #            the DB is stored at path/collection/ instead of path/
+    normalize=False,         # bool — L2-normalize every inserted vector and every query at
+                             #        write time; makes inner-product scoring equivalent to
+                             #        cosine similarity without changing the metric parameter
 )
+
+# Parameterless reopen — reads all parameters from manifest.json:
+db = Database.open("./mydb")
 ```
 
-`path` must use the same `dimension`, `bits`, `seed`, and `metric` every time it is opened — these are baked into the quantizer and cannot be changed after creation.
+When reopening an existing database, `dimension` may be omitted; `bits`, `seed`, and `metric` are loaded from the stored `manifest.json` automatically.  `dimension` is required only when creating a new database (no manifest present).
+
+Pass an `s3://bucket/prefix` URI (requires the `cloud` Cargo feature) to store segments in Amazon S3 with a local write-through cache (see [On-disk Layout](#on-disk-layout)).
 
 ### Multi-collection pattern
 
@@ -120,7 +130,13 @@ db.update(id, vector, metadata=None, document=None)  # raises RuntimeError if id
 
 ```python
 db.delete(id)                    # bool — True if id existed
-db.delete_batch(ids)             # → int — count of ids that were deleted
+db.delete_batch(                 # → int — count of ids that were deleted
+    ids=[],                      # list[str] — explicit IDs to delete (may be empty)
+    where_filter=None,           # dict | None — delete all vectors matching this filter
+)                                #   Examples:
+                                 #     db.delete_batch(["id1", "id2"])
+                                 #     db.delete_batch(where_filter={"year": {"$lt": 2020}})
+                                 #     db.delete_batch(["id1"], where_filter={"tag": "old"})
 
 db.get(id)                       # dict | None — {id, metadata, document}
 db.get_many(ids)                 # list[dict | None]
@@ -139,12 +155,30 @@ db.update_metadata(
     document=None,               # str | None — replaces document; None = keep existing
 )
 
-db.stats()                       # dict — vector_count, disk_bytes, has_index, …
+db.stats()                       # dict — see Stats Keys below
+db.flush()                       # flush WAL to a segment file immediately
+db.close()                       # flush and release all file handles
 
 # Python container protocol
 len(db)                          # int — number of active vectors
 "my-id" in db                    # bool — True if id exists
 ```
+
+**Stats keys** returned by `db.stats()`:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `vector_count` | `int` | Total active (non-deleted) vectors |
+| `segment_count` | `int` | Number of immutable segment files |
+| `buffered_vectors` | `int` | Vectors in the WAL (not yet flushed) |
+| `dimension` | `int` | Vector dimension |
+| `bits` | `int` | Quantization bits |
+| `total_disk_bytes` | `int` | Total on-disk footprint in bytes |
+| `has_index` | `bool` | Whether a HNSW index has been built |
+| `index_nodes` | `int` | Number of nodes in the HNSW graph |
+| `live_codes_bytes` | `int` | Size of the in-memory quantized codes buffer |
+| `live_slot_count` | `int` | Allocated slots in the live slab |
+| `ram_estimate_bytes` | `int` | Estimated total in-memory footprint |
 
 ---
 
@@ -252,6 +286,23 @@ Filter semantics:
 - `$contains` does substring matching on string fields only
 - No implicit type coercion — `{"year": "2023"}` will not match `{"year": 2023}`
 
+### Enumerating metadata values
+
+Use `list_metadata_values` to discover all distinct values for a field — useful for building filter UIs or faceted search:
+
+```python
+counts = db.list_metadata_values("topic")
+# {"finance": 120, "ml": 84, "sports": 31, ...}
+```
+
+Returns a `dict[str, int]` mapping each distinct non-null value to its occurrence count across active vectors. Supports dotted paths (e.g. `"profile.region"`). Non-string values are stringified via their JSON representation.
+
+---
+
+## Hybrid search (post-index inserts)
+
+Vectors inserted **after** `create_index()` are still searched correctly. The engine automatically detects "dark slots" (active but not yet indexed) and runs a targeted brute-force scan over them, merging results with the HNSW candidates before returning top-k. There is no extra configuration required; the fallback incurs zero overhead when all vectors are indexed.
+
 ---
 
 ## RAG Integration
@@ -296,6 +347,73 @@ for r in results:
 ```
 
 Returns a `list[dict]` with keys: `"text"`, `"metadata"`, `"score"`.
+
+---
+
+## ChromaDB Compatibility Shim
+
+`tqdb.chroma_compat` provides a drop-in `PersistentClient` that mirrors the chromadb ≥ 1.5 API. Each collection is stored as a `tqdb.Database` under `{path}/{collection_name}/`.
+
+```python
+from tqdb.chroma_compat import PersistentClient
+
+client = PersistentClient(path="/data/chroma")
+col = client.get_or_create_collection("docs", metadata={"hnsw:space": "cosine"})
+
+col.add(ids=["a", "b"], embeddings=[[0.1, ...], [0.2, ...]], metadatas=[{"src": "web"}, {}])
+col.upsert(ids=["a"], embeddings=[[0.3, ...]], metadatas=[{"src": "updated"}])
+
+results = col.query(query_embeddings=[[0.1, ...]], n_results=5)
+# {"ids": [[...]], "distances": [[...]], "metadatas": [[...]], "documents": [[...]]}
+
+col.delete(ids=["b"])
+col.delete(where={"src": {"$eq": "web"}})
+
+print(col.count())          # int
+print(col.peek(limit=3))    # dict same shape as query result
+```
+
+**Metric mapping:** `metadata={"hnsw:space": "cosine"}` → `metric="cosine"`, `"ip"` → inner product (default), `"l2"` → L2. The metric is fixed at collection creation and cannot be changed.
+
+**Not implemented:** `HttpClient`, `Settings`, server/cloud mode, `chromadb.Client()` (ephemeral), `where_document` filtering, automatic text embedding (pass pre-computed `embeddings`; or provide an `embedding_function` callable at collection creation time).
+
+**Where-filter operators supported:** `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$and`, `$or`, `$exists`, `$contains`.
+
+---
+
+## LanceDB Compatibility Shim
+
+`tqdb.lancedb_compat` provides a `connect()` factory mirroring the LanceDB v0/v1 Python API. Each table is stored as a `tqdb.Database` under `{uri}/{table_name}/`.
+
+```python
+from tqdb.lancedb_compat import connect
+import pyarrow as pa
+
+db = connect("/data/lancedb")
+
+# Create from PyArrow Table or list[dict] with "id" + "vector" columns
+tbl = db.create_table("docs", data=pa_table)
+tbl = db.create_table("docs", data=pa_table, mode="overwrite")  # wipe and recreate
+
+# Fluent query builder
+results = (
+    tbl.search(query_vec)
+       .metric("dot")          # "dot"/"ip" → ip, "cosine" → cosine, "l2"/"euclidean" → l2
+       .limit(10)
+       .where("id IN ('a', 'b', 'c')")
+       .to_list()               # list[dict] with all fields + "_distance"
+)
+
+tbl.delete("id IN ('a', 'b')")
+tbl.delete("status = 'archived'")
+
+print(tbl.count_rows())
+tbl.optimize()   # no-op; tqdb handles compaction automatically
+```
+
+**SQL WHERE parser:** supports `field = 'value'`, `field != 'value'`, `field IN ('a', 'b', ...)` (including `id IN (...)`), and numeric comparisons (`field > 10`, `field >= 10`, `field < 10`, `field <= 10`). More complex predicates raise `NotImplementedError`.
+
+**Not implemented:** `update(where, values)`, `merge_insert()`, `create_fts_index`, `create_scalar_index`, `drop_database`, remote/cloud URIs.
 
 ---
 

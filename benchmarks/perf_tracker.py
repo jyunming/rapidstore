@@ -28,7 +28,7 @@ BENCH_DIR    = Path(__file__).parent
 HISTORY_PATH = BENCH_DIR / "perf_history.json"
 OUTPUT_PATH  = BENCH_DIR / "_perf_history.html"
 
-DATASETS = ["glove-200", "dbpedia-1536", "dbpedia-3072"]
+DATASETS = ["glove-200", "dbpedia-1536"]
 
 # Metrics: (json_key_suffix, display_label, higher_is_better)
 METRICS = [
@@ -36,7 +36,7 @@ METRICS = [
     ("throughput",   "Throughput (vps)", True),
     ("p50_ms",       "p50 latency (ms)", False),
     ("disk_mb",      "Disk (MB)",        False),
-    ("ram_delta_mb", "RAM delta (MB)",   False),
+    ("ram_estimate_mb", "RAM estimate (MB)", False),
     ("mrr",          "MRR",              True),
 ]
 

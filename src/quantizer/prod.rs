@@ -116,6 +116,23 @@ impl ProdQuantizer {
         }
     }
 
+    /// Hamming similarity between two QJL bit codes: (matching bits) / (total bits).
+    /// Fraction of matching bits between two QJL bit codes.  Returns a value in
+    /// [0, 1] where 1 = identical codes and 0.5 = random (expected value for
+    /// independent bits).  Distinct from the free function [`hamming_score`]
+    /// which returns a centred value in [−1, 1].  Used as a proxy for inner-product
+    /// proximity during HNSW construction when raw vectors are unavailable.
+    pub fn hamming_proximity(&self, from_qjl: &[u8], to_qjl: &[u8]) -> f64 {
+        let n_bytes = from_qjl.len().min(to_qjl.len());
+        if n_bytes == 0 {
+            return 0.5;
+        }
+        let matching_bits: u32 = (0..n_bytes)
+            .map(|i| (!(from_qjl[i] ^ to_qjl[i])).count_ones())
+            .sum();
+        matching_bits as f64 / (n_bytes as f64 * 8.0)
+    }
+
     /// Build a `PreparedIpQueryLite` directly from stored MSE codes without any SRHT.
     ///
     /// Each `y[i]` is set to `centroids[idx[i]]` — the quantized approximation of the
@@ -559,6 +576,7 @@ impl ProdQuantizer {
     /// with Hamming distance gives a fast (~64× cheaper than LUT) proxy for inner
     /// product proximity, enabling fast HNSW navigation followed by accurate LUT
     /// re-scoring of the final candidate set.
+    #[allow(dead_code)]
     pub(crate) fn prepare_navigation_bits(&self, query: &Array1<f64>) -> Vec<u8> {
         let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
         let (_, qjl_bits, _) = self.quantize(&query_f32);
@@ -574,6 +592,7 @@ impl ProdQuantizer {
 ///
 /// The shorter slice determines the number of bits compared; any extra bytes in
 /// the longer slice are ignored.
+#[allow(dead_code)]
 pub(crate) fn hamming_score(a: &[u8], b: &[u8]) -> f64 {
     let n_bytes = a.len().min(b.len());
     if n_bytes == 0 {

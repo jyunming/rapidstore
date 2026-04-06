@@ -7,7 +7,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const WAL_MAGIC: &[u8; 4] = b"TQWV";
-const WAL_VERSION: u32 = 4;
+const WAL_VERSION: u32 = 5;
 
 /// On-disk V3 entry — MSE indices stored as bit-packed bytes.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -104,8 +104,13 @@ impl Wal {
                 bincode::serialize(entry)?
             };
             let len = encoded.len() as u64;
-            self.writer.write_all(&len.to_le_bytes())?;
+            let len_bytes = len.to_le_bytes();
+            self.writer.write_all(&len_bytes)?;
             self.writer.write_all(&encoded)?;
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&len_bytes);
+            hasher.update(&encoded);
+            self.writer.write_all(&hasher.finalize().to_le_bytes())?;
             self.entry_count += 1;
         }
         self.writer.flush()?;
@@ -142,14 +147,15 @@ impl Wal {
             return Ok(Vec::new());
         };
 
-        if version != WAL_VERSION {
+        if version < 4 || version > WAL_VERSION {
             return Err(format!(
-                "Unsupported WAL version {} (expected {}). \
+                "Unsupported WAL version {} (supported: 4–{}). \
                  The WAL format changed; delete wal.log to start fresh.",
                 version, WAL_VERSION
             )
             .into());
         }
+        let use_crc = version >= 5;
 
         let mut entries = Vec::new();
         loop {
@@ -167,7 +173,26 @@ impl Wal {
                 Err(_) => break,
             }
 
-            // V4: packed MSE indices with norm field.
+            if use_crc {
+                let mut crc_buf = [0u8; 4];
+                if file.read_exact(&mut crc_buf).is_err() {
+                    // CRC bytes not fully written (truncated entry) — stop here.
+                    break;
+                }
+                let stored = u32::from_le_bytes(crc_buf);
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&len_buf);
+                hasher.update(&payload);
+                if stored != hasher.finalize() {
+                    eprintln!(
+                        "WAL CRC32 mismatch at entry {}; truncating replay here.",
+                        entries.len()
+                    );
+                    break;
+                }
+            }
+
+            // V4/V5: packed MSE indices with norm field.
             match bincode::deserialize::<WalEntryPacked>(&payload) {
                 Ok(packed) => {
                     let quantized_indices = if packed.is_deleted || packed.packed_mse.is_empty() {
@@ -263,7 +288,7 @@ mod tests {
         let data = std::fs::read(&path).unwrap();
         assert!(data.len() >= 8, "file should have header");
         assert_eq!(&data[0..4], b"TQWV");
-        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 4u32);
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 5u32);
     }
 
     #[test]
@@ -496,6 +521,112 @@ mod tests {
         assert!(
             file_size > 8,
             "WAL should have data after append: size={file_size}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CRC32 checksums (v5)
+    // -----------------------------------------------------------------------
+
+    /// A v4 WAL file (no CRC32) should still replay without errors.
+    #[test]
+    fn wal_v4_legacy_file_replays_without_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal_v4.bin");
+
+        // Construct a v4 file manually (header v=4, two tombstone entries, no CRC).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"TQWV");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        for id in &["a", "b"] {
+            let packed = WalEntryPacked {
+                id: id.to_string(),
+                packed_mse: vec![],
+                qjl_bits: vec![],
+                gamma: 0.0,
+                norm: 0.0,
+                metadata_json: "{}".to_string(),
+                is_deleted: true,
+            };
+            let encoded = bincode::serialize(&packed).unwrap();
+            let len = encoded.len() as u64;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(&encoded);
+        }
+        std::fs::write(&path, &buf).unwrap();
+
+        let replayed = Wal::replay(&path, None).unwrap();
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[0].id, "a");
+        assert_eq!(replayed[1].id, "b");
+    }
+
+    /// A v5 entry with a corrupted CRC32 must stop replay at that entry.
+    #[test]
+    fn wal_crc32_mismatch_stops_replay_at_corrupt_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal_crc.bin");
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"TQWV");
+        buf.extend_from_slice(&5u32.to_le_bytes());
+        for (i, id) in ["e1", "e2", "e3"].iter().enumerate() {
+            let packed = WalEntryPacked {
+                id: id.to_string(),
+                packed_mse: vec![],
+                qjl_bits: vec![],
+                gamma: 0.0,
+                norm: 0.0,
+                metadata_json: "{}".to_string(),
+                is_deleted: true,
+            };
+            let encoded = bincode::serialize(&packed).unwrap();
+            let len = encoded.len() as u64;
+            let len_bytes = len.to_le_bytes();
+            buf.extend_from_slice(&len_bytes);
+            buf.extend_from_slice(&encoded);
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&len_bytes);
+            hasher.update(&encoded);
+            let crc = hasher.finalize();
+            if i == 1 {
+                // Corrupt entry 2's CRC by flipping bits.
+                buf.extend_from_slice(&(crc ^ 0xDEAD_BEEF).to_le_bytes());
+            } else {
+                buf.extend_from_slice(&crc.to_le_bytes());
+            }
+        }
+        std::fs::write(&path, &buf).unwrap();
+
+        let replayed = Wal::replay(&path, None).unwrap();
+        // Only entry 1 should be recovered; replay stops at entry 2's bad CRC.
+        assert_eq!(replayed.len(), 1, "corrupt CRC should stop replay");
+        assert_eq!(replayed[0].id, "e1");
+    }
+
+    /// A truncated payload (incomplete write) must still allow earlier entries to replay.
+    #[test]
+    fn wal_truncated_entry_allows_prior_entries_to_replay() {
+        let pq = make_pq();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal_trunc.bin");
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.set_quantizer(Arc::clone(&pq));
+            wal.append(&real_entry("ok1", &pq), false).unwrap();
+            wal.append(&real_entry("ok2", &pq), false).unwrap();
+        }
+        // Append a truncated entry (write len but only half the payload + no CRC).
+        let mut raw = std::fs::read(&path).unwrap();
+        raw.extend_from_slice(&999u64.to_le_bytes()); // claims 999-byte payload
+        raw.extend_from_slice(&[0xAB; 10]); // only 10 bytes of garbage
+        std::fs::write(&path, &raw).unwrap();
+
+        let replayed = Wal::replay(&path, Some(&pq)).unwrap();
+        assert_eq!(
+            replayed.len(),
+            2,
+            "two complete entries should survive despite truncated tail"
         );
     }
 }

@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TurboQuantDB - The Zero-Training Quantized Vector Database</title>
+    <meta name="description" content="TurboQuantDB: An embedded vector database implementing the TurboQuant algorithm for 2-4 bit compression and zero training time.">
+    
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="bg-glow bg-glow-1"></div>
+    <div class="bg-glow bg-glow-2"></div>
+
+    <nav class="navbar glass-panel">
+        <div class="nav-brand">
+            <span class="logo-text">TurboQuant<span class="accent">DB</span></span>
+        </div>
+        <div class="nav-links">
+            <a href="#features">Features</a>
+            <a href="#quickstart">Quick Start</a>
+            <a href="#benchmarks">Benchmarks</a>
+            <a href="https://github.com/jyunming/TurboQuantDB" class="btn btn-outline" target="_blank">GitHub</a>
+        </div>
+    </nav>
+
+    <header class="hero">
+        <div class="hero-content fade-in-up">
+            <div class="badge">v0.3.0 Released</div>
+            <h1 class="hero-title">Massive embedding datasets.<br>Lightweight hardware.</h1>
+            <p class="hero-subtitle">
+                An embedded vector database in Rust with Python bindings. Implementing the <strong>TurboQuant algorithm</strong> for zero-training, 2–4 bit compression, and unbiased inner product estimation.
+            </p>
+            
+            <div class="install-card glass-panel flex-row">
+                <code class="install-code">pip install tqdb</code>
+                <button class="copy-btn tooltip" data-tooltip="Copy" onclick="copyInstallCmd()">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                </button>
+            </div>
+
+            <div class="hero-actions">
+                <a href="#quickstart" class="btn btn-primary">Get Started</a>
+                <a href="https://arxiv.org/abs/2504.19874" class="btn btn-secondary" target="_blank">Read Paper</a>
+            </div>
+        </div>
+    </header>
+
+    <section id="features" class="section">
+        <div class="section-header fade-in-up">
+            <h2>Why TurboQuantDB?</h2>
+            <p>Rethinking vector databases for the era of billion-scale datasets on laptops.</p>
+        </div>
+
+        <div class="features-grid">
+            <div class="feature-card glass-panel fade-in-up" style="animation-delay: 0.1s">
+                <div class="feature-icon">⚡</div>
+                <h3>Zero Training</h3>
+                <p>No <code>train()</code> step required. Vectors are quantized and stored immediately on insert.</p>
+            </div>
+            <div class="feature-card glass-panel fade-in-up" style="animation-delay: 0.2s">
+                <div class="feature-icon">🗜️</div>
+                <h3>10× Compression</h3>
+                <p>Reduces 1536-dim float32 embeddings from 586 MB to 59 MB at 100k vectors using 2-bit quantization.</p>
+            </div>
+            <div class="feature-card glass-panel fade-in-up" style="animation-delay: 0.3s">
+                <div class="feature-icon">🎯</div>
+                <h3>Unbiased Scoring</h3>
+                <p>The combination of QR rotation and QJL guarantees unbiased inner product estimation.</p>
+            </div>
+            <div class="feature-card glass-panel fade-in-up" style="animation-delay: 0.4s">
+                <div class="feature-icon">🔍</div>
+                <h3>Metadata Filtering</h3>
+                <p>MongoDB-style filter operators ($eq, $gt, $in, $exists, $contains) on any metadata field. Bulk deletes by filter with <code>delete_batch(where_filter=...)</code>.</p>
+            </div>
+        </div>
+    </section>
+
+    <section id="quickstart" class="section bg-darker">
+        <div class="quickstart-container fade-in-up">
+            <div class="quickstart-text">
+                <h2>Quick Start</h2>
+                <p>TurboQuantDB runs in-process with a Python-native API. No daemon, no external servers.</p>
+                <ul class="benefit-list">
+                    <li>Built with PyO3 and Maturin — no daemon required</li>
+                    <li>Write-ahead log (WAL) + CRC32 crash recovery</li>
+                    <li>LangChain, ChromaDB, and LanceDB compatible</li>
+                    <li>Parameterless reopen from stored manifest</li>
+                </ul>
+            </div>
+            
+            <div class="code-window glass-panel">
+                <div class="code-header">
+                    <div class="mac-buttons">
+                        <span></span><span></span><span></span>
+                    </div>
+                    <div class="code-title">example.py</div>
+                    <button class="copy-btn copy-code" data-target="python-code">Copy</button>
+                </div>
+                <pre><code id="python-code" class="language-python">import numpy as np
+from tqdb import Database
+
+# Create database (dimension required on first open)
+db = Database.open("./my_db", dimension=1536, bits=4, rerank=True)
+
+# Insert documents and metadata
+db.insert("doc-1",
+    np.random.randn(1536).astype("f4"),
+    metadata={"topic": "ml", "year": 2026},
+    document="Machine learning intro"
+)
+db.close()
+
+# Reopen later — no need to specify dimension or other params
+db = Database.open("./my_db")
+
+# Search with MongoDB-style filter
+results = db.search(
+    np.random.randn(1536).astype("f4"),
+    top_k=5,
+    filter={"year": {"$gte": 2026}}
+)
+for r in results:
+    print(r["id"], r["score"], r["document"])
+
+# Bulk delete by metadata filter
+deleted = db.delete_batch(where_filter={"year": {"$lt": 2020}})</code></pre>
+            </div>
+        </div>
+    </section>
+
+    <section id="how-it-works" class="section">
+        <div class="section-header fade-in-up">
+            <h2>TurboQuant Explained</h2>
+            <p>Interactive visualization of Online Vector Quantization with Near-optimal Distortion Rate.</p>
+        </div>
+
+        <div class="explainer-nav fade-in-up">
+            <div class="step-progress-bar"></div>
+            <div class="step-item active" data-step="0">
+                <div class="step-icon"><svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"></path><path d="M21 3v5h-5"></path></svg></div>
+                <span>1. Random Rotation</span>
+            </div>
+            <div class="step-item" data-step="1">
+                <div class="step-icon"><svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><path d="M4 14V4a2 2 0 0 1 2-2h10"></path><path d="M20 10v10a2 2 0 0 1-2 2H8"></path><path d="M14 2v4a2 2 0 0 0 2 2h4"></path><path d="M8 11h.01"></path><path d="M16 11h.01"></path><path d="M12 15h.01"></path><path d="M12 19h.01"></path></svg></div>
+                <span>2. MSE Quantization</span>
+            </div>
+            <div class="step-item" data-step="2">
+                <div class="step-icon"><svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"></path><circle cx="12" cy="12" r="3"></circle></svg></div>
+                <span>3. Residual QJL</span>
+            </div>
+        </div>
+
+        <div class="explainer-card glass-panel fade-in-up">
+            <div class="explainer-content" id="explainer-step-content">
+                <!-- Content will be dynamically swapped by JS -->
+                <div class="step-info">
+                    <h3 id="step-title">The "Turbo" Trick: Random Rotation</h3>
+                    <p id="step-desc">Real-world data can be highly skewed. TurboQuant applies a random rotation matrix to transform coordinates into a predictable Normal distribution.</p>
+                    <div id="step-controls">
+                        <!-- Step specific controls like "Apply Rotation" or "Bits Toggle" -->
+                    </div>
+                </div>
+                <div class="step-visual" id="step-visual-container">
+                    <!-- SVG / Canvas visualization area -->
+                </div>
+            </div>
+            
+            <div class="explainer-footer">
+                <button id="prev-step" class="btn btn-secondary" disabled>← Previous</button>
+                <button id="next-step" class="btn btn-primary">Next Step →</button>
+            </div>
+        </div>
+    </section>
+
+    <section id="ecosystem" class="section bg-darker">
+        <div class="section-header fade-in-up">
+            <h2>Developer Ecosystem</h2>
+            <p>More than just a library — a complete vector database infrastructure.</p>
+        </div>
+
+        <div class="ecosystem-grid">
+            <div class="eco-card glass-panel fade-in-up" style="animation-delay: 0.1s">
+                <div class="eco-icon">🚀</div>
+                <h3>Server Mode</h3>
+                <p>Axum-based HTTP service with multi-tenancy, RBAC, quotas, Prometheus metrics, and async jobs.</p>
+                <a href="https://github.com/jyunming/TurboQuantDB/tree/main/server" class="eco-link">Explore Server →</a>
+            </div>
+            <div class="eco-card glass-panel fade-in-up" style="animation-delay: 0.2s">
+                <div class="eco-icon">🦜</div>
+                <h3>RAG Integration</h3>
+                <p>First-class support for LangChain with the <code>TurboQuantRetriever</code> wrapper.</p>
+                <a href="https://github.com/jyunming/TurboQuantDB/blob/main/python/tqdb/rag.py" class="eco-link">View Wrapper →</a>
+            </div>
+            <div class="eco-card glass-panel fade-in-up" style="animation-delay: 0.3s">
+                <div class="eco-icon">🔄</div>
+                <h3>ChromaDB Drop-in</h3>
+                <p>Migrate existing ChromaDB apps with zero code changes using <code>tqdb.chroma_compat</code>. Full filter support.</p>
+                <a href="https://github.com/jyunming/TurboQuantDB/blob/main/python/tqdb/chroma_compat.py" class="eco-link">View Shim →</a>
+            </div>
+            <div class="eco-card glass-panel fade-in-up" style="animation-delay: 0.4s">
+                <div class="eco-icon">⚙️</div>
+                <h3>LanceDB Compatible</h3>
+                <p>Use <code>tqdb.lancedb_compat</code> as a LanceDB backend replacement. PyArrow ingestion and SQL WHERE filters.</p>
+                <a href="https://github.com/jyunming/TurboQuantDB/blob/main/python/tqdb/lancedb_compat.py" class="eco-link">View Shim →</a>
+            </div>
+            <div class="eco-card glass-panel fade-in-up" style="animation-delay: 0.5s">
+                <div class="eco-icon">☁️</div>
+                <h3>S3 Storage</h3>
+                <p>Store segments in Amazon S3 with a write-through local cache. Enable with <code>--features cloud</code>.</p>
+            </div>
+            <div class="eco-card glass-panel fade-in-up" style="animation-delay: 0.6s">
+                <div class="eco-icon">🏎️</div>
+                <h3>SIMD Accelerated</h3>
+                <p>AVX2/FMA intrinsics for FWHT and bit-unpacking. Sequential brute-force for small corpora avoids scheduler overhead.</p>
+            </div>
+        </div>
+    </section>
+
+    <footer class="footer">
+        <div class="footer-content">
+            <div class="footer-brand">
+                <span class="logo-text">TurboQuant<span class="accent">DB</span></span>
+                <p>Massive embedding datasets on lightweight hardware.</p>
+            </div>
+            <div class="footer-links">
+                <div class="footer-col">
+                    <h4>Resources</h4>
+                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md">Documentation</a>
+                    <a href="https://github.com/jyunming/TurboQuantDB">GitHub</a>
+                    <a href="https://pypi.org/project/tqdb/">PyPI</a>
+                </div>
+            </div>
+        </div>
+        <div class="footer-bottom">
+            <p>&copy; 2026 TurboQuantDB. Apache 2.0 License.</p>
+        </div>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>

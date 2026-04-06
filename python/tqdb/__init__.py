@@ -17,6 +17,8 @@ Quick start::
 See ``Database.open`` for all parameters and ``Database.search`` for filter syntax.
 """
 from .tqdb import Database, TurboQuantDB
+from .chroma_compat import CompatClient as ChromaCompatClient, PersistentClient
+from .lancedb_compat import connect as lancedb_connect
 from importlib.metadata import version, PackageNotFoundError
 
 try:
@@ -24,4 +26,11 @@ try:
 except PackageNotFoundError:
     __version__ = "0.0.0"
 
-__all__ = ["Database", "TurboQuantDB", "__version__"]
+__all__ = [
+    "Database",
+    "TurboQuantDB",
+    "__version__",
+    "ChromaCompatClient",
+    "PersistentClient",
+    "lancedb_connect",
+]

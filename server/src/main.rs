@@ -4,6 +4,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use metrics_exporter_prometheus::PrometheusHandle;
 use ndarray::Array1;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -11,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
 use tqdb::storage::engine::{BatchWriteItem, DistanceMetric, GetResult, TurboQuantEngine};
 
@@ -22,6 +23,10 @@ struct AppState {
     jobs: Arc<Mutex<JobStore>>,
     storage: StorageConfig,
     job_worker_concurrency: usize,
+    metrics_handle: PrometheusHandle,
+    /// Last time `collect_collection_gauges` ran.  Shared across clones so
+    /// concurrent requests do not all trigger a full directory scan.
+    last_gauge_collect: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 #[derive(Clone)]
@@ -112,6 +117,7 @@ enum JobType {
     Compact,
     IndexBuild,
     Snapshot,
+    Restore,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,7 +167,7 @@ fn build_batch_items(
     (0..ids.len())
         .map(|i| BatchWriteItem {
             id: ids[i].clone(),
-            vector: Array1::from(embeddings[i].clone()),
+            vector: embeddings[i].iter().map(|&x| x as f32).collect(),
             metadata: metadatas
                 .and_then(|m| m.get(i).cloned())
                 .unwrap_or_default(),
@@ -340,18 +346,20 @@ struct DeleteCollectionResponse {
     deleted: bool,
 }
 
+/// All job-enqueue endpoints are always asynchronous.  The `async` field was
+/// previously accepted but silently ignored; it is removed to avoid misleading
+/// callers into thinking synchronous execution is supported.
 #[derive(Deserialize)]
-struct CompactRequest {
-    r#async: Option<bool>,
-}
+struct CompactRequest {}
 #[derive(Deserialize)]
-struct IndexRequest {
-    r#async: Option<bool>,
-}
+struct IndexRequest {}
 #[derive(Deserialize)]
 struct SnapshotRequest {
-    r#async: Option<bool>,
     snapshot_name: Option<String>,
+}
+#[derive(Deserialize)]
+struct RestoreRequest {
+    snapshot_name: String,
 }
 #[derive(Deserialize)]
 struct AddVectorsRequest {
@@ -510,6 +518,10 @@ fn build_app(state: AppState) -> Router {
             post(start_snapshot_job),
         )
         .route(
+            "/v1/tenants/:tenant/databases/:database/collections/:collection/restore",
+            post(start_restore_job),
+        )
+        .route(
             "/v1/tenants/:tenant/databases/:database/collections/:collection/jobs",
             get(list_collection_jobs),
         )
@@ -520,6 +532,7 @@ fn build_app(state: AppState) -> Router {
         .route("/v1/jobs/:job_id", get(get_job_status))
         .route("/v1/jobs/:job_id/cancel", post(cancel_job))
         .route("/v1/jobs/:job_id/retry", post(retry_job))
+        .route("/metrics", get(metrics_handler))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -701,6 +714,15 @@ async fn main() {
         )
         .init();
 
+    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Prefix("tqdb_search_latency_seconds".to_string()),
+            &[0.001, 0.005, 0.010, 0.050, 0.100],
+        )
+        .expect("invalid histogram buckets")
+        .install_recorder()
+        .expect("failed to install Prometheus metrics recorder");
+
     let local_root = std::env::var("TQ_LOCAL_ROOT").unwrap_or_else(|_| "./data".to_string());
     let uri = std::env::var("TQ_STORAGE_URI").unwrap_or_else(|_| local_root.clone());
     let auth_store_path = std::env::var("TQ_AUTH_STORE_PATH")
@@ -733,6 +755,8 @@ async fn main() {
             job_store_path,
         },
         job_worker_concurrency,
+        metrics_handle,
+        last_gauge_collect: Arc::new(Mutex::new(None)),
     };
 
     dispatch_queued_jobs(&state);
@@ -753,6 +777,89 @@ async fn main() {
 
 async fn healthz() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+/// Minimum interval between full gauge collection passes.  A directory scan
+/// that opens every engine is too expensive to run on every scrape.
+const GAUGE_COLLECT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    // Only re-scan if the TTL has elapsed since the last collection.
+    let should_collect = {
+        let last = state.last_gauge_collect.lock().unwrap_or_else(|e| e.into_inner());
+        last.map_or(true, |t| t.elapsed() >= GAUGE_COLLECT_TTL)
+    };
+    if should_collect {
+        collect_collection_gauges(&state);
+        *state.last_gauge_collect.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::time::Instant::now());
+    }
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state.metrics_handle.render(),
+    )
+}
+
+fn collect_collection_gauges(state: &AppState) {
+    let tenants_dir = PathBuf::from(&state.storage.local_root).join("tenants");
+    let Ok(tenant_entries) = std::fs::read_dir(&tenants_dir) else {
+        return;
+    };
+    for tenant_entry in tenant_entries.flatten() {
+        if !tenant_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let tenant = tenant_entry.file_name().to_string_lossy().to_string();
+        let Ok(db_entries) = std::fs::read_dir(tenant_entry.path().join("databases")) else {
+            continue;
+        };
+        for db_entry in db_entries.flatten() {
+            if !db_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let database = db_entry.file_name().to_string_lossy().to_string();
+            let Ok(col_entries) = std::fs::read_dir(db_entry.path().join("collections")) else {
+                continue;
+            };
+            for col_entry in col_entries.flatten() {
+                if !col_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let collection = col_entry.file_name().to_string_lossy().to_string();
+                if !col_entry.path().join("manifest.json").exists() {
+                    continue;
+                }
+                let Ok(mut engine) =
+                    open_scoped_engine_from_manifest(state, &tenant, &database, &collection)
+                else {
+                    continue;
+                };
+                let s = engine.stats();
+                let _ = engine.close();
+                metrics::gauge!("tqdb_vectors_total",
+                    "tenant" => tenant.clone(),
+                    "database" => database.clone(),
+                    "collection" => collection.clone(),
+                )
+                .set(s.vector_count as f64);
+                metrics::gauge!("tqdb_wal_buffer_size",
+                    "tenant" => tenant.clone(),
+                    "database" => database.clone(),
+                    "collection" => collection.clone(),
+                )
+                .set(s.buffered_vectors as f64);
+                metrics::gauge!("tqdb_index_nodes",
+                    "tenant" => tenant.clone(),
+                    "database" => database.clone(),
+                    "collection" => collection.clone(),
+                )
+                .set(s.index_nodes as f64);
+            }
+        }
+    }
 }
 
 async fn auth_middleware(
@@ -996,7 +1103,7 @@ async fn add_vectors(
             }
             items.push(BatchWriteItem {
                 id: body.ids[i].clone(),
-                vector: Array1::from(body.embeddings[i].clone()),
+                vector: body.embeddings[i].iter().map(|&x| x as f32).collect(),
                 metadata: body
                     .metadatas
                     .as_ref()
@@ -1178,7 +1285,7 @@ async fn upsert_vectors(
             }
             items.push(BatchWriteItem {
                 id: body.ids[i].clone(),
-                vector: Array1::from(body.embeddings[i].clone()),
+                vector: body.embeddings[i].iter().map(|&x| x as f32).collect(),
                 metadata: body
                     .metadatas
                     .as_ref()
@@ -1358,12 +1465,15 @@ async fn get_vectors(
     let mut engine = open_scoped_engine_from_manifest(&state, &tenant, &database, &collection)
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
 
-    let mut rows = if selector_ids.is_empty() {
+    let mut rows: Vec<GetResult> = if selector_ids.is_empty() {
         Vec::new()
     } else {
         engine
             .get_many(&selector_ids)
             .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?
+            .into_iter()
+            .flatten()
+            .collect()
     };
 
     if let Some(filter_expr) = where_filter {
@@ -1459,6 +1569,7 @@ async fn query_vectors(
     let mut engine = open_scoped_engine_from_manifest(&state, &tenant, &database, &collection)
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
     let mut rows = Vec::new();
+    let search_start = std::time::Instant::now();
     for q in &body.query_embeddings {
         if q.len() != engine.d {
             engine
@@ -1497,16 +1608,29 @@ async fn query_vectors(
                 .then(|| hits.iter().map(|h| h.document.clone()).collect()),
         });
     }
+    let elapsed = search_start.elapsed().as_secs_f64();
     engine
         .close()
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
+    metrics::counter!("tqdb_search_requests_total",
+        "tenant" => tenant.clone(),
+        "database" => database.clone(),
+        "collection" => collection.clone(),
+    )
+    .increment(1);
+    metrics::histogram!("tqdb_search_latency_seconds",
+        "tenant" => tenant.clone(),
+        "database" => database.clone(),
+        "collection" => collection.clone(),
+    )
+    .record(elapsed);
     Ok(Json(QueryVectorsResponse { results: rows }))
 }
 async fn start_compact_job(
     State(state): State<AppState>,
     Path((tenant, database, collection)): Path<(String, String, String)>,
     Extension(ctx): Extension<RequestContext>,
-    Json(body): Json<CompactRequest>,
+    Json(_body): Json<CompactRequest>,
 ) -> Result<(StatusCode, Json<JobEnqueueResponse>), ApiError> {
     authorize(
         &ctx,
@@ -1523,7 +1647,6 @@ async fn start_compact_job(
         Some(&collection),
         ctx.request_id.clone(),
     )?;
-    let _ = body.r#async.unwrap_or(true);
     let (job_id, status) = enqueue_job(
         &state,
         JobType::Compact,
@@ -1543,7 +1666,7 @@ async fn start_index_job(
     State(state): State<AppState>,
     Path((tenant, database, collection)): Path<(String, String, String)>,
     Extension(ctx): Extension<RequestContext>,
-    Json(body): Json<IndexRequest>,
+    Json(_body): Json<IndexRequest>,
 ) -> Result<(StatusCode, Json<JobEnqueueResponse>), ApiError> {
     authorize(
         &ctx,
@@ -1560,7 +1683,6 @@ async fn start_index_job(
         Some(&collection),
         ctx.request_id.clone(),
     )?;
-    let _ = body.r#async.unwrap_or(true);
     let (job_id, status) = enqueue_job(
         &state,
         JobType::IndexBuild,
@@ -1604,7 +1726,6 @@ async fn start_snapshot_job(
         &collection,
         ctx.request_id.clone(),
     )?;
-    let _ = body.r#async.unwrap_or(true);
     let (job_id, status) = enqueue_job(
         &state,
         JobType::Snapshot,
@@ -1612,6 +1733,42 @@ async fn start_snapshot_job(
         database,
         collection,
         body.snapshot_name,
+        ctx.request_id.clone(),
+    )?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(JobEnqueueResponse { job_id, status }),
+    ))
+}
+
+async fn start_restore_job(
+    State(state): State<AppState>,
+    Path((tenant, database, collection)): Path<(String, String, String)>,
+    Extension(ctx): Extension<RequestContext>,
+    Json(body): Json<RestoreRequest>,
+) -> Result<(StatusCode, Json<JobEnqueueResponse>), ApiError> {
+    authorize(
+        &ctx,
+        &state.auth,
+        "write",
+        &tenant,
+        &database,
+        Some(&collection),
+    )?;
+    enforce_job_enqueue_quota(
+        &state,
+        &tenant,
+        &database,
+        Some(&collection),
+        ctx.request_id.clone(),
+    )?;
+    let (job_id, status) = enqueue_job(
+        &state,
+        JobType::Restore,
+        tenant,
+        database,
+        collection,
+        Some(body.snapshot_name),
         ctx.request_id.clone(),
     )?;
     Ok((
@@ -1964,6 +2121,35 @@ fn execute_job_operation(
             let collection_dir_s = collection_dir.to_string_lossy().to_string();
             let snapshot_dir_s = snapshot_dir.to_string_lossy().to_string();
             TurboQuantEngine::snapshot_local_dir(&collection_dir_s, &snapshot_dir_s)
+        }
+        JobType::Restore => {
+            let snapshot_name = job
+                .snapshot_name
+                .as_deref()
+                .ok_or("restore job missing snapshot_name")?;
+            let snapshot_dir = PathBuf::from(&state.storage.local_root)
+                .join("snapshots")
+                .join(&job.tenant)
+                .join(&job.database)
+                .join(&job.collection)
+                .join(snapshot_name);
+            if !snapshot_dir.exists() {
+                return Err(format!(
+                    "snapshot '{}' not found for collection '{}' in tenant '{}' database '{}'",
+                    snapshot_name, job.collection, job.tenant, job.database
+                )
+                .into());
+            }
+            let collection_dir = scoped_collection_dir(
+                &state.storage.local_root,
+                &job.tenant,
+                &job.database,
+                &job.collection,
+            );
+            let snapshot_dir_s = snapshot_dir.to_string_lossy().to_string();
+            let collection_dir_s = collection_dir.to_string_lossy().to_string();
+            // Atomically replace the live collection dir with the snapshot contents.
+            TurboQuantEngine::snapshot_local_dir(&snapshot_dir_s, &collection_dir_s)
         }
     }
 }

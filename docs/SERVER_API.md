@@ -320,6 +320,53 @@ Response `202`:
 { "job_id": "job_0000000000000003", "status": "queued" }
 ```
 
+### `POST /v1/tenants/{tenant}/databases/{database}/collections/{collection}/restore`
+
+Enqueue a restore job. Atomically copies a previously taken snapshot back into the live collection directory, replacing its current contents.
+
+Request:
+
+```json
+{
+  "snapshot_name": "docs-backup",
+  "async": true
+}
+```
+
+The snapshot must exist at `<TQ_LOCAL_ROOT>/snapshots/{tenant}/{database}/{collection}/{snapshot_name}/`.
+
+Response `202`:
+
+```json
+{ "job_id": "job_0000000000000004", "status": "queued" }
+```
+
+---
+
+## Observability
+
+### `GET /metrics`
+
+Returns Prometheus text-format metrics. **No authentication required.**
+
+```
+Content-Type: text/plain; version=0.0.4; charset=utf-8
+```
+
+**Metrics emitted:**
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `tqdb_search_requests_total` | counter | `tenant`, `database`, `collection` | Total query requests served |
+| `tqdb_search_latency_seconds` | histogram | `tenant`, `database`, `collection` | End-to-end query latency; buckets: 1ms / 5ms / 10ms / 50ms / 100ms |
+| `tqdb_vectors_total` | gauge | `tenant`, `database`, `collection` | Active vector count (scraped at `/metrics` request time) |
+| `tqdb_wal_buffer_size` | gauge | `tenant`, `database`, `collection` | Vectors currently buffered in the WAL |
+| `tqdb_index_nodes` | gauge | `tenant`, `database`, `collection` | Number of nodes in the HNSW graph index |
+
+Gauge metrics are collected on-demand by scanning the tenant directory at scrape time. Counter and histogram metrics are maintained in memory and reset on server restart.
+
+---
+
 ## Quota Usage
 
 ### `GET /v1/tenants/{tenant}/databases/{database}/quota_usage`

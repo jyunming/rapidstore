@@ -276,15 +276,17 @@ def load_dbpedia(dim: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     else:
         from datasets import load_dataset
         HF = "Qdrant/dbpedia-entities-openai3-text-embedding-3-large-3072-1M"
-        split_name = "train" if dim == 3072 else "1536-train"
-        field = f"text-embedding-3-large-{dim}"
+        split_name = "train"  # dataset only has a single "train" split
+        # Dataset only has the 3072-dim field; for 1536 we slice the first half
+        # (text-embedding-3-large uses Matryoshka so prefix dims are meaningful)
+        src_field = "text-embedding-3-large-3072"
         print(f"  Downloading DBpedia-{dim} from {HF} (split={split_name}) ...", flush=True)
         ds = load_dataset(HF, split=split_name, streaming=True)
         raw = []
         for i, row in enumerate(ds):
             if i >= N_DATA + N_QUERIES:
                 break
-            raw.append(row[field])
+            raw.append(row[src_field][:dim])
             if (i + 1) % 10_000 == 0:
                 print(f"    {i+1:>7,} / {N_DATA + N_QUERIES:,}", flush=True)
         all_vecs = np.array(raw, dtype=np.float32)
