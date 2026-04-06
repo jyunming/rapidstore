@@ -320,10 +320,10 @@ class TestUpdate:
             metadatas=[{"v": 1}, {"v": 2}, {"v": 3}],
         )
         res = col.get(ids=["a", "b", "c"])
-        meta_by_id = {r["id"]: r["metadata"] for r in zip(
-            res["ids"], res["metadatas"]
-        ) for r in [{"id": res["ids"][i], "metadata": res["metadatas"][i]}
-                    for i in range(len(res["ids"]))]}
+        meta_by_id = {
+            id_: meta
+            for id_, meta in zip(res["ids"], res["metadatas"])
+        }
         assert meta_by_id["a"]["v"] == 1
         assert meta_by_id["b"]["v"] == 2
         assert meta_by_id["c"]["v"] == 3

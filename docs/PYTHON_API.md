@@ -400,7 +400,7 @@ print(tbl.count_rows())
 tbl.optimize()   # no-op; tqdb handles compaction automatically
 ```
 
-**SQL WHERE parser:** only `id IN ('a', 'b', ...)` and `field = 'value'` are supported. Complex predicates raise `NotImplementedError`.
+**SQL WHERE parser:** supports `field = 'value'`, `field != 'value'`, `field IN ('a', 'b', ...)` (including `id IN (...)`), and numeric comparisons (`field > 10`, `field >= 10`, `field < 10`, `field <= 10`). More complex predicates raise `NotImplementedError`.
 
 **Not implemented:** `update(where, values)`, `merge_insert()`, `create_fts_index`, `create_scalar_index`, `drop_database`, remote/cloud URIs.
 

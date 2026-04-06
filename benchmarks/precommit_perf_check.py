@@ -182,22 +182,26 @@ def _run_one_config_for_history(
     # Ingest pass — single round (trending, not gating)
     with tempfile.TemporaryDirectory() as db_dir:
         sampler = _CpuRamSampler() if _CpuRamSampler else None
-        if sampler:
-            sampler.start()
-        db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip")
-        t0 = time.perf_counter()
-        for start in range(0, n, CHUNK_SIZE):
-            db.insert_batch(ids[start:start + CHUNK_SIZE], corpus[start:start + CHUNK_SIZE])
-        db.flush()
-        ingest_s = time.perf_counter() - t0
-        # Use deterministic structural estimate — avoids RSS noise from GC/mmap faulting
-        ram_mb = db.stats()["ram_estimate_bytes"] / (1 << 20)
-        db.close()
-        # Reopen then close to trim pre-allocated mmap capacity before measuring disk
-        tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip").close()
-        disk_mb = sum(
-            p.stat().st_size for p in Path(db_dir).iterdir() if p.is_file()
-        ) / (1 << 20)
+        try:
+            if sampler:
+                sampler.start()
+            db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip")
+            t0 = time.perf_counter()
+            for start in range(0, n, CHUNK_SIZE):
+                db.insert_batch(ids[start:start + CHUNK_SIZE], corpus[start:start + CHUNK_SIZE])
+            db.flush()
+            ingest_s = time.perf_counter() - t0
+            # Use deterministic structural estimate — avoids RSS noise from GC/mmap faulting
+            ram_mb = db.stats()["ram_estimate_bytes"] / (1 << 20)
+            db.close()
+            # Reopen then close to trim pre-allocated mmap capacity before measuring disk
+            tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip").close()
+            disk_mb = sum(
+                p.stat().st_size for p in Path(db_dir).iterdir() if p.is_file()
+            ) / (1 << 20)
+        finally:
+            if sampler:
+                sampler.stop()
 
     # Query pass (with optional ANN index)
     with tempfile.TemporaryDirectory() as db_dir:

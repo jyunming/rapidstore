@@ -21,8 +21,11 @@ Intentionally not implemented (raises ``NotImplementedError`` or is a no-op):
 - ``update(where, values)``, ``merge_insert()``
 - ``create_fts_index``, ``create_scalar_index``
 - ``drop_database``
-- Complex SQL WHERE predicates (only ``id IN (...)`` and ``field = 'val'``
-  are parsed; anything else raises ``NotImplementedError``)
+- Complex SQL WHERE predicates beyond the supported subset. The parser
+  accepts ``id IN (...)``, ``field IN (...)``, string equality/inequality
+  (``field = 'val'`` and ``field != 'val'``), numeric equality, and
+  numeric comparisons (``>``, ``>=``, ``<``, ``<=``); anything else
+  raises ``NotImplementedError``
 """
 
 from __future__ import annotations

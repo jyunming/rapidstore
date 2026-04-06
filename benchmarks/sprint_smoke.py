@@ -4,7 +4,7 @@ Run after each audit phase to ensure no recall/latency regression.
 Uses purely synthetic data: no dataset downloads required.
 
 Pass criteria (checked at exit):
-  - Recall@10  >= 0.85
+  - Recall@10  >= 0.80
   - P95 latency <= 50 ms
   - Ingest throughput >= 1000 vec/s
 

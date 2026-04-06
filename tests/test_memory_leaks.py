@@ -22,8 +22,9 @@ import os
 import tempfile
 
 import numpy as np
-import psutil
 import pytest
+
+psutil = pytest.importorskip("psutil", reason="psutil not installed — skipping memory leak tests")
 
 from tqdb import Database
 
@@ -51,6 +52,7 @@ _LEAK_SLACK_MB = 20.0   # tolerated RSS growth per test
 # Tests
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 class TestMemoryLeaks:
     def test_insert_delete_cycle_does_not_leak(self, tmp_path):
         """RSS after N insert+delete+flush cycles must not grow >20 MB."""

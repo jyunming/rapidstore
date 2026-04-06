@@ -237,14 +237,21 @@ impl StorageProvider for S3Provider {
                 .try_collect::<Vec<_>>()
                 .await
         })?;
-        let strip_len = if self.prefix.is_empty() {
-            0
+        let provider_prefix = if self.prefix.is_empty() {
+            None
         } else {
-            self.prefix.len() + 1 // +1 for the trailing '/'
+            Some(format!("{}/", self.prefix))
         };
         Ok(objects
             .into_iter()
-            .map(|o| o.location.as_ref()[strip_len..].to_string())
+            .map(|o| {
+                let loc = o.location.as_ref();
+                provider_prefix
+                    .as_deref()
+                    .and_then(|p| loc.strip_prefix(p))
+                    .unwrap_or(loc)
+                    .to_string()
+            })
             .collect())
     }
 
