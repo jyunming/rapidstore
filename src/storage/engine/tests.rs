@@ -415,7 +415,9 @@ fn delete_existing_id_returns_true_and_reduces_count() {
 // ── Index invalidation ─────────────────────────────────────────────────
 
 #[test]
-fn index_invalidated_after_insert() {
+fn index_preserved_after_insert_new_slot_in_delta() {
+    // With the delta index, inserts after create_index() do NOT invalidate
+    // the HNSW graph.  The new slot goes into delta_slots instead.
     let dir = tempdir().unwrap();
     let p = dir.path().to_str().unwrap();
     let d = 16;
@@ -426,13 +428,19 @@ fn index_invalidated_after_insert() {
     }
     e.create_index_with_params(4, 16, 16, 1.2, 1).unwrap();
     assert!(e.manifest.index_state.is_some(), "index should be built");
-    // Any new insert must invalidate the index
+    assert_eq!(
+        e.delta_slots.len(),
+        0,
+        "delta must be empty right after build"
+    );
+    // A new insert must keep the index valid and add the slot to delta.
     e.insert("new".into(), &make_vec(d, 0.99), no_meta())
         .unwrap();
     assert!(
-        e.manifest.index_state.is_none(),
-        "index state should be cleared after insert"
+        e.manifest.index_state.is_some(),
+        "index state must be preserved after insert (delta index)"
     );
+    assert_eq!(e.delta_slots.len(), 1, "new slot must appear in delta");
 }
 
 #[test]
@@ -451,6 +459,66 @@ fn index_invalidated_after_delete() {
     assert!(
         e.manifest.index_state.is_none(),
         "index state should be cleared after delete"
+    );
+}
+
+#[test]
+fn delta_cleared_after_create_index() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 16;
+    let mut e = open_default(p, d);
+    for i in 0..10u32 {
+        e.insert(format!("v{i}"), &make_vec(d, i as f64 * 0.1), no_meta())
+            .unwrap();
+    }
+    e.create_index_with_params(4, 16, 16, 1.2, 1).unwrap();
+    // Insert 3 new vectors — they go to delta
+    for i in 10u32..13u32 {
+        e.insert(format!("v{i}"), &make_vec(d, i as f64 * 0.1), no_meta())
+            .unwrap();
+    }
+    assert_eq!(e.delta_slots.len(), 3, "3 new slots must be in delta");
+    // Rebuild — delta is merged into the graph and cleared
+    e.create_index_with_params(4, 16, 16, 1.2, 1).unwrap();
+    assert_eq!(e.delta_slots.len(), 0, "delta must be empty after rebuild");
+    assert_eq!(
+        e.index_ids.len(),
+        13,
+        "all 13 vectors must be indexed after rebuild"
+    );
+}
+
+#[test]
+fn ann_search_returns_delta_vectors() {
+    // Vectors inserted after create_index() must be findable via ANN search.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 32;
+    let mut e = open_default(p, d);
+    for i in 0..20u32 {
+        e.insert(format!("base{i}"), &make_vec(d, i as f64 * 0.05), no_meta())
+            .unwrap();
+    }
+    e.create_index_with_params(8, 32, 32, 1.2, 2).unwrap();
+    // Insert a distinctive vector into the delta
+    let target = make_vec(d, 9.9);
+    e.insert("delta_target".into(), &target, no_meta()).unwrap();
+    assert_eq!(e.delta_slots.len(), 1, "delta must have the new slot");
+    // ANN search with _use_ann=true must return the delta vector
+    let results = e
+        .search_with_filter_and_ann(
+            &target.iter().map(|&x| x as f64).collect(),
+            1,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].id, "delta_target",
+        "delta vector must be found via ANN"
     );
 }
 

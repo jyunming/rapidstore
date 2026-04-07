@@ -343,6 +343,7 @@ class Database:
             - ``total_disk_bytes`` — total on-disk footprint
             - ``has_index`` — whether a HNSW index exists
             - ``index_nodes`` — number of indexed nodes
+            - ``delta_size`` — vectors inserted after last ``create_index()`` (delta overlay)
             - ``live_codes_bytes`` — size of the in-memory codes buffer
             - ``ram_estimate_bytes`` — estimated in-memory footprint
         """

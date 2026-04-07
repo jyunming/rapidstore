@@ -176,6 +176,7 @@ len(db)                          # int — number of active vectors
 | `total_disk_bytes` | `int` | Total on-disk footprint in bytes |
 | `has_index` | `bool` | Whether a HNSW index has been built |
 | `index_nodes` | `int` | Number of nodes in the HNSW graph |
+| `delta_size` | `int` | Vectors inserted after last `create_index()` (delta overlay); when large, consider rebuilding |
 | `live_codes_bytes` | `int` | Size of the in-memory quantized codes buffer |
 | `live_slot_count` | `int` | Allocated slots in the live slab |
 | `ram_estimate_bytes` | `int` | Estimated total in-memory footprint |
@@ -299,9 +300,20 @@ Returns a `dict[str, int]` mapping each distinct non-null value to its occurrenc
 
 ---
 
-## Hybrid search (post-index inserts)
+## Hybrid search (delta index)
 
-Vectors inserted **after** `create_index()` are still searched correctly. The engine automatically detects "dark slots" (active but not yet indexed) and runs a targeted brute-force scan over them, merging results with the HNSW candidates before returning top-k. There is no extra configuration required; the fallback incurs zero overhead when all vectors are indexed.
+Vectors inserted **after** `create_index()` are tracked in an in-memory **delta overlay** (`delta_ids.json`). ANN search automatically queries both the HNSW graph and the delta overlay (brute-force), merging results before returning top-k. There is no extra configuration required.
+
+```python
+stats = db.stats()
+print(stats["delta_size"])   # vectors in the delta overlay
+
+# When delta grows large, rebuild to incorporate them into the graph:
+if stats["delta_size"] > 10_000:
+    db.create_index()        # merges delta into HNSW graph, clears delta_size to 0
+```
+
+The delta overlay is persisted to `delta_ids.json` and survives restarts. Deletes still invalidate the index (the deleted vector would otherwise remain navigable in the HNSW graph).
 
 ---
 

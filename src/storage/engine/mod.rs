@@ -22,6 +22,7 @@ use filter::{get_nested_field, metadata_matches_filter, score_vectors_with_metri
 
 const QUANTIZER_STATE_FILE: &str = "quantizer.bin";
 const INDEX_IDS_FILE: &str = "graph_ids.json";
+const DELTA_IDS_FILE: &str = "delta_ids.json";
 const ID_POOL_FILE: &str = "live_ids.bin";
 const MANIFEST_SAVE_INTERVAL_OPS: usize = 64;
 
@@ -184,6 +185,9 @@ pub struct DbStats {
     pub metadata_bytes_estimate: usize,
     pub ann_slot_count: usize,
     pub graph_nodes: usize,
+    /// Number of vectors in the delta overlay (inserted after last `create_index()`).
+    /// When this grows large, consider calling `create_index()` again to merge.
+    pub delta_size: usize,
 }
 
 pub struct TurboQuantEngine {
@@ -204,10 +208,15 @@ pub struct TurboQuantEngine {
     local_dir: String,
 
     index_ids: Vec<u32>,
+    /// Slots inserted after the last `create_index()` call — the "delta" overlay.
+    /// ANN search queries both the HNSW graph and these slots (brute-force).
+    /// Cleared on every `create_index()` and persisted to `delta_ids.json`.
+    delta_slots: Vec<u32>,
     live_codes: LiveCodesFile,
     live_vraw: Option<LiveCodesFile>,
     id_pool: IdPool,
     index_ids_dirty: bool,
+    delta_slots_dirty: bool,
     pending_manifest_updates: usize,
     /// True when at least one delete has been issued since the last compaction.
     /// When false, `live_compact_slab` is skipped on WAL flush — a pure insert
@@ -438,10 +447,12 @@ impl TurboQuantEngine {
             graph,
             local_dir: local_dir.to_string(),
             index_ids: load_index_ids(local_dir).unwrap_or_default(),
+            delta_slots: load_delta_slots(local_dir).unwrap_or_default(),
             live_codes,
             live_vraw,
             id_pool: IdPool::new(),
             index_ids_dirty: false,
+            delta_slots_dirty: false,
             pending_manifest_updates: 0,
             has_pending_deletes: false,
             rerank_enabled: manifest.rerank_enabled,
@@ -1192,6 +1203,9 @@ impl TurboQuantEngine {
         )?;
         self.index_ids = indexed_slots;
         self.index_ids_dirty = true;
+        // Delta slots are now part of the rebuilt graph — clear the overlay.
+        self.delta_slots.clear();
+        self.delta_slots_dirty = true;
         self.manifest.index_state = Some(IndexState {
             max_degree,
             ef_construction,
@@ -1430,22 +1444,21 @@ impl TurboQuantEngine {
                 out.truncate(top_k);
             }
 
-            // Hybrid: score any vectors inserted after create_index() ("dark slots")
-            // that are not in the HNSW graph. Without this, new inserts are silently
-            // invisible to ANN search.
-            let indexed_set: std::collections::HashSet<u32> =
-                self.index_ids.iter().copied().collect();
-            let dark_slots: Vec<u32> = self
-                .id_pool
-                .iter_active()
+            // Delta overlay: brute-force score vectors inserted after create_index()
+            // that are not in the HNSW graph.  delta_slots is maintained incrementally
+            // on every insert, avoiding the O(n) set-difference scan on each search.
+            let active_set: std::collections::HashSet<u32> =
+                self.id_pool.iter_active().iter().map(|(_, s)| *s).collect();
+            let delta: Vec<u32> = self
+                .delta_slots
                 .iter()
-                .map(|(_, s)| *s)
-                .filter(|s| !indexed_set.contains(s))
+                .copied()
+                .filter(|s| active_set.contains(s))
                 .collect();
-            if !dark_slots.is_empty() {
-                let mut dark_results =
-                    self.exhaustive_search_simd(query, top_k, filter, Some(dark_slots))?;
-                out.append(&mut dark_results);
+            if !delta.is_empty() {
+                let mut delta_results =
+                    self.exhaustive_search_simd(query, top_k, filter, Some(delta))?;
+                out.append(&mut delta_results);
                 out.sort_by(|a, b| {
                     b.score
                         .partial_cmp(&a.score)
@@ -2124,6 +2137,7 @@ impl TurboQuantEngine {
             metadata_bytes_estimate: self.metadata.approx_bytes(),
             ann_slot_count: self.index_ids.len(),
             graph_nodes: self.graph.node_count(),
+            delta_size: self.delta_slots.len(),
         }
     }
 
@@ -2367,6 +2381,7 @@ impl TurboQuantEngine {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !force
             && !self.index_ids_dirty
+            && !self.delta_slots_dirty
             && self.pending_manifest_updates < MANIFEST_SAVE_INTERVAL_OPS
         {
             return Ok(());
@@ -2376,6 +2391,12 @@ impl TurboQuantEngine {
             self.backend
                 .write(INDEX_IDS_FILE, &serialize_index_ids(&self.index_ids)?)?;
             self.index_ids_dirty = false;
+        }
+        if self.delta_slots_dirty {
+            save_delta_slots(&self.local_dir, &self.delta_slots)?;
+            self.backend
+                .write(DELTA_IDS_FILE, &serialize_index_ids(&self.delta_slots)?)?;
+            self.delta_slots_dirty = false;
         }
         self.save_manifest()?;
         self.pending_manifest_updates = 0;
@@ -2467,10 +2488,19 @@ impl TurboQuantEngine {
                 entry.gamma,
                 stored_norm,
             )?;
+            // Track new slot in delta overlay (same as batch path).
+            if !self.index_ids.is_empty() {
+                let indexed_set: std::collections::HashSet<u32> =
+                    self.index_ids.iter().copied().collect();
+                if !indexed_set.contains(&slot) && !self.delta_slots.contains(&slot) {
+                    self.delta_slots.push(slot);
+                    self.delta_slots_dirty = true;
+                }
+            }
             self.live_save_raw_vector(slot, raw_for_rerank);
             self.metadata.put(slot, &meta)?;
         }
-        self.invalidate_index_state()?;
+        // Inserts do NOT invalidate the HNSW index — new slots go to delta_slots.
         self.manifest.vector_count = self.live_active_count() as u64;
         self.maybe_persist_state(false)?;
         if self.wal_buffer.len() >= self.wal_flush_threshold {
@@ -2571,9 +2601,25 @@ impl TurboQuantEngine {
             }
             self.wal.append_batch(&wal_entries, false)?;
             self.metadata.put_many(&metadata_entries)?;
+            // If an index exists, track newly allocated slots in the delta overlay so
+            // ANN search finds them without a rebuild.  Build the indexed set once per
+            // chunk (not per item) to keep this O(chunk + indexed) instead of O(chunk × indexed).
+            if !self.index_ids.is_empty() {
+                let indexed_set: std::collections::HashSet<u32> =
+                    self.index_ids.iter().copied().collect();
+                for (slot, _) in &metadata_entries {
+                    if !indexed_set.contains(slot) && !self.delta_slots.contains(slot) {
+                        self.delta_slots.push(*slot);
+                        self.delta_slots_dirty = true;
+                    }
+                }
+            }
             self.wal_buffer.extend(wal_entries);
         }
-        self.invalidate_index_state()?;
+        // Inserts do NOT invalidate the HNSW index.  New slots are tracked in
+        // delta_slots (above); ANN search unions HNSW results with a brute-force
+        // pass over the delta.  The index is only invalidated on deletes or
+        // on explicit rebuild via create_index().
         self.manifest.vector_count = self.live_active_count() as u64;
         self.maybe_persist_state(false)?;
         if self.wal_buffer.len() >= self.wal_flush_threshold {
@@ -2663,5 +2709,25 @@ fn load_index_ids(local_dir: &str) -> Result<Vec<u32>, Box<dyn std::error::Error
     }
     Ok(Vec::new())
 }
+
+fn save_delta_slots(
+    local_dir: &str,
+    slots: &[u32],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    std::fs::write(
+        format!("{}/{}", local_dir, DELTA_IDS_FILE),
+        serialize_index_ids(slots)?,
+    )?;
+    Ok(())
+}
+
+fn load_delta_slots(local_dir: &str) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
+    let local = format!("{}/{}", local_dir, DELTA_IDS_FILE);
+    if Path::new(&local).exists() {
+        return Ok(serde_json::from_slice(&std::fs::read(&local)?)?);
+    }
+    Ok(Vec::new())
+}
+
 #[cfg(test)]
 mod tests;
