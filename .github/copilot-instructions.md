@@ -149,14 +149,6 @@ Version is defined only in `pyproject.toml`. `Cargo.toml` must be kept in sync m
 ### Commit style
 `type(scope): summary` — e.g. `fix(storage): release mmap before rename on Windows`, `perf(quantizer): faster bit-unpack`
 
-### Sprint / PR workflow
-One PR per sprint. All issues for a sprint are implemented on a single branch (e.g. `feat/v0.4-sprint`) and merged via one PR. Never open multiple simultaneous PRs for the same sprint.
-
-1. `git checkout -b feat/vX.Y-sprint main`
-2. Commit each issue as a separate commit on the sprint branch
-3. Run the full benchmark once: `TQDB_TRACK=1 python benchmarks/paper_recall_bench.py --update-readme --track`
-4. Push, open one PR targeting `main`, close any issue-level PRs
-
 ### Git push
 ```bash
 GITHUB_TOKEN="" git push origin <branch>
