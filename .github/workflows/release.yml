@@ -194,3 +194,35 @@ jobs:
         with:
           command: upload
           args: --non-interactive --skip-existing dist/*
+
+  # ── Update website version badge ─────────────────────────────────────────────
+  update-website:
+    name: Update website version badge
+    runs-on: ubuntu-latest
+    needs: [release]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Patch version badge in index.html
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          sed -i "s|<div class=\"badge\">v[^<]*</div>|<div class=\"badge\">${VERSION} Released</div>|g" website/index.html
+          echo "Updated badge to: ${VERSION} Released"
+          grep -n 'badge' website/index.html
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "jyunming"
+          git config user.email "69726231+jyunming@users.noreply.github.com"
+          if git diff --quiet website/index.html; then
+            echo "No change to website/index.html — skipping commit"
+          else
+            git add website/index.html
+            git commit -m "chore(website): bump version badge to ${GITHUB_REF_NAME}"
+            git push origin main
+          fi

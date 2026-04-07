@@ -115,6 +115,11 @@ impl IdPool {
         }
     }
 
+    /// Returns true if `slot` is within bounds and has not been deleted.
+    pub fn is_slot_alive(&self, slot: u32) -> bool {
+        (slot as usize) < self.alive.len() && self.alive[slot as usize]
+    }
+
     pub fn iter_active(&self) -> Vec<(String, u32)> {
         let mut out = Vec::with_capacity(self.active_count);
         for slot in 0..self.offsets.len() {

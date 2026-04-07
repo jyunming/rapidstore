@@ -33,7 +33,10 @@ pub trait StorageProvider: Send + Sync {
     /// Get file size.
     fn size(&self, path: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
 
-    /// Rename (move) a file atomically within the same storage root.
+    /// Rename (move) a file within the same storage root.
+    /// For local storage this is atomic. For S3 it is best-effort: the new key
+    /// is written before the old key is deleted, so a crash between those two
+    /// operations leaves both keys present (safe to retry).
     fn rename(&self, from: &str, to: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
@@ -300,20 +303,21 @@ impl StorageProvider for S3Provider {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Rename local cache file atomically, then upload under the new key and
-        // delete the old key from S3. S3 has no atomic rename primitive.
+        // Crash-safe order for S3: upload new key first, delete old key second,
+        // then rename the local cache. A crash between S3 put and S3 delete
+        // leaves both keys present but no data is lost (safe to retry).
         let from_cached = self.cached(from);
         let to_cached = self.cached(to);
         if let Some(parent) = to_cached.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::rename(&from_cached, &to_cached)?;
-        let data = fs::read(&to_cached)?;
+        let data = fs::read(&from_cached)?;
         let to_key = self.s3_key(to);
         let payload = object_store::PutPayload::from(data);
         self.rt.block_on(self.store.put(&to_key, payload))?;
         let from_key = self.s3_key(from);
         self.rt.block_on(self.store.delete(&from_key))?;
+        fs::rename(&from_cached, &to_cached)?;
         Ok(())
     }
 }

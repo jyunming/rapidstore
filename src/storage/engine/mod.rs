@@ -432,6 +432,7 @@ impl TurboQuantEngine {
         };
 
         let normalize_flag = normalize || manifest.normalize;
+        let delta_slots = load_delta_slots(local_dir, &backend).unwrap_or_default();
         let mut engine = Self {
             d: manifest.d,
             b: manifest.b,
@@ -447,7 +448,7 @@ impl TurboQuantEngine {
             graph,
             local_dir: local_dir.to_string(),
             index_ids: load_index_ids(local_dir).unwrap_or_default(),
-            delta_slots: load_delta_slots(local_dir).unwrap_or_default(),
+            delta_slots,
             live_codes,
             live_vraw,
             id_pool: IdPool::new(),
@@ -1447,13 +1448,12 @@ impl TurboQuantEngine {
             // Delta overlay: brute-force score vectors inserted after create_index()
             // that are not in the HNSW graph.  delta_slots is maintained incrementally
             // on every insert, avoiding the O(n) set-difference scan on each search.
-            let active_set: std::collections::HashSet<u32> =
-                self.id_pool.iter_active().iter().map(|(_, s)| *s).collect();
+            // is_slot_alive filters deleted slots without allocating strings or a HashSet.
             let delta: Vec<u32> = self
                 .delta_slots
                 .iter()
                 .copied()
-                .filter(|s| active_set.contains(s))
+                .filter(|s| self.id_pool.is_slot_alive(*s))
                 .collect();
             if !delta.is_empty() {
                 let mut delta_results =
@@ -2393,7 +2393,9 @@ impl TurboQuantEngine {
             self.index_ids_dirty = false;
         }
         if self.delta_slots_dirty {
-            save_delta_slots(&self.local_dir, &self.delta_slots)?;
+            // Single write path via backend (mirrors index_ids_dirty handling).
+            // For LocalProvider this writes to local_dir; for S3Provider this
+            // writes to local cache and uploads to S3.
             self.backend
                 .write(DELTA_IDS_FILE, &serialize_index_ids(&self.delta_slots)?)?;
             self.delta_slots_dirty = false;
@@ -2490,9 +2492,7 @@ impl TurboQuantEngine {
             )?;
             // Track new slot in delta overlay (same as batch path).
             if !self.index_ids.is_empty() {
-                let indexed_set: std::collections::HashSet<u32> =
-                    self.index_ids.iter().copied().collect();
-                if !indexed_set.contains(&slot) && !self.delta_slots.contains(&slot) {
+                if !self.index_ids.contains(&slot) && !self.delta_slots.contains(&slot) {
                     self.delta_slots.push(slot);
                     self.delta_slots_dirty = true;
                 }
@@ -2710,21 +2710,18 @@ fn load_index_ids(local_dir: &str) -> Result<Vec<u32>, Box<dyn std::error::Error
     Ok(Vec::new())
 }
 
-fn save_delta_slots(
+fn load_delta_slots(
     local_dir: &str,
-    slots: &[u32],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    std::fs::write(
-        format!("{}/{}", local_dir, DELTA_IDS_FILE),
-        serialize_index_ids(slots)?,
-    )?;
-    Ok(())
-}
-
-fn load_delta_slots(local_dir: &str) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
+    backend: &Arc<StorageBackend>,
+) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
     let local = format!("{}/{}", local_dir, DELTA_IDS_FILE);
     if Path::new(&local).exists() {
         return Ok(serde_json::from_slice(&std::fs::read(&local)?)?);
+    }
+    // Fall back to backend (e.g. S3 restore on a fresh machine).
+    if let Ok(bytes) = backend.read(DELTA_IDS_FILE) {
+        std::fs::write(&local, &bytes)?;
+        return Ok(serde_json::from_slice(&bytes)?);
     }
     Ok(Vec::new())
 }
