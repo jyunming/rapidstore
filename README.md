@@ -173,18 +173,16 @@ results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
 
 ## Benchmarks
 
-Measured on **DBpedia OpenAI3 embeddings** ([Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-1M](https://huggingface.co/datasets/Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-1M)) — real 1536-dim embeddings, n=100k vectors, 500 queries, Recall@1@k metric. HNSW uses M=32, ef_construction=200.
-
-### Algorithm validation (reproducing paper Section 4.4)
-
-Brute-force recall across all three datasets from [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) Figure 5 — n=100k vectors, paper values read visually from plots (approximate). Full script: [`benchmarks/paper_recall_bench.py`](https://github.com/jyunming/TurboQuantDB/blob/main/benchmarks/paper_recall_bench.py).
+Three datasets from [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) — n=100k vectors each. Full script: [`benchmarks/paper_recall_bench.py`](https://github.com/jyunming/TurboQuantDB/blob/main/benchmarks/paper_recall_bench.py).
 
 <!-- PAPER_BENCH_START -->
+### Algorithm Validation — Recall vs Paper
+
 ![Benchmark recall curves — TQDB vs paper](https://raw.githubusercontent.com/jyunming/TurboQuantDB/main/benchmarks/benchmark_plots.png)
 
-**GloVe-200** (d=200, 100,000 corpus, 10,000 queries, metric=ip)
+Brute-force recall across all three datasets from [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) Figure 5 — n=100k vectors, paper values read visually from plots (approximate).
 
-*Recall@1@k — brute-force:*
+**GloVe-200** (d=200, 100,000 corpus, 10,000 queries)
 
 | Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -195,42 +193,7 @@ Brute-force recall across all three datasets from [arXiv:2504.19874](https://arx
 | **TQDB b=4 rerank=F** | 73.9% | 88.3% | 96.4% | 99.2% | 99.9% | 100.0% | 100.0% |
 | **TQDB b=4 rerank=T** | 82.6% | 94.2% | 98.7% | 99.9% | 100.0% | 100.0% | 100.0% |
 
-*Performance — brute-force:*
-
-| Config | Thruput vps | Ingest | Disk MB | ΔRSS MB | p50 ms | p99 ms | MRR |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | 86,333 | 1.2s | 16.4 | 34 | 12.72 | 14.29 | 0.502 |
-| b=2 rerank=T | 78,762 | 1.3s | 16.4 | 19 | 14.71 | 16.32 | 0.666 |
-| b=4 rerank=F | 50,066 | 2.0s | 22.5 | 25 | 12.96 | 14.43 | 0.842 |
-| b=4 rerank=T | 45,659 | 2.2s | 22.5 | 31 | 14.99 | 24.54 | 0.900 |
-
-<details>
-<summary>ANN configs — GloVe-200 (extra info)</summary>
-
-*Recall@1@k — ANN (HNSW):*
-
-| Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| TQDB b=2 rerank=F ANN | 9.5% | 12.7% | 15.3% | 17.2% | 18.6% | 19.3% | 19.6% |
-| TQDB b=2 rerank=T ANN | 21.2% | 26.4% | 30.1% | 32.4% | 33.3% | 33.4% | 33.4% |
-| TQDB b=4 rerank=F ANN | 23.1% | 26.8% | 28.2% | 28.6% | 28.7% | 28.7% | 28.7% |
-| TQDB b=4 rerank=T ANN | 36.2% | 40.1% | 41.3% | 41.5% | 41.5% | 41.5% | 41.5% |
-
-*Performance — ANN:*
-
-| Config | Thruput vps | Ingest | Index | Disk MB | ΔRSS MB | p50 ms | p99 ms | MRR |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F ANN | 87,290 | 1.1s | 5.6s | 16.4 | 25 | 0.40 | 0.99 | 0.124 |
-| b=2 rerank=T ANN | 71,475 | 1.4s | 5.2s | 16.4 | 16 | 2.77 | 5.26 | 0.254 |
-| b=4 rerank=F ANN | 53,778 | 1.9s | 4.5s | 22.5 | 27 | 0.43 | 0.99 | 0.255 |
-| b=4 rerank=T ANN | 63,549 | 1.6s | 4.6s | 22.5 | 16 | 2.63 | 4.36 | 0.386 |
-
-</details>
-
-
-**DBpedia OpenAI3 d=1536** (d=1536, 100,000 corpus, 1,000 queries, metric=ip)
-
-*Recall@1@k — brute-force:*
+**DBpedia OpenAI3 d=1536** (d=1536, 100,000 corpus, 1,000 queries)
 
 | Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -241,42 +204,7 @@ Brute-force recall across all three datasets from [arXiv:2504.19874](https://arx
 | **TQDB b=4 rerank=F** | 92.6% | 99.1% | 99.9% | 100.0% | 100.0% | 100.0% | 100.0% |
 | **TQDB b=4 rerank=T** | 95.5% | 99.5% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
 
-*Performance — brute-force:*
-
-| Config | Thruput vps | Ingest | Disk MB | ΔRSS MB | p50 ms | p99 ms | MRR |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | 24,014 | 4.2s | 59.1 | 79 | 41.49 | 50.05 | 0.882 |
-| b=2 rerank=T | 22,985 | 4.4s | 59.1 | 118 | 49.85 | 61.78 | 0.926 |
-| b=4 rerank=F | 9,043 | 11.1s | 108.0 | 178 | 49.82 | 60.09 | 0.961 |
-| b=4 rerank=T | 13,013 | 7.7s | 108.0 | 180 | 56.52 | 65.36 | 0.977 |
-
-<details>
-<summary>ANN configs — DBpedia OpenAI3 d=1536 (extra info)</summary>
-
-*Recall@1@k — ANN (HNSW):*
-
-| Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| TQDB b=2 rerank=F ANN | 58.8% | 66.0% | 69.1% | 69.5% | 69.7% | 69.7% | 69.7% |
-| TQDB b=2 rerank=T ANN | 73.3% | 79.9% | 82.0% | 82.4% | 82.4% | 82.4% | 82.4% |
-| TQDB b=4 rerank=F ANN | 69.2% | 72.7% | 73.0% | 73.1% | 73.1% | 73.1% | 73.1% |
-| TQDB b=4 rerank=T ANN | 78.9% | 81.9% | 82.1% | 82.1% | 82.1% | 82.1% | 82.1% |
-
-*Performance — ANN:*
-
-| Config | Thruput vps | Ingest | Index | Disk MB | ΔRSS MB | p50 ms | p99 ms | MRR |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F ANN | 22,026 | 4.5s | 27.4s | 59.1 | 69 | 2.31 | 4.09 | 0.634 |
-| b=2 rerank=T ANN | 22,873 | 4.4s | 27.6s | 59.1 | 68 | 18.60 | 29.26 | 0.773 |
-| b=4 rerank=F ANN | 11,346 | 8.8s | 26.1s | 108.0 | 181 | 2.67 | 4.97 | 0.711 |
-| b=4 rerank=T ANN | 10,996 | 9.1s | 27.0s | 108.0 | 167 | 20.34 | 32.57 | 0.805 |
-
-</details>
-
-
-**DBpedia OpenAI3 d=3072** (d=3072, 100,000 corpus, 1,000 queries, metric=ip)
-
-*Recall@1@k — brute-force:*
+**DBpedia OpenAI3 d=3072** (d=3072, 100,000 corpus, 1,000 queries)
 
 | Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -287,40 +215,52 @@ Brute-force recall across all three datasets from [arXiv:2504.19874](https://arx
 | **TQDB b=4 rerank=F** | 94.8% | 99.1% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
 | **TQDB b=4 rerank=T** | 96.0% | 99.8% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
 
-*Performance — brute-force:*
-
-| Config | Thruput vps | Ingest | Disk MB | ΔRSS MB | p50 ms | p99 ms | MRR |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | 8,729 | 11.5s | 108.0 | 154 | 73.72 | 86.39 | 0.913 |
-| b=2 rerank=T | 11,799 | 8.5s | 108.0 | 203 | 83.57 | 94.50 | 0.943 |
-| b=4 rerank=F | 6,256 | 16.0s | 205.6 | 320 | 85.62 | 98.89 | 0.972 |
-| b=4 rerank=T | 5,689 | 17.6s | 205.6 | 308 | 95.61 | 109.04 | 0.980 |
-
-<details>
-<summary>ANN configs — DBpedia OpenAI3 d=3072 (extra info)</summary>
-
-*Recall@1@k — ANN (HNSW):*
-
-| Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| TQDB b=2 rerank=F ANN | 60.9% | 67.5% | 69.9% | 70.3% | 70.3% | 70.3% | 70.3% |
-| TQDB b=2 rerank=T ANN | 76.3% | 83.4% | 84.0% | 84.2% | 84.2% | 84.2% | 84.2% |
-| TQDB b=4 rerank=F ANN | 67.9% | 70.6% | 71.0% | 71.0% | 71.0% | 71.0% | 71.0% |
-| TQDB b=4 rerank=T ANN | 80.9% | 83.9% | 83.9% | 83.9% | 83.9% | 83.9% | 83.9% |
-
-*Performance — ANN:*
-
-| Config | Thruput vps | Ingest | Index | Disk MB | ΔRSS MB | p50 ms | p99 ms | MRR |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F ANN | 12,305 | 8.1s | 44.8s | 108.0 | 196 | 4.22 | 7.60 | 0.650 |
-| b=2 rerank=T ANN | 12,269 | 8.2s | 44.0s | 108.0 | 204 | 33.07 | 48.23 | 0.801 |
-| b=4 rerank=F ANN | 5,968 | 16.8s | 41.9s | 205.6 | 306 | 4.81 | 9.30 | 0.694 |
-| b=4 rerank=T ANN | 6,375 | 15.7s | 43.9s | 205.6 | 305 | 39.70 | 70.07 | 0.824 |
-
-</details>
-
-
 The GloVe gap (~12–18% at k=1) is expected: d=200 is the hardest case (fewest bits per dimension), and we evaluate on the first 100k vectors from a 1.18M corpus while the paper used a random sample. From k=4 onward the gap is ≤2.6% on GloVe and ≤1% on DBpedia. For high-dimensional embeddings (d≥1536), TQDB matches the paper within ~5% at k=1 and within 1% from k=4.
+
+### Performance & Config Trade-offs
+
+![Config trade-off overview — latency, disk, RAM, CPU](https://raw.githubusercontent.com/jyunming/TurboQuantDB/main/benchmarks/benchmark_plots_perf.png)
+
+All 8 configs — brute-force and ANN (HNSW md=32, ef=128). Disk MB for ANN includes `graph.bin`. RAM = peak RSS during query phase. Index = HNSW build time (ANN only).
+
+**GloVe-200** (d=200, 100,000 corpus, 10,000 queries)
+
+| Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| b=2 rerank=F | Brute | 1.1s | — | 16.8 | 207 | 11.19 | 13.66 | 37.1% | 0.502 |
+| b=2 rerank=T | Brute | 1.1s | — | 16.8 | 208 | 13.71 | 16.19 | 52.8% | 0.666 |
+| b=4 rerank=F | Brute | 1.5s | — | 22.9 | 214 | 12.13 | 13.92 | 73.9% | 0.842 |
+| b=4 rerank=T | Brute | 1.6s | — | 22.9 | 213 | 14.65 | 16.95 | 82.6% | 0.900 |
+| b=2 rerank=F | ANN | 1.1s | 15.3s | 25.4 | 238 | 5.73 | 8.40 | 21.2% | 0.279 |
+| b=2 rerank=T | ANN | 1.1s | 11.9s | 25.4 | 238 | 9.74 | 13.48 | 36.9% | 0.456 |
+| b=4 rerank=F | ANN | 1.5s | 11.2s | 31.5 | 244 | 5.59 | 8.45 | 42.4% | 0.472 |
+| b=4 rerank=T | ANN | 1.4s | 11.1s | 31.5 | 246 | 9.68 | 13.93 | 59.5% | 0.639 |
+
+**DBpedia OpenAI3 d=1536** (d=1536, 100,000 corpus, 1,000 queries)
+
+| Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| b=2 rerank=F | Brute | 3.7s | — | 59.5 | 756 | 50.36 | 95.64 | 79.7% | 0.882 |
+| b=2 rerank=T | Brute | 6.1s | — | 59.5 | 805 | 56.88 | 265.80 | 86.8% | 0.926 |
+| b=4 rerank=F | Brute | 15.8s | — | 108.3 | 855 | 54.47 | 78.30 | 92.6% | 0.961 |
+| b=4 rerank=T | Brute | 10.9s | — | 108.3 | 855 | 52.77 | 64.65 | 95.5% | 0.977 |
+| b=2 rerank=F | ANN | 6.0s | 60.3s | 68.1 | 774 | 12.21 | 17.95 | 75.3% | 0.832 |
+| b=2 rerank=T | ANN | 4.8s | 59.3s | 68.1 | 774 | 38.63 | 58.91 | 84.8% | 0.903 |
+| b=4 rerank=F | ANN | 8.4s | 59.5s | 116.9 | 821 | 14.16 | 20.14 | 87.7% | 0.908 |
+| b=4 rerank=T | ANN | 8.5s | 60.0s | 116.9 | 824 | 43.08 | 61.71 | 93.6% | 0.957 |
+
+**DBpedia OpenAI3 d=3072** (d=3072, 100,000 corpus, 1,000 queries)
+
+| Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| b=2 rerank=F | Brute | 8.4s | — | 108.3 | 1400 | 79.03 | 90.89 | 84.6% | 0.913 |
+| b=2 rerank=T | Brute | 9.9s | — | 108.3 | 1419 | 94.38 | 105.39 | 89.2% | 0.943 |
+| b=4 rerank=F | Brute | 17.8s | — | 206.0 | 1496 | 91.98 | 106.48 | 94.8% | 0.972 |
+| b=4 rerank=T | Brute | 20.4s | — | 206.0 | 1511 | 111.90 | 128.68 | 96.0% | 0.980 |
+| b=2 rerank=F | ANN | 8.8s | 103.1s | 116.9 | 1410 | 18.08 | 26.07 | 81.5% | 0.875 |
+| b=2 rerank=T | ANN | 7.8s | 103.8s | 116.9 | 1392 | 67.87 | 106.72 | 88.5% | 0.933 |
+| b=4 rerank=F | ANN | 21.1s | 99.1s | 214.6 | 1488 | 18.60 | 27.73 | 90.8% | 0.931 |
+| b=4 rerank=T | ANN | 20.5s | 120.6s | 214.6 | 1488 | 99.04 | 172.07 | 93.9% | 0.959 |
 
 **Reproduction:** `maturin develop --release && python benchmarks/paper_recall_bench.py --update-readme --track`  (requires `pip install datasets psutil matplotlib`)
 
