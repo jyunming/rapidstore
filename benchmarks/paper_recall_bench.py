@@ -232,29 +232,27 @@ def _recall_pct(v: float) -> str:
     return f"{v * 100:.1f}%"
 
 
-def _make_dataset_tables(ds_label: str, ds_results: list[dict]) -> str:
-    paper  = PAPER_RECALL.get(ds_label, {})
-    brute  = [r for r in ds_results if not r["ann"]]
-    ann    = [r for r in ds_results if r["ann"]]
-    fig    = {"glove-200": "a", "dbpedia-1536": "b", "dbpedia-3072": "c"}.get(ds_label, "")
-    n, d   = ds_results[0]["n"], ds_results[0]["dim"]
-    nq     = ds_results[0]["n_queries"]
+_DS_TITLE = {
+    "glove-200":    "GloVe-200",
+    "dbpedia-1536": "DBpedia OpenAI3 d=1536",
+    "dbpedia-3072": "DBpedia OpenAI3 d=3072",
+}
 
-    ds_title = {
-        "glove-200":    "GloVe-200",
-        "dbpedia-1536": "DBpedia OpenAI3 d=1536",
-        "dbpedia-3072": "DBpedia OpenAI3 d=3072",
-    }.get(ds_label, ds_label)
+
+def _make_validation_block(ds_label: str, ds_results: list[dict]) -> str:
+    """Recall@1@k table — brute-force TQDB rows interleaved with paper reference rows."""
+    paper = PAPER_RECALL.get(ds_label, {})
+    brute = [r for r in ds_results if not r["ann"]]
+    fig   = {"glove-200": "a", "dbpedia-1536": "b", "dbpedia-3072": "c"}.get(ds_label, "")
+    n, d  = ds_results[0]["n"], ds_results[0]["dim"]
+    nq    = ds_results[0]["n_queries"]
+    title = _DS_TITLE.get(ds_label, ds_label)
 
     lines: list[str] = []
-    lines.append(f"**{ds_title}** (d={d}, {n:,} corpus, {nq:,} queries, metric=ip)")
+    lines.append(f"**{title}** (d={d}, {n:,} corpus, {nq:,} queries)")
     lines.append("")
-
-    # ── Recall table ──────────────────────────────────────────────────────────
-    lines.append("*Recall@1@k — brute-force:*")
-    lines.append("")
-    hdr  = "| Config |" + "".join(f" @k={k} |" for k in K_VALUES)
-    sep  = "|---|" + "---:|" * len(K_VALUES)
+    hdr = "| Config |" + "".join(f" @k={k} |" for k in K_VALUES)
+    sep = "|---|" + "---:|" * len(K_VALUES)
     lines += [hdr, sep]
 
     for bits in BITS_LIST:
@@ -263,73 +261,58 @@ def _make_dataset_tables(ds_label: str, ds_results: list[dict]) -> str:
             row = f"| TurboQuant {bits}-bit (paper Fig. 5{fig}) |"
             row += "".join(f" ≈{_recall_pct(p[k])} |" for k in K_VALUES)
             lines.append(row)
-        b_rows = [r for r in brute if r["bits"] == bits]
-        for r in b_rows:
+        for r in (r for r in brute if r["bits"] == bits):
             lbl = f"TQDB b={bits} {'rerank=T' if r['rerank'] else 'rerank=F'}"
             row = f"| **{lbl}** |" + "".join(f" {_recall_pct(r['recall'][str(k)])} |" for k in K_VALUES)
             lines.append(row)
 
-    lines.append("")
+    return "\n".join(lines)
 
-    # ── Performance table ─────────────────────────────────────────────────────
-    lines.append("*Performance — brute-force:*")
+
+def _make_perf_block(ds_label: str, ds_results: list[dict]) -> str:
+    """Combined performance table — all 8 configs (brute + ANN), operational metrics only."""
+    brute = [r for r in ds_results if not r["ann"]]
+    ann   = [r for r in ds_results if r["ann"]]
+    n, d  = ds_results[0]["n"], ds_results[0]["dim"]
+    nq    = ds_results[0]["n_queries"]
+    title = _DS_TITLE.get(ds_label, ds_label)
+
+    lines: list[str] = []
+    lines.append(f"**{title}** (d={d}, {n:,} corpus, {nq:,} queries)")
     lines.append("")
-    lines.append("| Config | Thruput vps | Ingest | Disk MB | ΔRSS MB | p50 ms | p99 ms | MRR |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("| Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |")
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+
     for r in brute:
-        lbl  = f"b={r['bits']} {'rerank=T' if r['rerank'] else 'rerank=F'}"
-        ram  = f"{r['ram_delta_mb']:.0f}" if r['ram_delta_mb'] else "—"
-        row  = (
-            f"| {lbl} "
-            f"| {r['throughput_vps']:,} "
-            f"| {r['ingest_s']:.1f}s "
+        lbl = f"b={r['bits']} {'rerank=T' if r['rerank'] else 'rerank=F'}"
+        ram = f"{r['ram_query_peak_mb']:.0f}" if r.get('ram_query_peak_mb') else "—"
+        row = (
+            f"| {lbl} | Brute "
+            f"| {r['ingest_s']:.1f}s | — "
             f"| {r['disk_mb']:.1f} "
             f"| {ram} "
             f"| {r['p50_ms']:.2f} "
             f"| {r['p99_ms']:.2f} "
+            f"| {_recall_pct(r['recall']['1'])} "
             f"| {r['mrr']:.3f} |"
         )
         lines.append(row)
 
-    lines.append("")
-
-    # ── ANN collapsible ───────────────────────────────────────────────────────
-    if ann:
-        lines += [
-            "<details>",
-            f"<summary>ANN configs — {ds_title} (extra info)</summary>",
-            "",
-            "*Recall@1@k — ANN (HNSW):*",
-            "",
-        ]
-        lines.append("| Config |" + "".join(f" @k={k} |" for k in K_VALUES))
-        lines.append("|---|" + "---:|" * len(K_VALUES))
-        for r in ann:
-            lbl = f"TQDB b={r['bits']} {'rerank=T' if r['rerank'] else 'rerank=F'} ANN"
-            row = f"| {lbl} |" + "".join(f" {_recall_pct(r['recall'][str(k)])} |" for k in K_VALUES)
-            lines.append(row)
-        lines.append("")
-        lines.append("*Performance — ANN:*")
-        lines.append("")
-        lines.append("| Config | Thruput vps | Ingest | Index | Disk MB | ΔRSS MB | p50 ms | p99 ms | MRR |")
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
-        for r in ann:
-            lbl = f"b={r['bits']} {'rerank=T' if r['rerank'] else 'rerank=F'} ANN"
-            ram = f"{r['ram_delta_mb']:.0f}" if r['ram_delta_mb'] else "—"
-            idx = f"{r['index_s']:.1f}s" if r.get("index_s") is not None else "—"
-            row = (
-                f"| {lbl} "
-                f"| {r['throughput_vps']:,} "
-                f"| {r['ingest_s']:.1f}s "
-                f"| {idx} "
-                f"| {r['disk_mb']:.1f} "
-                f"| {ram} "
-                f"| {r['p50_ms']:.2f} "
-                f"| {r['p99_ms']:.2f} "
-                f"| {r['mrr']:.3f} |"
-            )
-            lines.append(row)
-        lines += ["", "</details>", ""]
+    for r in ann:
+        lbl = f"b={r['bits']} {'rerank=T' if r['rerank'] else 'rerank=F'}"
+        ram = f"{r['ram_query_peak_mb']:.0f}" if r.get('ram_query_peak_mb') else "—"
+        idx = f"{r['index_s']:.1f}s" if r.get("index_s") is not None else "—"
+        row = (
+            f"| {lbl} | ANN "
+            f"| {r['ingest_s']:.1f}s | {idx} "
+            f"| {r['disk_mb']:.1f} "
+            f"| {ram} "
+            f"| {r['p50_ms']:.2f} "
+            f"| {r['p99_ms']:.2f} "
+            f"| {_recall_pct(r['recall']['1'])} "
+            f"| {r['mrr']:.3f} |"
+        )
+        lines.append(row)
 
     return "\n".join(lines)
 
@@ -343,13 +326,21 @@ def make_readme_section(all_results: dict[str, list[dict]]) -> str:
         "![Config trade-off overview — latency, disk, RAM, CPU]"
         "(https://raw.githubusercontent.com/jyunming/TurboQuantDB/main/benchmarks/benchmark_plots_perf.png)"
     )
-    parts: list[str] = [_img_recall, "", _img_perf, ""]
-    for ds_label, ds_results in all_results.items():
-        parts.append(_make_dataset_tables(ds_label, ds_results))
-        parts.append("")
 
-    ds_names = list(all_results.keys())
-    brute_sample = [r for r in all_results[ds_names[0]] if not r["ann"]]
+    # ── Section 1: Algorithm Validation ──────────────────────────────────────
+    parts: list[str] = [
+        "### Algorithm Validation — Recall vs Paper",
+        "",
+        _img_recall,
+        "",
+        "Brute-force recall across all three datasets from "
+        "[arXiv:2504.19874](https://arxiv.org/abs/2504.19874) Figure 5 — "
+        "n=100k vectors, paper values read visually from plots (approximate).",
+        "",
+    ]
+    for ds_label, ds_results in all_results.items():
+        parts.append(_make_validation_block(ds_label, ds_results))
+        parts.append("")
 
     parts += [
         "The GloVe gap (~12–18% at k=1) is expected: d=200 is the hardest case "
@@ -358,7 +349,28 @@ def make_readme_section(all_results: dict[str, list[dict]]) -> str:
         "GloVe and ≤1% on DBpedia. For high-dimensional embeddings (d≥1536), TQDB matches "
         "the paper within ~5% at k=1 and within 1% from k=4.",
         "",
-        f"**Reproduction:** `maturin develop --release && python benchmarks/paper_recall_bench.py --update-readme --track`"
+    ]
+
+    # ── Section 2: Performance & Config Trade-offs ────────────────────────────
+    parts += [
+        "### Performance & Config Trade-offs",
+        "",
+        _img_perf,
+        "",
+        "All 8 configs — brute-force and ANN (HNSW md=32, ef=128). "
+        "Disk MB for ANN includes `graph.bin`. "
+        "RAM = peak RSS during query phase. "
+        "Index = HNSW build time (ANN only).",
+        "",
+    ]
+    for ds_label, ds_results in all_results.items():
+        parts.append(_make_perf_block(ds_label, ds_results))
+        parts.append("")
+
+    parts += [
+        "**Reproduction:** "
+        "`maturin develop --release && "
+        "python benchmarks/paper_recall_bench.py --update-readme --track`"
         "  (requires `pip install datasets psutil matplotlib`)",
         "",
     ]
@@ -676,13 +688,15 @@ def main() -> None:
                         help="Load saved JSON and regenerate plots only (no benchmarking)")
     args = parser.parse_args()
 
-    # ── Plots-only mode ───────────────────────────────────────────────────────
+    # ── Plots-only / readme-only mode ────────────────────────────────────────
     if args.plots_only:
         if not RESULTS_PATH.exists():
             print(f"No saved results at {RESULTS_PATH}; run without --plots-only first.")
             sys.exit(1)
         all_results = json.loads(RESULTS_PATH.read_text(encoding="utf-8"))
         generate_plots(all_results, Path(args.plots))
+        if args.update_readme:
+            patch_readme(make_readme_section(all_results))
         return
 
     # ── Full benchmark run ────────────────────────────────────────────────────
