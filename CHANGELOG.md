@@ -10,6 +10,28 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
+## [0.4.0] — 2026-04-08
+
+### Added
+- Delta overlay: vectors inserted after `create_index()` are tracked in a persisted `delta_ids.json` and merged into ANN search results without requiring a graph rebuild
+- Parallel ingest: Rayon-based quantization/normalization for large batches with sequential fallback for small ones
+
+### Fixed
+- Compaction crash recovery: segments written to `.tmp` then atomically renamed; orphan `.tmp` files cleaned on startup
+- ANN delta filter: replaced per-query `HashSet` allocation with `is_slot_alive()` O(1) check
+- `maybe_persist_state`: delta slots written to both `local_dir` and backend to prevent stale local file winning on reopen
+- S3 `rename`: switched to server-side `store.copy()` (no RAM spike) with crash-safe ordering
+- `release.yml`: `id-token: write` added to `release` job — was overridden by job-level permissions block, breaking OIDC publish
+
+### Performance
+- Batch insert: `indexed_set` built once per batch (not per chunk) — O(batch + indexed) instead of O(chunks × indexed)
+- Single-vector insert: `binary_search` O(log n) instead of `Vec::contains` O(n); `delta_slots` maintained sorted
+
+### Changed
+- `.unwrap()` audit: replaced with `.expect()` on all write/search paths for clearer panic messages
+
+---
+
 ## [0.3.0] — 2026-04-07
 
 ### Added
