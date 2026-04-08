@@ -52,7 +52,7 @@ impl Wal {
 
         Ok(Self {
             path,
-            writer: BufWriter::new(file),
+            writer: BufWriter::with_capacity(4 * 1024 * 1024, file),
             entry_count: 0,
             quantizer: None,
         })

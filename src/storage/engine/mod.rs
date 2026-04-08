@@ -785,12 +785,24 @@ impl TurboQuantEngine {
         ann_search_list_size: Option<usize>,
         use_ann: bool,
     ) -> Result<Vec<Vec<SearchResult>>, Box<dyn std::error::Error + Send + Sync>> {
-        queries
-            .iter()
-            .map(|q| {
-                self.search_with_filter_and_ann(q, top_k, filter, ann_search_list_size, use_ann)
-            })
-            .collect()
+        if use_ann {
+            // ANN path: each query uses moderate CPU (beam search), safe to parallelize.
+            queries
+                .par_iter()
+                .map(|q| {
+                    self.search_with_filter_and_ann(q, top_k, filter, ann_search_list_size, use_ann)
+                })
+                .collect()
+        } else {
+            // Brute-force path: each query already saturates the thread pool via par_chunks
+            // internally (N > 20k). Nesting par_iter causes contention — keep sequential.
+            queries
+                .iter()
+                .map(|q| {
+                    self.search_with_filter_and_ann(q, top_k, filter, ann_search_list_size, use_ann)
+                })
+                .collect()
+        }
     }
 
     ///
