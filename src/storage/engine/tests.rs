@@ -1461,6 +1461,38 @@ fn wal_recovery_upsert_and_delete_skip_paths_covered() {
     assert!(e2.vector_count() >= 1, "at least 'a' should be recovered");
 }
 
+#[test]
+fn wal_recovery_with_stale_id_pool_preserves_delete_then_reinsert() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+
+    {
+        let mut e = open_default(p, d);
+        let mut meta = no_meta();
+        meta.insert("phase".into(), json!(1));
+        e.insert_with_document("x".into(), &make_vec(d, 0.1), meta, Some("first".into()))
+            .unwrap();
+        e.flush_wal_to_segment().unwrap();
+    }
+
+    {
+        let mut e = open_default(p, d);
+        assert!(e.delete("x".into()).unwrap());
+        let mut meta = no_meta();
+        meta.insert("phase".into(), json!(2));
+        e.insert_with_document("x".into(), &make_vec(d, 0.9), meta, Some("second".into()))
+            .unwrap();
+        drop(e);
+    }
+
+    let e2 = open_default(p, d);
+    assert_eq!(e2.vector_count(), 1);
+    let got = e2.get("x").unwrap().unwrap();
+    assert_eq!(got.metadata["phase"], json!(2));
+    assert_eq!(got.document.as_deref(), Some("second"));
+}
+
 // ── IP ANN index build without raw vectors (lines 748-749) ───────────────
 // Uses prepare_ip_query_from_codes (no vraw available)
 
@@ -1846,6 +1878,32 @@ fn close_and_reopen_restores_id_pool() {
     // rebuild_lookup() called inside load_id_pool → covers id_pool.rs 123-132
     let e2 = open_default(p, d);
     assert_eq!(e2.vector_count(), 5);
+}
+
+#[test]
+fn delete_then_reinsert_persists_latest_metadata_across_reopen() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+    {
+        let mut e = open_default(p, d);
+        let mut first = no_meta();
+        first.insert("phase".into(), json!(1));
+        e.upsert_with_document("x".into(), &make_vec(d, 0.1), first, Some("first".into()))
+            .unwrap();
+        assert!(e.delete("x".into()).unwrap());
+        let mut second = no_meta();
+        second.insert("phase".into(), json!(2));
+        e.upsert_with_document("x".into(), &make_vec(d, 0.9), second, Some("second".into()))
+            .unwrap();
+        e.close().unwrap();
+    }
+
+    let e2 = open_default(p, d);
+    assert_eq!(e2.vector_count(), 1);
+    let got = e2.get("x").unwrap().unwrap();
+    assert_eq!(got.metadata["phase"], json!(2));
+    assert_eq!(got.document.as_deref(), Some("second"));
 }
 
 // ── update_with_document on existing id (lines 527-528) ──────────────────

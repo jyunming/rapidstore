@@ -482,56 +482,9 @@ impl TurboQuantEngine {
 
         let pending = Wal::replay(&wal_path, Some(&engine.quantizer))?;
         if !pending.is_empty() {
-            if !id_pool_loaded {
-                // live_ids.bin is missing (unclean shutdown). Rebuild live_codes and
-                // id_pool entirely from the WAL entries so we have a consistent base
-                // before flush_wal_to_segment compacts and persists everything.
-                //
-                // Raw vectors (live_vraw) are NOT stored in the WAL, so we cannot
-                // recover them.  Drop the stale live_vectors.bin and fall back to
-                // dequantization reranking for this session; the file is recreated
-                // automatically on the next clean insert+close cycle.
-                engine.live_codes.clear()?;
-                engine.live_vraw = None;
-                let _ = std::fs::remove_file(Path::new(&engine.local_dir).join("live_vectors.bin"));
-                engine.id_pool = IdPool::new();
-                let mse_len = engine.live_mse_len();
-                let qjl_len = engine.live_qjl_len();
-                for entry in &pending {
-                    if entry.is_deleted || entry.quantized_indices.is_empty() {
-                        continue; // deletions handled by flush_wal_to_segment
-                    }
-                    let packed_mse = engine.quantizer.pack_mse_indices(&entry.quantized_indices);
-                    let slot = if let Some(s) = engine.id_pool.get_slot(&entry.id) {
-                        // upsert: overwrite existing slot
-                        let rec = engine.live_codes.get_slot_mut(s as usize);
-                        rec[0..mse_len].copy_from_slice(&packed_mse);
-                        rec[mse_len..mse_len + qjl_len].copy_from_slice(&entry.qjl_bits);
-                        rec[mse_len + qjl_len..mse_len + qjl_len + 4]
-                            .copy_from_slice(&entry.gamma.to_le_bytes());
-                        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-                            .copy_from_slice(&entry.norm.to_le_bytes());
-                        rec[mse_len + qjl_len + 8] = 0u8;
-                        s
-                    } else {
-                        // insert: alloc new slot
-                        let s = engine.id_pool.insert(&entry.id)?;
-                        let new_slot = engine.live_codes.alloc_slot()?;
-                        debug_assert_eq!(s as usize, new_slot);
-                        let rec = engine.live_codes.get_slot_mut(new_slot);
-                        rec[0..mse_len].copy_from_slice(&packed_mse);
-                        rec[mse_len..mse_len + qjl_len].copy_from_slice(&entry.qjl_bits);
-                        rec[mse_len + qjl_len..mse_len + qjl_len + 4]
-                            .copy_from_slice(&entry.gamma.to_le_bytes());
-                        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-                            .copy_from_slice(&entry.norm.to_le_bytes());
-                        rec[mse_len + qjl_len + 8] = 0u8;
-                        s
-                    };
-                    if let Ok(meta) = serde_json::from_str::<VectorMetadata>(&entry.metadata_json) {
-                        let _ = engine.metadata.put(slot, &meta);
-                    }
-                }
+            engine.apply_wal_entries_to_live_state(&pending, !id_pool_loaded)?;
+            if pending.iter().any(|entry| entry.is_deleted) {
+                engine.has_pending_deletes = true;
             }
             engine.wal_buffer.extend(pending);
             engine.flush_wal_to_segment()?;
@@ -1826,11 +1779,11 @@ impl TurboQuantEngine {
                 is_deleted: e.is_deleted,
             })
             .collect();
-        for r in &records {
-            if r.is_deleted {
-                self.live_delete_slot(&r.id);
-            }
-        }
+        // WAL entries have already been applied to live state when they were
+        // created (normal writes) or during reopen recovery (pending WAL replay).
+        // Do not re-apply delete tombstones here by ID or a delete followed by a
+        // same-ID reinsert in the same WAL batch will incorrectly delete the
+        // newest live slot before compaction persists the final state.
         // Persist segments first so any rebuilds (if needed) read a complete view.
         self.segments.flush_batch(records)?;
         // Only compact the live slab when there are pending deletes — compaction
@@ -2245,6 +2198,54 @@ impl TurboQuantEngine {
         }
     }
 
+    fn approx_raw_vector_from_entry(&self, entry: &WalEntry) -> Vec<f32> {
+        let mut vec = self.quantizer.dequantize(
+            &entry.quantized_indices,
+            &entry.qjl_bits,
+            entry.gamma as f64,
+        );
+        vec.mapv_inplace(|x| x * entry.norm as f64);
+        vec.iter().map(|&x| x as f32).collect()
+    }
+
+    fn apply_wal_entries_to_live_state(
+        &mut self,
+        entries: &[WalEntry],
+        rebuild_from_wal_only: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if rebuild_from_wal_only {
+            self.live_codes.clear()?;
+            if let Some(vraw) = &mut self.live_vraw {
+                vraw.clear()?;
+            }
+            self.id_pool = IdPool::new();
+            self.metadata.clear();
+        }
+
+        for entry in entries {
+            if entry.is_deleted {
+                self.live_delete_slot(&entry.id);
+                continue;
+            }
+
+            let slot = self.live_alloc_or_update(
+                &entry.id,
+                &entry.quantized_indices,
+                &entry.qjl_bits,
+                entry.gamma,
+                entry.norm,
+            )?;
+            if self.live_vraw.is_some() {
+                let approx_raw = self.approx_raw_vector_from_entry(entry);
+                self.live_save_raw_vector(slot, &approx_raw);
+            }
+            let meta: VectorMetadata = serde_json::from_str(&entry.metadata_json)?;
+            self.metadata.put(slot, &meta)?;
+        }
+
+        Ok(())
+    }
+
     fn live_alloc_slot(
         &mut self,
         id: &str,
@@ -2327,6 +2328,7 @@ impl TurboQuantEngine {
         }
 
         let mut new_pool = IdPool::new();
+        let mut new_metadata = HashMap::new();
 
         for (id, old_slot) in self.live_iter_id_slots() {
             let old_rec = self.live_codes.get_slot(old_slot as usize);
@@ -2339,7 +2341,11 @@ impl TurboQuantEngine {
                 nv.get_slot_mut(next_alloc).copy_from_slice(old_vrec);
             }
 
-            new_pool.insert(&id)?;
+            let new_slot = new_pool.insert(&id)?;
+            debug_assert_eq!(new_slot as usize, next_alloc);
+            if let Some(meta) = self.metadata.get(old_slot)? {
+                new_metadata.insert(new_slot, meta);
+            }
         }
 
         new_codes.truncate_to(new_pool.active_count())?;
@@ -2373,6 +2379,7 @@ impl TurboQuantEngine {
         }
 
         self.id_pool = new_pool;
+        self.metadata.replace_all(new_metadata);
         Ok(())
     }
 

@@ -87,6 +87,19 @@ impl MetadataStore {
         Ok(())
     }
 
+    pub fn clear(&mut self) {
+        if self.data.is_empty() {
+            return;
+        }
+        self.data.clear();
+        self.dirty = true;
+    }
+
+    pub fn replace_all(&mut self, data: HashMap<u32, VectorMetadata>) {
+        self.data = data;
+        self.dirty = true;
+    }
+
     pub fn len(&self) -> usize {
         self.data.len()
     }
