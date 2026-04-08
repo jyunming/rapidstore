@@ -11,10 +11,25 @@ pub struct VectorMetadata {
     pub document: Option<String>,
 }
 
+/// Convert a scalar JSON value to an index key. Object/Array -> None (not indexable).
+fn value_to_index_key(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Null => Some("__null__".to_string()),
+        _ => None,
+    }
+}
+
 pub struct MetadataStore {
     path: PathBuf,
     data: HashMap<u32, VectorMetadata>,
     dirty: bool,
+    /// Equality index: field -> value_key -> sorted slot list.
+    /// Covers scalar (string/number/bool/null) top-level fields only.
+    /// Enables O(1) pre-filter candidate lookup for $eq filter conditions.
+    eq_index: HashMap<String, HashMap<String, Vec<u32>>>,
 }
 
 impl MetadataStore {
@@ -30,10 +45,12 @@ impl MetadataStore {
         } else {
             HashMap::new()
         };
+        let eq_index = Self::build_eq_index(&data);
         Ok(Self {
             path,
             data,
             dirty: false,
+            eq_index,
         })
     }
 
@@ -42,7 +59,9 @@ impl MetadataStore {
         slot: u32,
         meta: &VectorMetadata,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.index_remove(slot);
         self.data.insert(slot, meta.clone());
+        self.index_add(slot, meta);
         self.dirty = true;
         Ok(())
     }
@@ -55,7 +74,9 @@ impl MetadataStore {
             return Ok(());
         }
         for (slot, meta) in entries {
+            self.index_remove(*slot);
             self.data.insert(*slot, meta.clone());
+            self.index_add(*slot, meta);
         }
         self.dirty = true;
         Ok(())
@@ -82,9 +103,23 @@ impl MetadataStore {
     }
 
     pub fn delete(&mut self, slot: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.index_remove(slot);
         self.data.remove(&slot);
         self.dirty = true;
         Ok(())
+    }
+
+    /// Return all slots where `field == value`.
+    /// Only works for scalar values (string, number, bool, null).
+    /// Returns `None` when the field is not indexed or `value` is not scalar.
+    pub fn get_eq_candidates(&self, field: &str, value: &serde_json::Value) -> Option<&[u32]> {
+        let key = value_to_index_key(value)?;
+        let v = self.eq_index.get(field)?.get(&key)?;
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.as_slice())
+        }
     }
 
     pub fn clear(&mut self) {
@@ -138,6 +173,61 @@ impl MetadataStore {
         std::fs::rename(&tmp, &self.path)?;
         self.dirty = false;
         Ok(())
+    }
+
+    fn index_add(&mut self, slot: u32, meta: &VectorMetadata) {
+        for (field, val) in &meta.properties {
+            if let Some(key) = value_to_index_key(val) {
+                let slots = self
+                    .eq_index
+                    .entry(field.clone())
+                    .or_default()
+                    .entry(key)
+                    .or_default();
+                let pos = slots.partition_point(|&s| s < slot);
+                if slots.get(pos) != Some(&slot) {
+                    slots.insert(pos, slot);
+                }
+            }
+        }
+    }
+
+    fn index_remove(&mut self, slot: u32) {
+        let Some(meta) = self.data.get(&slot).cloned() else {
+            return;
+        };
+        for (field, val) in &meta.properties {
+            if let Some(key) = value_to_index_key(val) {
+                if let Some(val_map) = self.eq_index.get_mut(field.as_str()) {
+                    if let Some(slots) = val_map.get_mut(key.as_str()) {
+                        if let Ok(pos) = slots.binary_search(&slot) {
+                            slots.remove(pos);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn build_eq_index(
+        data: &HashMap<u32, VectorMetadata>,
+    ) -> HashMap<String, HashMap<String, Vec<u32>>> {
+        let mut idx: HashMap<String, HashMap<String, Vec<u32>>> = HashMap::new();
+        let mut slots_sorted: Vec<u32> = data.keys().copied().collect();
+        slots_sorted.sort_unstable();
+        for slot in slots_sorted {
+            let meta = &data[&slot];
+            for (field, val) in &meta.properties {
+                if let Some(key) = value_to_index_key(val) {
+                    idx.entry(field.clone())
+                        .or_default()
+                        .entry(key)
+                        .or_default()
+                        .push(slot);
+                }
+            }
+        }
+        idx
     }
 
     fn load_from_file(
@@ -391,5 +481,137 @@ mod tests {
         let meta = VectorMetadata::default();
         assert!(meta.properties.is_empty());
         assert!(meta.document.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // eq_index
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn eq_index_basic_string_lookup() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        store.put(0, &make_meta("status", "active")).unwrap();
+        store.put(1, &make_meta("status", "inactive")).unwrap();
+        store.put(2, &make_meta("status", "active")).unwrap();
+        let active = store.get_eq_candidates("status", &json!("active")).unwrap();
+        assert_eq!(active, &[0, 2]);
+        let inactive = store
+            .get_eq_candidates("status", &json!("inactive"))
+            .unwrap();
+        assert_eq!(inactive, &[1]);
+    }
+
+    #[test]
+    fn eq_index_missing_field_returns_none() {
+        let dir = tempdir().unwrap();
+        let store = open_store(&dir, "meta.bin");
+        assert!(
+            store
+                .get_eq_candidates("nonexistent", &json!("x"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn eq_index_missing_value_returns_none() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        store.put(0, &make_meta("status", "active")).unwrap();
+        assert!(
+            store
+                .get_eq_candidates("status", &json!("pending"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn eq_index_object_value_not_indexable() {
+        let dir = tempdir().unwrap();
+        let store = open_store(&dir, "meta.bin");
+        assert!(
+            store
+                .get_eq_candidates("nested", &json!({"a": 1}))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn eq_index_number_value() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        let mut p0 = HashMap::new();
+        p0.insert("year".to_string(), json!(2024));
+        let mut p1 = HashMap::new();
+        p1.insert("year".to_string(), json!(2023));
+        store
+            .put(
+                0,
+                &VectorMetadata {
+                    properties: p0,
+                    document: None,
+                },
+            )
+            .unwrap();
+        store
+            .put(
+                1,
+                &VectorMetadata {
+                    properties: p1,
+                    document: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(store.get_eq_candidates("year", &json!(2024)).unwrap(), &[0]);
+    }
+
+    #[test]
+    fn eq_index_updated_on_overwrite() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        store.put(0, &make_meta("status", "active")).unwrap();
+        store.put(0, &make_meta("status", "inactive")).unwrap();
+        assert!(
+            store
+                .get_eq_candidates("status", &json!("active"))
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_eq_candidates("status", &json!("inactive"))
+                .unwrap(),
+            &[0]
+        );
+    }
+
+    #[test]
+    fn eq_index_removed_on_delete() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        store.put(0, &make_meta("status", "active")).unwrap();
+        store.put(1, &make_meta("status", "active")).unwrap();
+        store.delete(0).unwrap();
+        assert_eq!(
+            store.get_eq_candidates("status", &json!("active")).unwrap(),
+            &[1]
+        );
+    }
+
+    #[test]
+    fn eq_index_rebuilt_on_reload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.bin").to_str().unwrap().to_string();
+        {
+            let mut store = MetadataStore::open(&path).unwrap();
+            store.put(0, &make_meta("color", "red")).unwrap();
+            store.put(1, &make_meta("color", "blue")).unwrap();
+            store.put(2, &make_meta("color", "red")).unwrap();
+            store.flush().unwrap();
+        }
+        let store2 = MetadataStore::open(&path).unwrap();
+        assert_eq!(
+            store2.get_eq_candidates("color", &json!("red")).unwrap(),
+            &[0, 2]
+        );
     }
 }
