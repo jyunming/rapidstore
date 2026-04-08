@@ -45,6 +45,7 @@ from bench_core import (
     K_VALUES,
     BITS_LIST,
     PAPER_RECALL,
+    PERF_METRIC_ROWS,
     CpuRamSampler,
     compute_recalls,
     compute_mrr,
@@ -418,17 +419,8 @@ _PAPER_STYLES: list[tuple[int, str, str, str]] = [
     (4, "Paper 4-bit", "#333333", "-."),
 ]
 
-_METRIC_ROWS: list[tuple[str, str]] = [
-    ("throughput_vps",      "Ingest (vps)"),
-    ("p50_ms",              "Query p50 (ms)"),
-    ("p99_ms",              "Query p99 (ms)"),
-    ("disk_mb",             "Disk (MB)"),
-    ("ram_ingest_peak_mb",  "RAM @ ingest peak (MB)"),
-    ("ram_query_peak_mb",   "RAM @ query peak (MB)"),
-    ("cpu_ingest_pct",      "CPU @ ingest (%)"),
-    ("cpu_query_pct",       "CPU @ query (%)"),
-    ("mrr",                 "MRR"),
-]
+# Use the canonical metric list from bench_core (shared with run_bench_private.py).
+_METRIC_ROWS = PERF_METRIC_ROWS
 
 # ds_label → short x-axis label
 _DS_SHORT = {

@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write   # required for PyPI Trusted Publisher (OIDC)
 
 jobs:
   # ── Linux (manylinux) ───────────────────────────────────────────────────────
@@ -187,17 +188,15 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
 
-      - name: Publish to PyPI
+      - name: Publish to PyPI (Trusted Publisher / OIDC)
         uses: PyO3/maturin-action@v1
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         with:
           command: upload
           args: --non-interactive --skip-existing dist/*
 
-  # ── Update website version badge ─────────────────────────────────────────────
-  update-website:
-    name: Update website version badge
+  # ── Update website badge + CHANGELOG.md ──────────────────────────────────────
+  update-docs:
+    name: Update website badge and CHANGELOG.md
     runs-on: ubuntu-latest
     needs: [release]
     permissions:
@@ -206,23 +205,91 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
-          fetch-depth: 1
+          fetch-depth: 0   # full history needed for git log range
 
       - name: Patch version badge in index.html
         run: |
           VERSION="${GITHUB_REF_NAME}"
           sed -i "s|<div class=\"badge\">v[^<]*</div>|<div class=\"badge\">${VERSION} Released</div>|g" website/index.html
           echo "Updated badge to: ${VERSION} Released"
-          grep -n 'badge' website/index.html
+
+      - name: Prepend release entry to CHANGELOG.md
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAG="${GITHUB_REF_NAME}"
+          TODAY=$(date -u '+%Y-%m-%d')
+
+          # Determine commit range since last tag
+          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..${TAG}"
+          else
+            RANGE="${TAG}"
+          fi
+
+          # Build the new changelog block
+          {
+            echo "## [${VERSION}] — ${TODAY}"
+            echo ""
+
+            FEATS=$(git log $RANGE --oneline --no-merges --grep="^feat" 2>/dev/null || true)
+            if [ -n "$FEATS" ]; then
+              echo "### Added"
+              git log $RANGE --oneline --no-merges --grep="^feat" | sed 's/^[a-f0-9]* /- /'
+              echo ""
+            fi
+
+            FIXES=$(git log $RANGE --oneline --no-merges --grep="^fix" 2>/dev/null || true)
+            if [ -n "$FIXES" ]; then
+              echo "### Fixed"
+              git log $RANGE --oneline --no-merges --grep="^fix" | sed 's/^[a-f0-9]* /- /'
+              echo ""
+            fi
+
+            PERFS=$(git log $RANGE --oneline --no-merges --grep="^perf" 2>/dev/null || true)
+            if [ -n "$PERFS" ]; then
+              echo "### Performance"
+              git log $RANGE --oneline --no-merges --grep="^perf" | sed 's/^[a-f0-9]* /- /'
+              echo ""
+            fi
+
+            REFACTORS=$(git log $RANGE --oneline --no-merges --grep="^refactor\|^chore\|^docs" 2>/dev/null || true)
+            if [ -n "$REFACTORS" ]; then
+              echo "### Changed"
+              git log $RANGE --oneline --no-merges --grep="^refactor\|^chore\|^docs" | sed 's/^[a-f0-9]* /- /'
+              echo ""
+            fi
+
+            echo "---"
+            echo ""
+          } > NEW_SECTION.md
+
+          # Insert after the [Unreleased] block (after the "---" that follows it)
+          # Pattern: find "## [Unreleased]", skip to the next "---", then insert
+          awk '
+            /^## \[Unreleased\]/ { print; unreleased=1; next }
+            unreleased && /^---/ {
+              print
+              print ""
+              while ((getline line < "NEW_SECTION.md") > 0) print line
+              close("NEW_SECTION.md")
+              unreleased=0
+              next
+            }
+            { print }
+          ' CHANGELOG.md > CHANGELOG.md.tmp && mv CHANGELOG.md.tmp CHANGELOG.md
+
+          echo "CHANGELOG.md updated for ${TAG}:"
+          head -30 CHANGELOG.md
 
       - name: Commit and push if changed
         run: |
           git config user.name "jyunming"
           git config user.email "69726231+jyunming@users.noreply.github.com"
-          if git diff --quiet website/index.html; then
-            echo "No change to website/index.html — skipping commit"
+          git add website/index.html CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "No changes — skipping commit"
           else
-            git add website/index.html
-            git commit -m "chore(website): bump version badge to ${GITHUB_REF_NAME}"
+            git commit -m "chore(release): bump version badge and CHANGELOG for ${GITHUB_REF_NAME}"
             git push origin main
           fi

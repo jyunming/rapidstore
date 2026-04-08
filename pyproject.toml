@@ -9,6 +9,7 @@ description = "Embedded vector database using the TurboQuant algorithm (arXiv:25
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
+authors = [{ name = "jyunming", email = "69726231+jyunming@users.noreply.github.com" }]
 keywords = ["vector-database", "vector-search", "quantization", "embeddings", "rag"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -27,9 +28,11 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jyunming/TurboQuantDB"
+Homepage = "https://jyunming.github.io/TurboQuantDB"
 Repository = "https://github.com/jyunming/TurboQuantDB"
+Documentation = "https://jyunming.github.io/TurboQuantDB"
 Issues = "https://github.com/jyunming/TurboQuantDB/issues"
+Changelog = "https://github.com/jyunming/TurboQuantDB/releases"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

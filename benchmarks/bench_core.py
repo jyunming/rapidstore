@@ -4,6 +4,8 @@ Provides:
   K_VALUES          : k values [1, 2, 4, 8, 16, 32, 64]
   BITS_LIST         : bits tested [2, 4]
   PAPER_RECALL      : paper reference recall values (arXiv:2504.19874 Fig. 5)
+  PERF_METRIC_ROWS  : canonical (key, label) list for perf plots — shared by
+                      paper_recall_bench.py and run_bench_private.py
   CKPT_DIR          : cache directory path (auto-created on first use)
   CpuRamSampler     : context manager — background-thread CPU% / RSS sampler
   compute_recalls   : Recall@1@k for multiple k values
@@ -42,6 +44,20 @@ except ImportError:  # pragma: no cover
 
 K_VALUES: list[int] = [1, 2, 4, 8, 16, 32, 64]
 BITS_LIST: list[int] = [2, 4]
+
+# Canonical metric set used by both paper_recall_bench.py and run_bench_private.py.
+# Keep these in sync — they drive both the README perf panel and the private plots.
+PERF_METRIC_ROWS: list[tuple[str, str]] = [
+    ("throughput_vps",      "Ingest (vps)"),
+    ("p50_ms",              "p50 (ms)"),
+    ("p99_ms",              "p99 (ms)"),
+    ("disk_mb",             "Disk (MB)"),
+    ("ram_ingest_peak_mb",  "RAM ingest (MB)"),
+    ("ram_query_peak_mb",   "RAM query (MB)"),
+    ("cpu_ingest_pct",      "CPU ingest (%)"),
+    ("cpu_query_pct",       "CPU query (%)"),
+    ("mrr",                 "MRR"),
+]
 
 CKPT_DIR: Path = Path(__file__).parent / "_paper_bench_cache"
 
