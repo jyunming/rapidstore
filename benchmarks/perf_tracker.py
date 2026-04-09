@@ -146,22 +146,6 @@ def _build_figure(history: list[dict], ds_key: str) -> str:
             row="all", col="all",
         )
 
-    # ── Date labels as annotations above the top row ─────────────────────────
-    # x in paper coords: map integer index to [0,1] fraction
-    x_range = n - 1  # indices 0..n-1
-    for gi, (date, s, e_idx) in enumerate(date_groups):
-        mid_idx = (s + e_idx) / 2
-        # approximate paper x: left margin ~0.05, right ~0.97
-        paper_x = 0.05 + (mid_idx / max(x_range, 1)) * 0.92
-        fig.add_annotation(
-            x=paper_x, y=1.02,
-            xref="paper", yref="paper",
-            text=f"<b>{date}</b>",
-            showarrow=False,
-            font=dict(size=10, color="#555"),
-            xanchor="center",
-        )
-
     # ── Metric traces ─────────────────────────────────────────────────────────
     for mi, (metric_suffix, _label, _higher) in enumerate(METRICS):
         row = mi // _N_COLS + 1
@@ -221,24 +205,13 @@ def _build_figure(history: list[dict], ds_key: str) -> str:
         zeroline=False,
     )
 
-    # ── Native Plotly range buttons (guaranteed to work) ─────────────────────
-    n_axes = _N_ROWS * _N_COLS  # 12 subplots → xaxis … xaxis12
-    def _range_args(last: int) -> dict:
-        min_x = max(-0.5, n - last - 0.5) if last > 0 else -0.5
-        max_x = n - 0.5
-        d: dict = {"xaxis.range": [min_x, max_x], "xaxis.autorange": False}
-        for ai in range(2, n_axes + 1):
-            d[f"xaxis{ai}.range"] = [min_x, max_x]
-            d[f"xaxis{ai}.autorange"] = False
-        return d
-
     fig.update_layout(
         height=_N_ROWS * 280 + 160,
         width=1150,
         template="plotly_white",
         font=dict(size=11),
         hovermode="x unified",
-        margin=dict(t=80, b=160, l=55, r=20),
+        margin=dict(t=60, b=160, l=55, r=20),
         legend=dict(
             orientation="h",
             xanchor="center", x=0.5,
@@ -247,23 +220,14 @@ def _build_figure(history: list[dict], ds_key: str) -> str:
             bordercolor="#ccc", borderwidth=1,
             tracegroupgap=4,
         ),
-        updatemenus=[dict(
-            type="buttons",
-            direction="left",
-            x=1.0, y=1.06,
-            xanchor="right", yanchor="bottom",
-            bgcolor="#f0f4ff",
-            bordercolor="#aac",
-            font=dict(size=11),
-            buttons=[
-                dict(label="Last 5",  method="relayout", args=[_range_args(5)]),
-                dict(label="Last 10", method="relayout", args=[_range_args(10)]),
-                dict(label="All",     method="relayout", args=[_range_args(0)]),
-            ],
-        )],
     )
 
-    return fig.to_html(full_html=False, include_plotlyjs=False)
+    # Prefix with "plot_" so the div ID never collides with the tab pane ID.
+    return fig.to_html(
+        full_html=False,
+        include_plotlyjs=False,
+        div_id=f"plot_{ds_key.replace('-', '')}",  # e.g. "plot_glove200", "plot_dbpedia1536"
+    )
 
 
 def generate_html_plotly(history: list[dict], out_path: Path) -> None:
@@ -272,14 +236,55 @@ def generate_html_plotly(history: list[dict], out_path: Path) -> None:
     except ImportError as exc:
         raise ImportError("pip install plotly") from exc
 
-    tab_js = """
+    n = len(history)
+    n_axes = _N_ROWS * _N_COLS  # 12
+
+    # Div IDs match the ds_key with "-" stripped: glove200, dbpedia1536, dbpedia3072
+    plot_ids = {ds_key: ds_key.replace("-", "") for ds_key, _, _ in DATASETS}
+
+    tab_js = f"""
 <script>
-function showTab(tabId, btn) {
-  document.querySelectorAll('.tab-pane').forEach(function(d){ d.style.display='none'; });
-  document.querySelectorAll('.tab-btn').forEach(function(b){ b.classList.remove('active'); });
-  document.getElementById(tabId).style.display = 'block';
+var TQDB_N = {n};
+var TQDB_N_AXES = {n_axes};
+
+// Switch dataset tab; mark pane with CSS class so setRange can find it reliably.
+function showTab(tabId, btn) {{
+  document.querySelectorAll('.tab-pane').forEach(function(d){{
+    d.style.display = 'none';
+    d.classList.remove('active-pane');
+  }});
+  document.querySelectorAll('.tab-btn').forEach(function(b){{ b.classList.remove('active'); }});
+  var pane = document.getElementById(tabId);
+  pane.style.display = 'block';
+  pane.classList.add('active-pane');
   btn.classList.add('active');
-}
+  // Resize the Plotly figure inside the newly-visible tab.
+  var gd = pane.querySelector('.plotly-graph-div');
+  if (gd && window.Plotly) {{ Plotly.Plots.resize(gd); }}
+}}
+
+// Set the x-axis range on all subplots of the currently active figure.
+// last=0 means show all commits; last=N means show the most recent N commits.
+function setRange(last) {{
+  var pane = document.querySelector('.tab-pane.active-pane');
+  if (!pane) pane = document.querySelector('.tab-pane');  // fallback: first pane
+  if (!pane) return;
+  var gd = pane.querySelector('.plotly-graph-div');
+  if (!gd || !window.Plotly) return;
+  var maxX = TQDB_N - 0.5;
+  var minX = (last > 0) ? Math.max(-0.5, TQDB_N - last - 0.5) : -0.5;
+  // Deep-copy the live layout (preserves domain, tickvals, etc.) then patch
+  // only the range on every x-axis. Plotly.react re-renders efficiently with
+  // the full layout object — avoids the partial-update bugs in Plotly.js 3.x.
+  var layout = JSON.parse(JSON.stringify(gd.layout));
+  Object.keys(layout).forEach(function(key) {{
+    if (key === 'xaxis' || /^xaxis\d+$/.test(key)) {{
+      layout[key].range = [minX, maxX];
+      layout[key].autorange = false;
+    }}
+  }});
+  Plotly.react(gd.id, gd.data, layout);
+}}
 </script>
 """
 
@@ -287,7 +292,7 @@ function showTab(tabId, btn) {
 <style>
 body { font-family: sans-serif; margin: 24px; background: #fafafa; }
 h1   { color: #222; margin-bottom: 16px; }
-.tab-bar  { display: flex; gap: 8px; margin-bottom: 20px; }
+.tab-bar  { display: flex; gap: 8px; margin-bottom: 0; }
 .tab-btn  {
   padding: 8px 20px; border: 1px solid #ccc; border-radius: 6px 6px 0 0;
   background: #eee; cursor: pointer; font-size: 14px; font-weight: 500;
@@ -298,6 +303,13 @@ h1   { color: #222; margin-bottom: 16px; }
                   font-weight: 700; box-shadow: 0 -2px 6px rgba(0,0,0,0.06); }
 .tab-pane { border: 1px solid #ccc; border-radius: 0 6px 6px 6px;
             background: #fff; padding: 16px; }
+.range-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.range-bar span { font-size: 13px; color: #555; }
+.range-btn {
+  padding: 4px 14px; border: 1px solid #aac; border-radius: 4px;
+  background: #f0f4ff; cursor: pointer; font-size: 12px; color: #334;
+}
+.range-btn:hover { background: #dde8ff; }
 </style>
 """
 
@@ -306,10 +318,10 @@ h1   { color: #222; margin-bottom: 16px; }
         "<meta charset='utf-8'>",
         "<title>TurboQuantDB Performance History</title>",
         tab_css,
-        "<script src='https://cdn.plot.ly/plotly-latest.min.js'></script>",
+        "<script src='https://cdn.plot.ly/plotly-3.4.0.min.js'></script>",
         tab_js,
         "</head><body>",
-        f"<h1>TurboQuantDB \u2014 Performance History ({len(history)} entries)</h1>",
+        f"<h1>TurboQuantDB \u2014 Performance History ({n} entries)</h1>",
         "<div class='tab-bar'>",
     ]
 
@@ -322,10 +334,21 @@ h1   { color: #222; margin-bottom: 16px; }
         )
     parts.append("</div>")
 
-    # Tab panes
+    # Tab panes (first one pre-marked as active for setRange fallback)
     for i, (ds_key, ds_label, tab_id) in enumerate(DATASETS):
         display = "block" if i == 0 else "none"
-        parts.append(f"<div id='{tab_id}' class='tab-pane' style='display:{display}'>")
+        extra_class = " active-pane" if i == 0 else ""
+        parts.append(f"<div id='{tab_id}' class='tab-pane{extra_class}' style='display:{display}'>")
+
+        # Range buttons (plain HTML, call setRange() via JS)
+        parts.append(
+            "<div class='range-bar'>"
+            "<span>Show commits:</span>"
+            "<button class='range-btn' onclick='setRange(5)'>Last 5</button>"
+            "<button class='range-btn' onclick='setRange(10)'>Last 10</button>"
+            "<button class='range-btn' onclick='setRange(0)'>All</button>"
+            "</div>"
+        )
 
         if any(ds_key in e.get("results", {}) for e in history):
             fig_html = _build_figure(history, ds_key)
@@ -337,7 +360,7 @@ h1   { color: #222; margin-bottom: 16px; }
 
     parts.append("</body></html>")
     out_path.write_text("\n".join(parts), encoding="utf-8")
-    print(f"  History report saved to {out_path} ({len(history)} entries)", flush=True)
+    print(f"  History report saved to {out_path} ({n} entries)", flush=True)
 
 
 def print_summary(history: list[dict]) -> None:
