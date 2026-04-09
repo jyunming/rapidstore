@@ -38,6 +38,11 @@ db = Database.open(
     normalize=False,         # bool — L2-normalize every inserted vector and every query at
                              #        write time; makes inner-product scoring equivalent to
                              #        cosine similarity without changing the metric parameter
+    quantizer_type=None,     # str|None — None/"srht" (default, O(d log d)) or "exact"
+                             #            "exact" uses QR-random orthogonal rotation + dense
+                             #            i.i.d. N(0,1) Gaussian projection — the algorithm
+                             #            specified in the paper (O(d²), more memory, slower
+                             #            ingest at high d; SRHT matches or exceeds recall).
 )
 
 # Parameterless reopen — reads all parameters from manifest.json:

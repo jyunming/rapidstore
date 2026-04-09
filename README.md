@@ -102,7 +102,8 @@ for r in results:
 # Open / create
 db = Database.open(path, dimension, bits=4, seed=42, metric="ip",
                    rerank=True, fast_mode=False, rerank_precision=None,
-                   collection=None, wal_flush_threshold=None)  # wal_flush_threshold default=5000; set higher for bulk loads
+                   collection=None, wal_flush_threshold=None,
+                   quantizer_type=None)  # None/"srht" (default) or "exact" (paper-exact QR + Gaussian, O(d²))
 
 # Write
 db.insert(id, vector, metadata=None, document=None)
@@ -264,6 +265,37 @@ All 8 configs — brute-force and ANN (HNSW md=32, ef=128). Disk MB for ANN incl
 
 **Reproduction:** `maturin develop --release && python benchmarks/paper_recall_bench.py --update-readme --track`  (requires `pip install datasets psutil matplotlib`)
 
+### SRHT vs. Exact Mode Comparison
+
+The default SRHT mode (O(d log d)) is an approximation of the paper's QR + dense Gaussian construction. Both are available; below is a side-by-side comparison on the paper benchmark datasets (brute-force, no reranking). Full script: [`benchmarks/compare_quantizers_paper.py`](https://github.com/jyunming/TurboQuantDB/blob/main/benchmarks/compare_quantizers_paper.py).
+
+**GloVe-200** (d=200, 100k corpus, 10k queries)
+
+| Config | R@1 | R@4 | R@8 | MRR | Ingest vps | p50 ms | Disk MB | CPU ingest |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **SRHT** b=2 | 37.1% | 62.0% | 73.0% | 0.502 | 81,750 | 16.80 | 17.8 | 10% |
+| Exact b=2 | 32.8% | 56.1% | 66.9% | 0.452 | 44,415 | 16.25 | 16.6 | 36% |
+| **SRHT** b=4 | 73.9% | 96.4% | 99.2% | 0.842 | 48,206 | 17.60 | 24.8 | 16% |
+| Exact b=4 | 71.1% | 95.2% | 98.7% | 0.821 | 42,995 | 10.56 | 22.0 | 26% |
+
+**DBpedia-1536** (d=1536, 100k corpus, 1k queries)
+
+| Config | R@1 | R@4 | R@8 | MRR | Ingest vps | p50 ms | Disk MB | CPU ingest |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **SRHT** b=2 | 79.7% | 98.3% | 99.7% | 0.882 | 25,304 | 36.68 | 66.8 | 23% |
+| Exact b=2 | 79.3% | 97.5% | 99.6% | 0.877 | 1,385 | 34.26 | 70.8 | 82% |
+| **SRHT** b=4 | 92.6% | 99.9% | 100.0% | 0.961 | 11,991 | 55.48 | 122.8 | 19% |
+| Exact b=4 | 90.5% | 99.9% | 100.0% | 0.949 | 1,126 | 55.31 | 112.8 | 79% |
+
+**DBpedia-3072** (d=3072) — exact skipped: O(d²) = 9.4M ops/vec is prohibitive
+
+| Config | R@1 | R@4 | MRR | Ingest vps | p50 ms | Disk MB |
+|---|---:|---:|---:|---:|---:|---:|
+| **SRHT** b=2 | 84.6% | 99.0% | 0.913 | 10,719 | 101.4 | 122.8 |
+| **SRHT** b=4 | 94.8% | 100.0% | 0.972 | 5,459 | 119.4 | 234.8 |
+
+**Observations:** On these datasets, SRHT achieves equal or higher recall than the exact paper algorithm at all configurations tested, while ingesting 10–95× faster at high dimensions and using 4–5× less CPU. The recall advantage likely stems from SRHT padding to the next power of two (d=200→256, d=1536→2048 codes), which provides finer quantization. However, SRHT is a mathematical approximation of the QR + Gaussian construction with different theoretical guarantees. The results warrant further verification across more diverse datasets and conditions before drawing firm conclusions — use `quantizer_type="exact"` to run the original paper algorithm.
+
 <!-- PAPER_BENCH_END -->
 
 ### When to use brute-force vs. ANN
@@ -355,23 +387,25 @@ TurboQuantDB is an embedded database — it runs in-process with no daemon.
 └── seg-XXXXXXXX.bin     — Immutable flushed segment files
 ```
 
-**Write path:** `insert()` → quantize (QR rotation → MSE → Gaussian QJL) → WAL → `live_codes.bin` → flush to segment
+**Write path:** `insert()` → quantize (SRHT rotation → MSE → SRHT QJL) → WAL → `live_codes.bin` → flush to segment
 
 **Search (brute-force):** query → precompute lookup tables → score all live vectors → top-k
 
 **Search (ANN):** query → HNSW beam search → rerank → top-k
 
-**Quantization:** Two-stage pipeline:
-1. **MSE** — QR rotation + Lloyd-Max scalar quantization to `bits` per coordinate
-2. **QJL** — Dense Gaussian projection, 1-bit quantized, bit-packed
+**Quantization:** Two-stage pipeline as specified in the paper:
+1. **MSE** — random orthogonal rotation (QR) + Lloyd-Max scalar quantization to `bits` per coordinate
+2. **QJL** — dense i.i.d. N(0,1) Gaussian projection, 1-bit quantized, bit-packed
 
 The combination gives unbiased inner product estimates with near-optimal distortion, requiring no training data.
+
+**SRHT approximation (default):** The default implementation substitutes SRHT (Walsh-Hadamard × random ±1 diagonal) for both the QR rotation and the Gaussian projection. SRHT runs in O(d log d) vs the paper's O(d²), uses O(d) memory vs O(d²), and pads vectors to the next power of two — giving *more* quantization codes than the exact algorithm and often matching or exceeding exact-mode recall. However, SRHT is a mathematical approximation of the paper's construction with different theoretical guarantees. More rigorous verification and comparison across a wider range of datasets and conditions is needed before drawing firm conclusions. Use `quantizer_type="exact"` to run the original paper algorithm.
 
 ### What comes from the paper vs. what is added here
 
 The TurboQuant paper contributes the **quantization algorithm** — how to compress vectors and estimate inner products accurately. Its experiments use flat (exhaustive) search: all database vectors are scored against every query using the LUT-based asymmetric scorer. The paper's "indexing time virtually zero" claim refers to the quantizer requiring no training data, not to graph construction.
 
-**From the paper:** two-stage MSE + QJL quantization, QR rotation, Lloyd-Max codebook, asymmetric LUT scoring, unbiased inner product estimation.
+**From the paper:** two-stage MSE + QJL quantization, Lloyd-Max codebook, asymmetric LUT scoring, unbiased inner product estimation. The paper specifies QR-random orthogonal rotation and dense Gaussian projection — available as `quantizer_type="exact"`. The default implementation uses SRHT (O(d log d)) as an approximation that is faster and more memory-efficient; initial benchmarks show it matching or exceeding exact-mode recall, but further verification is needed to fully characterize the trade-offs.
 
 **Added by TurboQuantDB (not in the paper):** WAL persistence, memory-mapped storage, metadata/documents, HNSW graph index, reranking, Python bindings, and the HTTP server.
 
@@ -388,8 +422,8 @@ The brute-force search path (`_use_ann=False`, the default) is the paper-conform
 | `src/storage/live_codes.rs` | Memory-mapped hot vector cache |
 | `src/storage/graph.rs` | HNSW graph index |
 | `src/quantizer/prod.rs` | `ProdQuantizer` — MSE + QJL orchestrator |
-| `src/quantizer/mse.rs` | `MseQuantizer` — QR rotation + Lloyd-Max codebook |
-| `src/quantizer/qjl.rs` | `QjlQuantizer` — 1-bit Gaussian projection, bit-packed |
+| `src/quantizer/mse.rs` | `MseQuantizer` — SRHT rotation + Lloyd-Max codebook (exact: QR via `quantizer_type="exact"`) |
+| `src/quantizer/qjl.rs` | `QjlQuantizer` — 1-bit SRHT projection, bit-packed (exact: dense Gaussian) |
 | `python/tqdb/rag.py` | `TurboQuantRetriever` — LangChain-style wrapper |
 | `server/` | Optional Axum HTTP service (separate Cargo workspace) |
 
