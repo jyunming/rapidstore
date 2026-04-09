@@ -63,7 +63,7 @@ impl Database {
     ///     # Equivalent cosine-via-IP with auto-normalization:
     ///     db = Database.open("mydb", dimension=1536, bits=4, metric="ip", normalize=True)
     #[staticmethod]
-    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false))]
+    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false, quantizer_type=None))]
     fn open(
         path: String,
         dimension: Option<usize>,
@@ -76,6 +76,7 @@ impl Database {
         collection: Option<&str>,
         wal_flush_threshold: Option<usize>,
         normalize: bool,
+        quantizer_type: Option<String>,
     ) -> PyResult<Self> {
         let engine_path = match collection {
             Some(col) if !col.is_empty() => {
@@ -146,6 +147,7 @@ impl Database {
             precision,
             wal_flush_threshold,
             normalize,
+            quantizer_type,
         )
         .map_err(to_py_runtime)?;
         Ok(Self {
@@ -511,6 +513,35 @@ impl Database {
             let mut engine = self.write_engine()?;
             engine
                 .create_index_with_params(
+                    max_degree.unwrap_or(32),
+                    ef_construction.unwrap_or(200),
+                    search_list_size.unwrap_or(128),
+                    alpha.unwrap_or(1.2),
+                    n_refinements.unwrap_or(5),
+                )
+                .map_err(to_py_runtime)
+        })
+    }
+
+    /// Incrementally extend an existing HNSW index with vectors inserted since the last
+    /// ``create_index()`` call. If no graph exists, behaves like ``create_index()``.
+    ///
+    /// Significantly faster than a full rebuild for small deltas (< ~10% of corpus).
+    /// For large deltas, prefer ``create_index()`` to get the full quality build.
+    #[pyo3(signature = (max_degree=None, ef_construction=None, search_list_size=None, alpha=None, n_refinements=None))]
+    fn update_index(
+        &self,
+        py: Python<'_>,
+        max_degree: Option<usize>,
+        ef_construction: Option<usize>,
+        search_list_size: Option<usize>,
+        alpha: Option<f64>,
+        n_refinements: Option<usize>,
+    ) -> PyResult<()> {
+        py.allow_threads(|| {
+            let mut engine = self.write_engine()?;
+            engine
+                .create_index_incremental(
                     max_degree.unwrap_or(32),
                     ef_construction.unwrap_or(200),
                     search_list_size.unwrap_or(128),

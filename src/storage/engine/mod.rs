@@ -18,7 +18,9 @@ use super::wal::{Wal, WalEntry};
 use crate::quantizer::CodeIndex;
 use crate::quantizer::prod::ProdQuantizer;
 mod filter;
-use filter::{get_nested_field, metadata_matches_filter, score_vectors_with_metric};
+use filter::{
+    extract_indexable_eq, get_nested_field, metadata_matches_filter, score_vectors_with_metric,
+};
 
 const QUANTIZER_STATE_FILE: &str = "quantizer.bin";
 const INDEX_IDS_FILE: &str = "graph_ids.json";
@@ -91,6 +93,10 @@ pub struct Manifest {
     /// repeating the normalisation themselves.
     #[serde(default)]
     pub normalize: bool,
+    /// Which quantizer variant is in use: `"srht"` (default) or `"exact"` (paper-exact).
+    /// Persisted so reopened DBs load the correct `quantizer.bin`.
+    #[serde(default)]
+    pub quantizer_type: String,
 }
 
 fn default_rerank_enabled() -> bool {
@@ -293,7 +299,7 @@ impl TurboQuantEngine {
             RerankPrecision::Disabled
         };
         Self::open_with_options(
-            uri, local_dir, d, b, seed, metric, rerank, fast_mode, precision, None, false,
+            uri, local_dir, d, b, seed, metric, rerank, fast_mode, precision, None, false, None,
         )
     }
 
@@ -309,6 +315,7 @@ impl TurboQuantEngine {
         rerank_precision: RerankPrecision,
         wal_flush_threshold: Option<usize>,
         normalize: bool,
+        quantizer_type: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(local_dir)?;
         let manifest_path = format!("{}/manifest.json", local_dir);
@@ -364,7 +371,10 @@ impl TurboQuantEngine {
             let q = load_quantizer_state(local_dir, &backend)?;
             (m, q)
         } else {
-            let q = if fast_mode {
+            let qt = quantizer_type.as_deref().unwrap_or("srht");
+            let q = if qt == "exact" {
+                ProdQuantizer::new_exact(d, b, seed)
+            } else if fast_mode {
                 ProdQuantizer::new_srht(d, b, seed)
             } else {
                 ProdQuantizer::new(d, b, seed)
@@ -383,6 +393,7 @@ impl TurboQuantEngine {
                 fast_mode,
                 rerank_precision,
                 normalize,
+                quantizer_type: qt.to_string(),
             };
             save_quantizer_state(local_dir, &backend, &q)?;
             m.save(&manifest_path)?;
@@ -409,9 +420,10 @@ impl TurboQuantEngine {
         let metadata = MetadataStore::open(&metadata_path)?;
         let graph = GraphManager::open(backend.clone(), local_dir)?;
 
-        let n = manifest.d.next_power_of_two();
-        let qjl_len = n.div_ceil(8);
-        let mse_len = (n * (manifest.b - 1)).div_ceil(8);
+        // Use quantizer.n (not manifest.d.next_power_of_two()) so that exact mode (n=d)
+        // and SRHT mode (n=next_power_of_two(d)) both get the correct stride.
+        let qjl_len = quantizer.n.div_ceil(8);
+        let mse_len = (quantizer.n * (manifest.b - 1)).div_ceil(8);
         let stride = mse_len + qjl_len + LIVE_GAMMA_BYTES + LIVE_NORM_BYTES + LIVE_DELETED_BYTES;
         let live_codes = LiveCodesFile::open(Path::new(local_dir).join("live_codes.bin"), stride)?;
         let live_vraw_path = Path::new(local_dir).join("live_vectors.bin");
@@ -1243,21 +1255,57 @@ impl TurboQuantEngine {
                     .unwrap_or(64)
             });
 
-            // Pre-filter support
-            let filter_slots = if let Some(f) = filter {
-                let mut matches = Vec::new();
+            // Pre-filter support: resolve matching slots.
+            // Fast path uses eq_index for O(1) candidate lookup on pure-$eq filters.
+            // Query planner: if the filtered candidate set is small (< N/20 = 5%),
+            // route to brute-force — HNSW graph traversal adds more overhead than it saves.
+            let active_n = self.id_pool.active_count();
+            const PLANNER_SELECTIVE_THRESHOLD: usize = 20; // route to brute-force if < N/20
+            let filter_slots: Option<Vec<u32>> = if let Some(f) = filter {
                 let active = self.id_pool.iter_active();
-                let slots: Vec<u32> = active.iter().map(|(_, s)| *s).collect();
-                let meta_map = self.metadata.get_many(&slots)?;
-                for (_, slot) in active {
-                    if let Some(meta) = meta_map.get(&slot) {
-                        if metadata_matches_filter(&meta.properties, f) {
-                            matches.push(slot);
-                        }
+                let active_set: std::collections::HashSet<u32> =
+                    active.iter().map(|(_, s)| *s).collect();
+
+                let matches = if let Some(indexed) = self.resolve_filter_via_index(f, &active_set) {
+                    let all_eq = extract_indexable_eq(f)
+                        .map(|eqs| eqs.len() == f.len())
+                        .unwrap_or(false);
+                    if all_eq {
+                        indexed
+                    } else {
+                        let meta_map = self.metadata.get_many(&indexed)?;
+                        indexed
+                            .into_iter()
+                            .filter(|s| {
+                                meta_map
+                                    .get(s)
+                                    .is_some_and(|m| metadata_matches_filter(&m.properties, f))
+                            })
+                            .collect()
                     }
-                }
+                } else {
+                    // O(n) fallback
+                    let slots: Vec<u32> = active_set.into_iter().collect();
+                    let meta_map = self.metadata.get_many(&slots)?;
+                    let mut v: Vec<u32> = slots
+                        .into_iter()
+                        .filter(|s| {
+                            meta_map
+                                .get(s)
+                                .is_some_and(|m| metadata_matches_filter(&m.properties, f))
+                        })
+                        .collect();
+                    v.sort_unstable();
+                    v
+                };
+
                 if matches.is_empty() {
                     return Ok(Vec::new());
+                }
+
+                // Query planner: if very selective, brute-force beats HNSW.
+                if matches.len() < active_n / PLANNER_SELECTIVE_THRESHOLD {
+                    return self.exhaustive_search_simd(query, top_k, filter, Some(matches));
                 }
                 Some(matches)
             } else {
@@ -1439,6 +1487,53 @@ impl TurboQuantEngine {
         self.exhaustive_search_simd(query, top_k, filter, None)
     }
 
+    /// Try to resolve filter candidates using the eq_index for O(1) lookup.
+    ///
+    /// Returns `Some(slots)` when the filter consists entirely of simple `$eq` conditions
+    /// that are all covered by the index, intersected with `active_slots`.
+    /// Returns `None` when the filter is not indexable (falls back to O(n) scan).
+    fn resolve_filter_via_index(
+        &self,
+        filter: &HashMap<String, JsonValue>,
+        active_slots: &std::collections::HashSet<u32>,
+    ) -> Option<Vec<u32>> {
+        let conditions = extract_indexable_eq(filter)?;
+        // For each condition, look up the eq_index. On a miss (field/value not present),
+        // return an empty candidate set immediately — the intersection is empty.
+        let mut result: Option<Vec<u32>> = None;
+        for (field, val) in conditions {
+            let indexed = self.metadata.get_eq_candidates(field, val)?;
+            let set: Vec<u32> = if let Some(prev) = &result {
+                // Intersect with previous result (both are sorted).
+                let mut intersected = Vec::new();
+                let mut i = 0;
+                let mut j = 0;
+                while i < prev.len() && j < indexed.len() {
+                    match prev[i].cmp(&indexed[j]) {
+                        std::cmp::Ordering::Equal => {
+                            intersected.push(prev[i]);
+                            i += 1;
+                            j += 1;
+                        }
+                        std::cmp::Ordering::Less => i += 1,
+                        std::cmp::Ordering::Greater => j += 1,
+                    }
+                }
+                intersected
+            } else {
+                indexed.to_vec()
+            };
+            result = Some(set);
+        }
+        // Filter to only active slots.
+        result.map(|slots| {
+            slots
+                .into_iter()
+                .filter(|s| active_slots.contains(s))
+                .collect()
+        })
+    }
+
     /// Score a set of candidate slots against `query` and return the top-`top_k` results.
     ///
     /// `forced_slots`: when `Some`, these slots are scored directly (after optional filter).
@@ -1481,16 +1576,43 @@ impl TurboQuantEngine {
                     return Ok(Vec::new());
                 }
                 if let Some(f) = filter {
-                    let all_slots: Vec<u32> = active.iter().map(|(_, s)| *s).collect();
-                    let meta_map = self.metadata.get_many(&all_slots)?;
-                    all_slots
-                        .into_iter()
-                        .filter(|s| {
-                            meta_map
-                                .get(s)
-                                .is_some_and(|m| metadata_matches_filter(&m.properties, f))
-                        })
-                        .collect()
+                    let active_set: std::collections::HashSet<u32> =
+                        active.iter().map(|(_, s)| *s).collect();
+                    // Fast path: try eq_index for O(1) candidate resolution.
+                    if let Some(indexed_slots) = self.resolve_filter_via_index(f, &active_set) {
+                        // Still need full filter eval in case there are additional conditions
+                        // beyond the indexed ones (e.g. range operators alongside $eq).
+                        let all_eq = extract_indexable_eq(f)
+                            .map(|eqs| eqs.len() == f.len())
+                            .unwrap_or(false);
+                        if all_eq {
+                            indexed_slots
+                        } else {
+                            let meta_map = self.metadata.get_many(&indexed_slots)?;
+                            indexed_slots
+                                .into_iter()
+                                .filter(|s| {
+                                    meta_map
+                                        .get(s)
+                                        .is_some_and(|m| metadata_matches_filter(&m.properties, f))
+                                })
+                                .collect()
+                        }
+                    } else {
+                        // Fallback: O(n) scan.
+                        let all_slots: Vec<u32> = active_set.into_iter().collect();
+                        let meta_map = self.metadata.get_many(&all_slots)?;
+                        let mut cands: Vec<u32> = all_slots
+                            .into_iter()
+                            .filter(|s| {
+                                meta_map
+                                    .get(s)
+                                    .is_some_and(|m| metadata_matches_filter(&m.properties, f))
+                            })
+                            .collect();
+                        cands.sort_unstable();
+                        cands
+                    }
                 } else {
                     active.iter().map(|(_, s)| *s).collect()
                 }
@@ -1879,6 +2001,7 @@ impl TurboQuantEngine {
             RerankPrecision::Disabled,
             None,
             false,
+            None,
         )
     }
 
@@ -2056,6 +2179,124 @@ impl TurboQuantEngine {
         ef_construction: usize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.create_index_with_params(max_degree, ef_construction, 128, 1.2, 5)
+    }
+
+    /// Incrementally extend an existing HNSW index with vectors inserted since the last
+    /// `create_index()` call (the delta overlay). If no graph exists, performs a full build.
+    ///
+    /// Delta vectors are merged into the graph using an MSE+Hamming scorer and `delta_slots`
+    /// is cleared. Significantly faster than full rebuild for small deltas (< ~10% of corpus).
+    pub fn create_index_incremental(
+        &mut self,
+        max_degree: usize,
+        ef_construction: usize,
+        search_list_size: usize,
+        alpha: f64,
+        n_refinements: usize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.delta_slots.is_empty() && self.graph.has_index() {
+            return Ok(());
+        }
+        if !self.graph.has_index() {
+            return self.create_index_with_params(
+                max_degree,
+                ef_construction,
+                search_list_size,
+                alpha,
+                n_refinements,
+            );
+        }
+
+        self.flush_wal_to_segment()?;
+
+        let mut id_slot_pairs = self.live_iter_id_slots();
+        if id_slot_pairs.is_empty() {
+            return Ok(());
+        }
+        id_slot_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let indexed_slots: Vec<u32> = id_slot_pairs.iter().map(|(_, slot)| *slot).collect();
+        let new_total = indexed_slots.len();
+
+        // Pre-cache MSE codes and QJL bits for all nodes (existing + delta).
+        // Uses the same MSE+Hamming scoring as the no-raw-vecs path in create_index_with_params.
+        let live_codes = &self.live_codes;
+        let qjl_len = self.live_qjl_len();
+        let mse_len = self.live_mse_len();
+        let quantizer = self.quantizer.clone();
+        let qn = quantizer.n;
+        let is_fast_mode = self.manifest.fast_mode;
+        let cached_qjl_len = if is_fast_mode { 0 } else { qjl_len };
+
+        let n_idx = new_total;
+        let mut all_mse = vec![0u16; n_idx * qn];
+        let mut all_qjl = vec![0u8; n_idx * cached_qjl_len.max(1)];
+        let mut all_norm = vec![0.0f32; n_idx];
+
+        for (i, &slot) in indexed_slots.iter().enumerate() {
+            let rec = live_codes.get_slot(slot as usize);
+            quantizer.unpack_mse_indices(&rec[..mse_len], &mut all_mse[i * qn..(i + 1) * qn]);
+            if cached_qjl_len > 0 {
+                all_qjl[i * cached_qjl_len..(i + 1) * cached_qjl_len]
+                    .copy_from_slice(&rec[mse_len..mse_len + qjl_len]);
+            }
+            all_norm[i] = f32::from_le_bytes(
+                rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                    .try_into()
+                    .expect("live_codes norm field is always 4 bytes"),
+            );
+        }
+
+        let build_scorer = move |from: u32, candidates: &[u32]| -> Vec<(u32, f64)> {
+            let fi = from as usize;
+            let from_i = &all_mse[fi * qn..(fi + 1) * qn];
+            let from_q = if cached_qjl_len > 0 {
+                &all_qjl[fi * cached_qjl_len..(fi + 1) * cached_qjl_len]
+            } else {
+                &[]
+            };
+            let mse_prep = quantizer.prepare_ip_query_from_codes(from_i);
+            candidates
+                .iter()
+                .map(|&to| {
+                    let ti = to as usize;
+                    let to_i = &all_mse[ti * qn..(ti + 1) * qn];
+                    let to_q = if cached_qjl_len > 0 {
+                        &all_qjl[ti * cached_qjl_len..(ti + 1) * cached_qjl_len]
+                    } else {
+                        &[]
+                    };
+                    let to_n = all_norm[ti];
+                    let mse_score = quantizer.score_ip_encoded_lite(&mse_prep, to_i, &[], 0.0);
+                    let hamming_bonus = if !from_q.is_empty() && !to_q.is_empty() {
+                        quantizer.hamming_proximity(from_q, to_q) - 0.5
+                    } else {
+                        0.0
+                    };
+                    (to, (mse_score + hamming_bonus) * to_n as f64)
+                })
+                .collect()
+        };
+
+        self.graph.build_incremental(
+            new_total,
+            max_degree,
+            ef_construction,
+            n_refinements,
+            alpha,
+            build_scorer,
+        )?;
+
+        self.index_ids = indexed_slots;
+        self.index_ids_dirty = true;
+        self.delta_slots.clear();
+        self.delta_slots_dirty = true;
+
+        if let Some(state) = self.manifest.index_state.as_mut() {
+            state.indexed_nodes = self.index_ids.len();
+            state.search_list_size = search_list_size;
+        }
+        self.maybe_persist_state(true)?;
+        Ok(())
     }
 
     /// List collection names (subdirectories containing a `manifest.json`) under
