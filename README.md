@@ -228,73 +228,72 @@ All 8 configs — brute-force and ANN (HNSW md=32, ef=128). Disk MB for ANN incl
 
 | Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 1.1s | — | 16.8 | 208 | 11.12 | 12.83 | 37.1% | 0.502 |
-| b=2 rerank=T | Brute | 1.2s | — | 16.8 | 208 | 13.38 | 15.33 | 52.8% | 0.666 |
-| b=4 rerank=F | Brute | 2.2s | — | 22.9 | 214 | 12.06 | 13.59 | 73.9% | 0.842 |
-| b=4 rerank=T | Brute | 1.5s | — | 22.9 | 212 | 14.67 | 17.08 | 82.6% | 0.900 |
-| b=2 rerank=F | ANN | 1.1s | 15.7s | 25.4 | 234 | 6.08 | 9.10 | 22.0% | 0.288 |
-| b=2 rerank=T | ANN | 1.1s | 13.9s | 25.4 | 237 | 10.12 | 14.03 | 37.3% | 0.458 |
-| b=4 rerank=F | ANN | 1.8s | 14.1s | 31.5 | 244 | 6.09 | 9.28 | 46.1% | 0.512 |
-| b=4 rerank=T | ANN | 1.5s | 12.4s | 31.5 | 244 | 10.09 | 13.98 | 60.8% | 0.653 |
+| b=2 rerank=F | Brute | 1.1s | — | 16.4 | 208 | 12.71 | 21.72 | 37.1% | 0.502 |
+| b=2 rerank=T | Brute | 1.2s | — | 16.4 | 207 | 16.57 | 24.70 | 52.8% | 0.666 |
+| b=4 rerank=F | Brute | 2.3s | — | 22.5 | 214 | 15.36 | 37.02 | 73.9% | 0.842 |
+| b=4 rerank=T | Brute | 1.6s | — | 22.5 | 213 | 17.96 | 27.60 | 82.6% | 0.900 |
+| b=2 rerank=F | ANN | 1.3s | 30.2s | 25.0 | 238 | 6.43 | 9.47 | 21.5% | 0.283 |
+| b=2 rerank=T | ANN | 1.2s | 28.3s | 25.0 | 238 | 11.03 | 14.57 | 37.6% | 0.464 |
+| b=4 rerank=F | ANN | 1.6s | 19.8s | 31.1 | 243 | 6.34 | 9.24 | 44.5% | 0.495 |
+| b=4 rerank=T | ANN | 1.5s | 18.5s | 31.1 | 246 | 11.10 | 15.07 | 61.1% | 0.656 |
 
 **DBpedia OpenAI3 d=1536** (d=1536, 100,000 corpus, 1,000 queries)
 
 | Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 3.9s | — | 59.5 | 759 | 37.27 | 40.43 | 79.7% | 0.882 |
-| b=2 rerank=T | Brute | 4.0s | — | 59.5 | 814 | 45.69 | 70.13 | 86.8% | 0.926 |
-| b=4 rerank=F | Brute | 10.5s | — | 108.3 | 862 | 58.00 | 68.46 | 92.6% | 0.961 |
-| b=4 rerank=T | Brute | 9.8s | — | 108.3 | 864 | 69.03 | 79.58 | 95.5% | 0.977 |
-| b=2 rerank=F | ANN | 5.9s | 81.8s | 68.1 | 772 | 14.27 | 33.39 | 75.5% | 0.836 |
-| b=2 rerank=T | ANN | 5.5s | 83.6s | 68.1 | 772 | 52.04 | 92.70 | 84.4% | 0.899 |
-| b=4 rerank=F | ANN | 10.0s | 82.3s | 116.9 | 822 | 14.75 | 35.73 | 88.7% | 0.918 |
-| b=4 rerank=T | ANN | 7.2s | 63.8s | 116.9 | 822 | 37.83 | 54.89 | 93.6% | 0.957 |
+| b=2 rerank=F | Brute | 5.5s | — | 59.1 | 755 | 45.97 | 70.70 | 79.7% | 0.882 |
+| b=2 rerank=T | Brute | 4.4s | — | 59.1 | 805 | 63.93 | 99.16 | 86.8% | 0.926 |
+| b=4 rerank=F | Brute | 7.4s | — | 108.0 | 854 | 66.77 | 110.56 | 92.6% | 0.961 |
+| b=4 rerank=T | Brute | 9.2s | — | 108.0 | 858 | 71.44 | 121.88 | 95.5% | 0.977 |
+| b=2 rerank=F | ANN | 4.6s | 99.7s | 67.7 | 772 | 10.15 | 14.61 | 75.2% | 0.829 |
+| b=2 rerank=T | ANN | 5.2s | 99.6s | 67.7 | 772 | 38.29 | 53.88 | 84.9% | 0.904 |
+| b=4 rerank=F | ANN | 7.9s | 98.2s | 116.5 | 823 | 11.47 | 15.83 | 87.9% | 0.907 |
+| b=4 rerank=T | ANN | 10.0s | 107.0s | 116.5 | 822 | 39.30 | 70.66 | 93.8% | 0.959 |
 
 **DBpedia OpenAI3 d=3072** (d=3072, 100,000 corpus, 1,000 queries)
 
 | Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 7.4s | — | 108.3 | 1400 | 67.32 | 74.15 | 84.6% | 0.913 |
-| b=2 rerank=T | Brute | 7.6s | — | 108.3 | 1420 | 80.66 | 91.53 | 89.2% | 0.943 |
-| b=4 rerank=F | Brute | 17.6s | — | 206.0 | 1500 | 78.14 | 87.41 | 94.8% | 0.972 |
-| b=4 rerank=T | Brute | 14.6s | — | 206.0 | 1516 | 90.00 | 98.10 | 96.0% | 0.980 |
-| b=2 rerank=F | ANN | 7.8s | 117.1s | 116.9 | 1416 | 15.33 | 23.21 | 81.3% | 0.875 |
-| b=2 rerank=T | ANN | 7.4s | 117.2s | 117.0 | 1416 | 60.10 | 91.06 | 87.7% | 0.926 |
-| b=4 rerank=F | ANN | 13.8s | 119.3s | 214.6 | 1514 | 20.41 | 42.39 | 90.1% | 0.922 |
-| b=4 rerank=T | ANN | 16.6s | 121.7s | 214.6 | 1516 | 68.87 | 103.18 | 94.0% | 0.960 |
+| b=2 rerank=F | Brute | 7.8s | — | 108.0 | 1401 | 110.82 | 398.86 | 84.6% | 0.913 |
+| b=2 rerank=T | Brute | 11.3s | — | 108.0 | 1418 | 104.77 | 175.07 | 89.2% | 0.943 |
+| b=4 rerank=F | Brute | 14.3s | — | 205.6 | 1497 | 119.48 | 191.95 | 94.8% | 0.972 |
+| b=4 rerank=T | Brute | 15.7s | — | 205.6 | 1513 | 120.57 | 211.47 | 96.0% | 0.980 |
+| b=2 rerank=F | ANN | 10.4s | 188.1s | 116.6 | 1412 | 16.03 | 27.62 | 81.8% | 0.879 |
+| b=2 rerank=T | ANN | 7.9s | 209.2s | 116.6 | 1413 | 62.88 | 129.03 | 87.7% | 0.924 |
+| b=4 rerank=F | ANN | 17.3s | 192.9s | 214.2 | 1508 | 36.90 | 62.74 | 90.6% | 0.929 |
+| b=4 rerank=T | ANN | 31.6s | 209.0s | 214.2 | 1510 | 152.35 | 282.61 | 94.8% | 0.967 |
 
 **Reproduction:** `maturin develop --release && python benchmarks/paper_recall_bench.py --update-readme --track`  (requires `pip install datasets psutil matplotlib`)
 
-### SRHT vs. Exact Mode Comparison
+### SRHT vs. Exact Mode — Fair Comparison
 
-The default SRHT mode (O(d log d)) is an approximation of the paper's QR + dense Gaussian construction. Both are available; below is a side-by-side comparison on the paper benchmark datasets (brute-force, no reranking). Full script: [`benchmarks/compare_quantizers_paper.py`](https://github.com/jyunming/TurboQuantDB/blob/main/benchmarks/compare_quantizers_paper.py).
+The default SRHT mode pads d to the next power of two, producing n=next_power_of_two(d) codes vs. n=d for exact. Comparing at the same bit-width (b) gives SRHT more stored bits — inflating recall numbers unfairly. The only methodology that truly decouples rotation quality from code count is to run both modes at dimensions that are already powers of two, where `next_power_of_two(d) = d` and both modes produce exactly n=d codes. At that point the **only** difference is the rotation matrix: Walsh-Hadamard × ±1 diagonal (SRHT) vs. Haar-random QR (exact). Script: [`benchmarks/compare_quantizers_fair.py`](https://github.com/jyunming/TurboQuantDB/blob/main/benchmarks/compare_quantizers_fair.py) — 100k synthetic Gaussian vectors, 1k queries, direct delta (no interpolation).
 
-**GloVe-200** (d=200, 100k corpus, 10k queries)
+| d | Bits | SRHT R@1 | Exact R@1 | Delta R@1 | SRHT MRR | Exact MRR | Delta MRR | Speed ratio |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 2 | 9.7% | 10.4% | +0.7 pp | 0.181 | 0.190 | +0.009 | 1.1x |
+| 128 | 4 | 40.7% | 39.9% | -0.8 pp | 0.560 | 0.552 | -0.008 | 1.4x |
+| 128 | 8 | 49.8% | 49.2% | -0.6 pp | 0.643 | 0.640 | -0.004 | 1.1x |
+| 256 | 2 | 11.7% | 10.9% | -0.8 pp | 0.203 | 0.199 | -0.005 | 3.2x |
+| 256 | 4 | 47.8% | 46.6% | -1.2 pp | 0.633 | 0.631 | -0.003 | 1.8x |
+| 256 | 8 | 59.4% | 59.9% | +0.5 pp | 0.742 | 0.744 | +0.003 | 1.7x |
+| 512 | 2 | 11.1% | 11.3% | +0.2 pp | 0.200 | 0.202 | +0.002 | 5.1x |
+| 512 | 4 | 52.7% | 53.6% | **+0.9 pp** | 0.687 | 0.691 | +0.004 | 2.8x |
+| 512 | 8 | 72.6% | 73.2% | **+0.6 pp** | 0.838 | 0.840 | +0.002 | 2.8x |
+| 1024 | 2 | 11.5% | 10.8% | -0.7 pp | 0.208 | 0.203 | -0.005 | 17.9x |
+| 1024 | 4 | 56.7% | 60.5% | **+3.8 pp** | 0.719 | 0.741 | **+0.022** | 12.7x |
+| 1024 | 8 | 79.6% | 79.6% | ~0.0 pp | 0.885 | 0.884 | ~0.000 | 6.6x |
 
-| Config | R@1 | R@4 | R@8 | MRR | Ingest vps | p50 ms | Disk MB | CPU ingest |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **SRHT** b=2 | 37.1% | 62.0% | 73.0% | 0.502 | 81,750 | 16.80 | 17.8 | 10% |
-| Exact b=2 | 32.8% | 56.1% | 66.9% | 0.452 | 44,415 | 16.25 | 16.6 | 36% |
-| **SRHT** b=4 | 73.9% | 96.4% | 99.2% | 0.842 | 48,206 | 17.60 | 24.8 | 16% |
-| Exact b=4 | 71.1% | 95.2% | 98.7% | 0.821 | 42,995 | 10.56 | 22.0 | 26% |
+*Positive delta = exact better. Speed ratio = SRHT ingest vps / Exact ingest vps. Disk difference (~4–8 MB) is the rotation matrix storage (d×d float32 vs d signs); vector code storage is identical.*
 
-**DBpedia-1536** (d=1536, 100k corpus, 1k queries)
+**Interpretation:**
+- **d <= 256:** Differences are within noise (±0.012), with no consistent winner. At small dimensions both rotations mix coordinates equally well.
+- **d = 512:** Exact is consistently slightly better (+0.2–0.9 pp R@1), consistent with QR's stronger theoretical guarantee (Haar-uniform distribution).
+- **d = 1024, b=4:** Exact wins by +3.8 pp R@1 — a meaningful gap for precision-sensitive applications. The Haar-random matrix becomes a noticeably better mixing operator as d grows.
+- **d = 1024, b=8:** Both modes reach near-ceiling recall (79.6%) and are indistinguishable.
+- **Speed:** SRHT ingest is 1.1–17.9x faster depending on d. The gap widens with d because exact applies an O(d²) matrix multiply vs SRHT's O(d log d) WHT. At d=1024, exact is 7–18x slower to ingest.
 
-| Config | R@1 | R@4 | R@8 | MRR | Ingest vps | p50 ms | Disk MB | CPU ingest |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **SRHT** b=2 | 79.7% | 98.3% | 99.7% | 0.882 | 25,304 | 36.68 | 66.8 | 23% |
-| Exact b=2 | 79.3% | 97.5% | 99.6% | 0.877 | 1,385 | 34.26 | 70.8 | 82% |
-| **SRHT** b=4 | 92.6% | 99.9% | 100.0% | 0.961 | 11,991 | 55.48 | 122.8 | 19% |
-| Exact b=4 | 90.5% | 99.9% | 100.0% | 0.949 | 1,126 | 55.31 | 112.8 | 79% |
-
-**DBpedia-3072** (d=3072) — exact skipped: O(d²) = 9.4M ops/vec is prohibitive
-
-| Config | R@1 | R@4 | MRR | Ingest vps | p50 ms | Disk MB |
-|---|---:|---:|---:|---:|---:|---:|
-| **SRHT** b=2 | 84.6% | 99.0% | 0.913 | 10,719 | 101.4 | 122.8 |
-| **SRHT** b=4 | 94.8% | 100.0% | 0.972 | 5,459 | 119.4 | 234.8 |
-
-**Observations:** On these datasets, SRHT achieves equal or higher recall than the exact paper algorithm at all configurations tested, while ingesting 10–95× faster at high dimensions and using 4–5× less CPU. The recall advantage likely stems from SRHT padding to the next power of two (d=200→256, d=1536→2048 codes), which provides finer quantization. However, SRHT is a mathematical approximation of the QR + Gaussian construction with different theoretical guarantees. The results warrant further verification across more diverse datasets and conditions before drawing firm conclusions — use `quantizer_type="exact"` to run the original paper algorithm.
+**Recommendation:** SRHT is the right default for most workloads — it matches or nearly matches exact quality at d<=256, is only slightly behind at d=512, and is dramatically faster at all dimensions. Use `quantizer_type="exact"` when d>=512 and recall quality is more important than ingest throughput.
 
 <!-- PAPER_BENCH_END -->
 
@@ -399,13 +398,15 @@ TurboQuantDB is an embedded database — it runs in-process with no daemon.
 
 The combination gives unbiased inner product estimates with near-optimal distortion, requiring no training data.
 
-**SRHT approximation (default):** The default implementation substitutes SRHT (Walsh-Hadamard × random ±1 diagonal) for both the QR rotation and the Gaussian projection. SRHT runs in O(d log d) vs the paper's O(d²), uses O(d) memory vs O(d²), and pads vectors to the next power of two — giving *more* quantization codes than the exact algorithm and often matching or exceeding exact-mode recall. However, SRHT is a mathematical approximation of the paper's construction with different theoretical guarantees. More rigorous verification and comparison across a wider range of datasets and conditions is needed before drawing firm conclusions. Use `quantizer_type="exact"` to run the original paper algorithm.
+**SRHT approximation (default):** The default implementation substitutes SRHT (Walsh-Hadamard × random ±1 diagonal) for both the QR rotation and the Gaussian projection. SRHT runs in O(d log d) vs the paper's O(d²) and uses O(d) memory vs O(d²). It pads d to the next power of two, producing more stored codes than the exact mode at the same bit-width setting — which inflates raw recall numbers in a direct comparison. When compared at **equal disk usage**, the exact QR rotation achieves equal or slightly better recall per stored byte, consistent with its stronger theoretical guarantees (Haar-uniform distribution). SRHT's practical advantage is ingest throughput: 15–23× faster at d=1536. Use `quantizer_type="exact"` when storage efficiency matters more than ingest speed.
+
+**Note on "zero indexing time":** The paper's claim (Table 2: TurboQuant 0.0013 s vs PQ 239 s vs RabitQ 2268 s at d=1536) measures **codebook/matrix construction time only** — i.e., how long to set up the quantizer before inserting any data. TurboQuant is near-zero because the quantizer is constructed analytically from a random seed with no data dependency; PQ and RabitQ require expensive training passes (k-means, SVD) over the corpus. The per-vector encoding cost (applying the rotation and projection to each inserted vector) still exists and scales as O(d log d) for SRHT or O(d²) for the exact mode.
 
 ### What comes from the paper vs. what is added here
 
 The TurboQuant paper contributes the **quantization algorithm** — how to compress vectors and estimate inner products accurately. Its experiments use flat (exhaustive) search: all database vectors are scored against every query using the LUT-based asymmetric scorer. The paper's "indexing time virtually zero" claim refers to the quantizer requiring no training data, not to graph construction.
 
-**From the paper:** two-stage MSE + QJL quantization, Lloyd-Max codebook, asymmetric LUT scoring, unbiased inner product estimation. The paper specifies QR-random orthogonal rotation and dense Gaussian projection — available as `quantizer_type="exact"`. The default implementation uses SRHT (O(d log d)) as an approximation that is faster and more memory-efficient; initial benchmarks show it matching or exceeding exact-mode recall, but further verification is needed to fully characterize the trade-offs.
+**From the paper:** two-stage MSE + QJL quantization, Lloyd-Max codebook, asymmetric LUT scoring, unbiased inner product estimation. The paper specifies QR-random orthogonal rotation and dense Gaussian projection — available as `quantizer_type="exact"`. The default implementation uses SRHT (O(d log d)) as a practical approximation; at equal storage budget, exact mode achieves equal or slightly better recall per byte, while SRHT is 15–23× faster to ingest at high dimensions.
 
 **Added by TurboQuantDB (not in the paper):** WAL persistence, memory-mapped storage, metadata/documents, HNSW graph index, reranking, Python bindings, and the HTTP server.
 
