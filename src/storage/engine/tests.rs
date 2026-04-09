@@ -301,6 +301,7 @@ fn f16_rerank_precision_stores_and_retrieves_vectors() {
         RerankPrecision::F16,
         None,
         false,
+        None,
     )
     .unwrap();
     let mut v = vec![0.0f64; d];
@@ -334,6 +335,7 @@ fn f16_roundtrip_within_half_precision_tolerance() {
         RerankPrecision::F16,
         None,
         false,
+        None,
     )
     .unwrap();
     // v = [0.1, 0.2, ..., 1.6]; expected IP = sum((0.1*i)^2) for i=1..=16
@@ -610,6 +612,7 @@ fn disabled_rerank_search_returns_results() {
         RerankPrecision::Disabled,
         None,
         false,
+        None,
     )
     .unwrap();
     for i in 0..5u32 {
@@ -742,6 +745,7 @@ fn l2_index_without_rerank_uses_dequantized_path() {
         RerankPrecision::Disabled,
         None,
         false,
+        None,
     )
     .unwrap();
     for i in 0..15u32 {
@@ -983,6 +987,7 @@ fn delete_triggers_wal_flush_at_threshold() {
         RerankPrecision::Disabled,
         Some(100),
         false,
+        None,
     )
     .unwrap();
     for i in 0..100 {
@@ -1039,6 +1044,7 @@ fn f16_rerank_cosine_ann_index_covers_f16_build_scorer_paths() {
         RerankPrecision::F16,
         None,
         false,
+        None,
     )
     .unwrap();
     for i in 0..30u32 {
@@ -1075,6 +1081,7 @@ fn f16_rerank_ip_ann_index_covers_f16_ip_build_scorer_path() {
         RerankPrecision::F16,
         None,
         false,
+        None,
     )
     .unwrap();
     for i in 0..30u32 {
@@ -1113,6 +1120,7 @@ fn l2_ann_index_without_raw_vectors_uses_precomputed_l2_path() {
         RerankPrecision::Disabled,
         None,
         false,
+        None,
     )
     .unwrap();
     for i in 0..30u32 {
@@ -1158,6 +1166,7 @@ fn l2_exhaustive_search_with_raw_f32_vectors_reranks_correctly() {
         RerankPrecision::F32,
         None,
         false,
+        None,
     )
     .unwrap();
     e.insert(
@@ -1236,6 +1245,7 @@ fn l2_exhaustive_rerank_without_raw_vectors_uses_dequant_path() {
         RerankPrecision::Disabled,
         None,
         false,
+        None,
     )
     .unwrap();
     e.insert("a".into(), &Array1::from_vec(vec![0.0f64; d]), no_meta())
@@ -1727,6 +1737,7 @@ fn cosine_ann_rerank_without_raw_vecs_uses_deq_path() {
         RerankPrecision::Disabled, // no raw vecs → live_vraw=None
         None,
         false,
+        None,
     )
     .unwrap();
     for i in 0..30u32 {

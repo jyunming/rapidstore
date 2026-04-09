@@ -151,11 +151,58 @@ pub(crate) fn apply_comparison_op(field: Option<&JsonValue>, op: &str, op_val: &
     }
 }
 
+/// Extract simple equality conditions from a filter that can use the eq_index.
+///
+/// Returns pairs of `(field, value)` for conditions of the form `{"field": value}`
+/// or `{"field": {"$eq": value}}`. Returns `None` if the filter contains `$or`,
+/// `$and`, or any range/set operator — those fall back to the O(n) scan path.
+pub(crate) fn extract_indexable_eq<'a>(
+    filter: &'a HashMap<String, JsonValue>,
+) -> Option<Vec<(&'a str, &'a JsonValue)>> {
+    if filter.contains_key("$or") || filter.contains_key("$and") {
+        return None;
+    }
+    let mut conditions = Vec::new();
+    for (k, v) in filter {
+        if k.starts_with('$') {
+            return None;
+        }
+        match v {
+            JsonValue::Object(op_map) => {
+                if op_map.len() == 1 {
+                    if let Some(eq_val) = op_map.get("$eq") {
+                        conditions.push((k.as_str(), eq_val));
+                    } else {
+                        return None; // range or other operator
+                    }
+                } else {
+                    return None; // compound per-field operators
+                }
+            }
+            _ => conditions.push((k.as_str(), v)), // simple {"field": value}
+        }
+    }
+    if conditions.is_empty() {
+        None
+    } else {
+        Some(conditions)
+    }
+}
+
 pub(crate) fn score_vectors_with_metric(
     metric: &DistanceMetric,
     a: &Array1<f64>,
     b: &Array1<f64>,
 ) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return unsafe { score_vectors_avx2(metric, a, b) };
+    }
+    score_vectors_scalar(metric, a, b)
+}
+
+#[inline(always)]
+fn score_vectors_scalar(metric: &DistanceMetric, a: &Array1<f64>, b: &Array1<f64>) -> f64 {
     match metric {
         DistanceMetric::Ip => a.iter().zip(b.iter()).map(|(x, y)| x * y).sum(),
         DistanceMetric::Cosine => {
@@ -175,4 +222,85 @@ pub(crate) fn score_vectors_with_metric(
             .sum::<f64>()
             .sqrt(),
     }
+}
+
+/// AVX2+FMA dot-product / cosine / L2 for f64 reranking vectors.
+/// 4-wide `__m256d` lanes; scalar tail for non-multiple-of-4 lengths.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn score_vectors_avx2(metric: &DistanceMetric, a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+    use std::arch::x86_64::*;
+
+    let n = a.len().min(b.len());
+    let a_ptr = a.as_ptr();
+    let b_ptr = b.as_ptr();
+    let chunks = n / 4;
+    let rem_start = chunks * 4;
+
+    match metric {
+        DistanceMetric::Ip => {
+            let mut acc = _mm256_setzero_pd();
+            for i in 0..chunks {
+                let av = _mm256_loadu_pd(a_ptr.add(i * 4));
+                let bv = _mm256_loadu_pd(b_ptr.add(i * 4));
+                acc = _mm256_fmadd_pd(av, bv, acc);
+            }
+            let mut dot = hsum_pd(acc);
+            for i in rem_start..n {
+                dot += *a_ptr.add(i) * *b_ptr.add(i);
+            }
+            dot
+        }
+        DistanceMetric::Cosine => {
+            let mut dot_acc = _mm256_setzero_pd();
+            let mut an_acc = _mm256_setzero_pd();
+            let mut bn_acc = _mm256_setzero_pd();
+            for i in 0..chunks {
+                let av = _mm256_loadu_pd(a_ptr.add(i * 4));
+                let bv = _mm256_loadu_pd(b_ptr.add(i * 4));
+                dot_acc = _mm256_fmadd_pd(av, bv, dot_acc);
+                an_acc = _mm256_fmadd_pd(av, av, an_acc);
+                bn_acc = _mm256_fmadd_pd(bv, bv, bn_acc);
+            }
+            let mut dot = hsum_pd(dot_acc);
+            let mut an2 = hsum_pd(an_acc);
+            let mut bn2 = hsum_pd(bn_acc);
+            for i in rem_start..n {
+                let av = *a_ptr.add(i);
+                let bv = *b_ptr.add(i);
+                dot += av * bv;
+                an2 += av * av;
+                bn2 += bv * bv;
+            }
+            let denom = an2.sqrt() * bn2.sqrt();
+            if denom == 0.0 { 0.0 } else { dot / denom }
+        }
+        DistanceMetric::L2 => {
+            let mut acc = _mm256_setzero_pd();
+            for i in 0..chunks {
+                let av = _mm256_loadu_pd(a_ptr.add(i * 4));
+                let bv = _mm256_loadu_pd(b_ptr.add(i * 4));
+                let diff = _mm256_sub_pd(av, bv);
+                acc = _mm256_fmadd_pd(diff, diff, acc);
+            }
+            let mut dist2 = hsum_pd(acc);
+            for i in rem_start..n {
+                let d = *a_ptr.add(i) - *b_ptr.add(i);
+                dist2 += d * d;
+            }
+            -dist2.sqrt()
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum_pd(v: std::arch::x86_64::__m256d) -> f64 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castpd256_pd128(v);
+    let hi = _mm256_extractf128_pd(v, 1);
+    let sum128 = _mm_add_pd(lo, hi);
+    let hi64 = _mm_unpackhi_pd(sum128, sum128);
+    _mm_cvtsd_f64(_mm_add_sd(sum128, hi64))
 }
