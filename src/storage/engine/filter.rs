@@ -151,6 +151,52 @@ pub(crate) fn apply_comparison_op(field: Option<&JsonValue>, op: &str, op_val: &
     }
 }
 
+/// Extract a single-field numeric range condition that can use the range_index.
+///
+/// Returns `(field, lo, hi)` where each bound is `(ord_key, inclusive)`.
+/// Returns `None` when:
+/// - The filter has $or/$and or more than one top-level field.
+/// - The field's value map contains non-range operators ($eq, $in, $exists, etc.).
+/// - Any operator value is not a finite number.
+pub(crate) fn extract_range_condition<'a>(
+    filter: &'a HashMap<String, JsonValue>,
+) -> Option<(&'a str, Option<(u64, bool)>, Option<(u64, bool)>)> {
+    use crate::storage::metadata::f64_to_ord;
+
+    if filter.contains_key("$or") || filter.contains_key("$and") || filter.len() != 1 {
+        return None;
+    }
+    let (field, val) = filter.iter().next()?;
+    if field.starts_with('$') {
+        return None;
+    }
+    let ops = if let JsonValue::Object(m) = val {
+        m
+    } else {
+        return None;
+    };
+
+    let mut lo: Option<(u64, bool)> = None;
+    let mut hi: Option<(u64, bool)> = None;
+
+    for (op, op_val) in ops {
+        let n = op_val.as_f64().filter(|v| v.is_finite())?;
+        let ord = f64_to_ord(n);
+        match op.as_str() {
+            "$gt" => lo = Some((ord, false)),
+            "$gte" => lo = Some((ord, true)),
+            "$lt" => hi = Some((ord, false)),
+            "$lte" => hi = Some((ord, true)),
+            _ => return None, // any non-range op → can't use range index
+        }
+    }
+
+    if lo.is_none() && hi.is_none() {
+        return None;
+    }
+    Some((field.as_str(), lo, hi))
+}
+
 /// Extract simple equality conditions from a filter that can use the eq_index.
 ///
 /// Returns pairs of `(field, value)` for conditions of the form `{"field": value}`

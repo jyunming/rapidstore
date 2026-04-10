@@ -2611,7 +2611,9 @@ fn search_batch_returns_one_result_set_per_query() {
     }
     let q1 = make_vec(d, 0.1);
     let q2 = make_vec(d, 0.9);
-    let results = e.search_batch(&[q1, q2], 2, None, None, true).unwrap();
+    let results = e
+        .search_batch(&[q1, q2], 2, None, None, Some(true))
+        .unwrap();
     assert_eq!(results.len(), 2, "one result set per query");
     assert_eq!(results[0].len(), 2, "top_k=2 for first query");
     assert_eq!(results[1].len(), 2, "top_k=2 for second query");
@@ -2623,7 +2625,7 @@ fn search_batch_empty_queries_returns_empty() {
     let p = dir.path().to_str().unwrap();
     let d = 8;
     let e = open_default(p, d);
-    let results = e.search_batch(&[], 5, None, None, true).unwrap();
+    let results = e.search_batch(&[], 5, None, None, Some(true)).unwrap();
     assert!(results.is_empty());
 }
 

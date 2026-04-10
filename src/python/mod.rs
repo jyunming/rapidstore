@@ -36,8 +36,11 @@ impl Database {
     ///     metric: Distance metric — ``"ip"`` (inner product), ``"cosine"``,
     ///             or ``"l2"`` (Euclidean). Fixed at creation. Default ``"ip"``.
     ///     rerank: Enable reranking of HNSW candidates. Default ``True``.
-    ///     fast_mode: Skip QJL residual quantization (~30 % faster ingest, slightly
-    ///                lower recall). Default ``False``.
+    ///     fast_mode: MSE-only mode — all ``bits`` go to the MSE codebook; QJL residual
+    ///                is not stored or scored. Recommended for RAG/ANN search: gives
+    ///                ~5 % higher R@1 than prod mode and matches paper Figure 5 recall.
+    ///                Set ``False`` only for LLM KV-cache inner-product estimation where
+    ///                unbiased absolute scores matter over ranking. Default ``True``.
     ///     rerank_precision: Raw-vector reranking precision:
     ///         - ``None`` (default): dequantization reranking — no extra disk/RAM.
     ///         - ``"f16"``: store raw vectors as float16 (+n×d×2 bytes), exact reranking.
@@ -63,7 +66,7 @@ impl Database {
     ///     # Equivalent cosine-via-IP with auto-normalization:
     ///     db = Database.open("mydb", dimension=1536, bits=4, metric="ip", normalize=True)
     #[staticmethod]
-    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false, quantizer_type=None))]
+    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=true, fast_mode=true, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false, quantizer_type=None))]
     fn open(
         path: String,
         dimension: Option<usize>,
@@ -438,14 +441,14 @@ impl Database {
     ///
     /// Returns:
     ///     List of dicts, each with keys ``id``, ``score``, ``metadata``, ``document``.
-    #[pyo3(signature = (query, top_k, filter=None, _use_ann=false, ann_search_list_size=None, include=None))]
+    #[pyo3(signature = (query, top_k, filter=None, _use_ann=None, ann_search_list_size=None, include=None))]
     fn search(
         &self,
         py: Python<'_>,
         query: PyObject,
         top_k: usize,
         filter: Option<&Bound<'_, PyDict>>,
-        _use_ann: bool,
+        _use_ann: Option<bool>,
         ann_search_list_size: Option<usize>,
         include: Option<Vec<String>>,
     ) -> PyResult<PyObject> {
@@ -468,8 +471,9 @@ impl Database {
 
         let results = py.allow_threads(|| {
             let engine = self.read_engine()?;
+            let use_ann = _use_ann.unwrap_or_else(|| engine.auto_use_ann());
             engine
-                .search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size, _use_ann)
+                .search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size, use_ann)
                 .map_err(to_py_runtime)
         })?;
 
@@ -666,14 +670,14 @@ impl Database {
     ///         query_embeddings=np.stack([q1, q2, q3]),
     ///         n_results=5,
     ///     )
-    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=false, ann_search_list_size=None))]
+    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=None, ann_search_list_size=None))]
     fn query(
         &self,
         py: Python<'_>,
         query_embeddings: PyObject,
         n_results: usize,
         where_filter: Option<&Bound<'_, PyDict>>,
-        _use_ann: bool,
+        _use_ann: Option<bool>,
         ann_search_list_size: Option<usize>,
     ) -> PyResult<PyObject> {
         let queries: Vec<ndarray::Array1<f64>> =
@@ -701,7 +705,6 @@ impl Database {
         } else {
             Some(&parsed_filter)
         };
-
         let batch = py.allow_threads(|| {
             let engine = self.read_engine()?;
             engine

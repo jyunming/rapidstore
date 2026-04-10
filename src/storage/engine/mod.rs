@@ -19,7 +19,8 @@ use crate::quantizer::CodeIndex;
 use crate::quantizer::prod::ProdQuantizer;
 mod filter;
 use filter::{
-    extract_indexable_eq, get_nested_field, metadata_matches_filter, score_vectors_with_metric,
+    extract_indexable_eq, extract_range_condition, get_nested_field, metadata_matches_filter,
+    score_vectors_with_metric,
 };
 
 const QUANTIZER_STATE_FILE: &str = "quantizer.bin";
@@ -31,6 +32,17 @@ const MANIFEST_SAVE_INTERVAL_OPS: usize = 64;
 const LIVE_GAMMA_BYTES: usize = 4;
 const LIVE_NORM_BYTES: usize = 4;
 const LIVE_DELETED_BYTES: usize = 1;
+
+/// Below this candidate count the brute-force inner loop runs sequentially (avoids
+/// Rayon thread park/unpark overhead on small N). Above it, par_chunks is used.
+/// Also used in search_batch to decide whether to parallelise across queries.
+const SEQ_THRESHOLD: usize = 20_000;
+
+/// Auto-planner: engage ANN automatically when N >= this threshold and an index exists.
+const AUTO_ANN_THRESHOLD: usize = 10_000;
+/// Auto-planner: fall back to brute-force when delta_slots > this fraction of N (num/den).
+const AUTO_ANN_MAX_DELTA_NUM: usize = 1;
+const AUTO_ANN_MAX_DELTA_DEN: usize = 5; // 20%
 
 /// Controls whether `live_vectors.bin` is written for raw-vector reranking.
 ///
@@ -372,7 +384,9 @@ impl TurboQuantEngine {
             (m, q)
         } else {
             let qt = quantizer_type.as_deref().unwrap_or("srht");
-            let q = if qt == "exact" {
+            let q = if qt == "exact" && fast_mode {
+                ProdQuantizer::new_exact_fast(d, b, seed)
+            } else if qt == "exact" {
                 ProdQuantizer::new_exact(d, b, seed)
             } else if fast_mode {
                 ProdQuantizer::new_srht(d, b, seed)
@@ -422,8 +436,13 @@ impl TurboQuantEngine {
 
         // Use quantizer.n (not manifest.d.next_power_of_two()) so that exact mode (n=d)
         // and SRHT mode (n=next_power_of_two(d)) both get the correct stride.
-        let qjl_len = quantizer.n.div_ceil(8);
-        let mse_len = (quantizer.n * (manifest.b - 1)).div_ceil(8);
+        // fast_mode never writes or reads QJL bytes — omit from stride to save disk/RAM.
+        let qjl_len = if quantizer.fast_mode {
+            0
+        } else {
+            quantizer.n.div_ceil(8)
+        };
+        let mse_len = (quantizer.n * quantizer.mse_bits_per_idx()).div_ceil(8);
         let stride = mse_len + qjl_len + LIVE_GAMMA_BYTES + LIVE_NORM_BYTES + LIVE_DELETED_BYTES;
         let live_codes = LiveCodesFile::open(Path::new(local_dir).join("live_codes.bin"), stride)?;
         let live_vraw_path = Path::new(local_dir).join("live_vectors.bin");
@@ -741,17 +760,43 @@ impl TurboQuantEngine {
         Ok(())
     }
 
+    /// Query-planner decision: should this query use the HNSW index?
+    ///
+    /// Returns `true` when all of:
+    /// - An index has been built and is non-empty.
+    /// - The active collection is large enough (≥ `AUTO_ANN_THRESHOLD`).
+    /// - The delta overlay (post-index inserts) is small enough (≤ 20% of N).
+    ///
+    /// Use this when `_use_ann` is `None` (caller did not explicitly request a path).
+    pub fn auto_use_ann(&self) -> bool {
+        let n = self.id_pool.active_count();
+        if !self.graph.has_index() || self.index_ids.is_empty() || n < AUTO_ANN_THRESHOLD {
+            return false;
+        }
+        // delta_size / n <= NUM/DEN  ↔  delta_size * DEN <= n * NUM
+        self.delta_slots.len() * AUTO_ANN_MAX_DELTA_DEN <= n * AUTO_ANN_MAX_DELTA_NUM
+    }
+
     /// Run the same search for multiple query vectors in one call.
+    ///
+    /// `use_ann_opt`:
+    /// - `None`       → query planner auto-selects (ANN when index exists + N ≥ threshold).
+    /// - `Some(true)` → force ANN (requires `create_index()` first).
+    /// - `Some(false)`→ force brute-force.
     pub fn search_batch(
         &self,
         queries: &[ndarray::Array1<f64>],
         top_k: usize,
         filter: Option<&HashMap<String, JsonValue>>,
         ann_search_list_size: Option<usize>,
-        use_ann: bool,
+        use_ann_opt: Option<bool>,
     ) -> Result<Vec<Vec<SearchResult>>, Box<dyn std::error::Error + Send + Sync>> {
-        if use_ann {
-            // ANN path: each query uses moderate CPU (beam search), safe to parallelize.
+        let use_ann = use_ann_opt.unwrap_or_else(|| self.auto_use_ann());
+        let n = self.id_pool.active_count();
+        if use_ann || n <= SEQ_THRESHOLD {
+            // ANN path: safe to parallelize (beam search, moderate CPU per query).
+            // Small-N brute-force: inner loop is sequential per query (< SEQ_THRESHOLD
+            // slots), so parallelise across queries instead to use idle cores.
             queries
                 .par_iter()
                 .map(|q| {
@@ -759,8 +804,8 @@ impl TurboQuantEngine {
                 })
                 .collect()
         } else {
-            // Brute-force path: each query already saturates the thread pool via par_chunks
-            // internally (N > 20k). Nesting par_iter causes contention — keep sequential.
+            // Large-N brute-force: each query already saturates the thread pool via
+            // par_chunks internally. Nesting par_iter causes contention — keep sequential.
             queries
                 .iter()
                 .map(|q| {
@@ -1487,51 +1532,66 @@ impl TurboQuantEngine {
         self.exhaustive_search_simd(query, top_k, filter, None)
     }
 
-    /// Try to resolve filter candidates using the eq_index for O(1) lookup.
+    /// Try to resolve filter candidates using the eq_index or range_index.
     ///
-    /// Returns `Some(slots)` when the filter consists entirely of simple `$eq` conditions
-    /// that are all covered by the index, intersected with `active_slots`.
+    /// Returns `Some(slots)` when the filter can be resolved by index:
+    /// - Pure `$eq` conditions → eq_index intersection (O(1) per field).
+    /// - Single-field pure range (`$gt`/`$gte`/`$lt`/`$lte`) on a numeric field → range_index
+    ///   BTreeMap range query (O(log n + result_count)).
+    ///
     /// Returns `None` when the filter is not indexable (falls back to O(n) scan).
     fn resolve_filter_via_index(
         &self,
         filter: &HashMap<String, JsonValue>,
         active_slots: &std::collections::HashSet<u32>,
     ) -> Option<Vec<u32>> {
-        let conditions = extract_indexable_eq(filter)?;
-        // For each condition, look up the eq_index. On a miss (field/value not present),
-        // return an empty candidate set immediately — the intersection is empty.
-        let mut result: Option<Vec<u32>> = None;
-        for (field, val) in conditions {
-            let indexed = self.metadata.get_eq_candidates(field, val)?;
-            let set: Vec<u32> = if let Some(prev) = &result {
-                // Intersect with previous result (both are sorted).
-                let mut intersected = Vec::new();
-                let mut i = 0;
-                let mut j = 0;
-                while i < prev.len() && j < indexed.len() {
-                    match prev[i].cmp(&indexed[j]) {
-                        std::cmp::Ordering::Equal => {
-                            intersected.push(prev[i]);
-                            i += 1;
-                            j += 1;
+        // Fast path 1: pure equality conditions → eq_index.
+        if let Some(conditions) = extract_indexable_eq(filter) {
+            let mut result: Option<Vec<u32>> = None;
+            for (field, val) in conditions {
+                let indexed = self.metadata.get_eq_candidates(field, val)?;
+                let set: Vec<u32> = if let Some(prev) = &result {
+                    // Intersect with previous result (both are sorted).
+                    let mut intersected = Vec::new();
+                    let mut i = 0;
+                    let mut j = 0;
+                    while i < prev.len() && j < indexed.len() {
+                        match prev[i].cmp(&indexed[j]) {
+                            std::cmp::Ordering::Equal => {
+                                intersected.push(prev[i]);
+                                i += 1;
+                                j += 1;
+                            }
+                            std::cmp::Ordering::Less => i += 1,
+                            std::cmp::Ordering::Greater => j += 1,
                         }
-                        std::cmp::Ordering::Less => i += 1,
-                        std::cmp::Ordering::Greater => j += 1,
                     }
-                }
-                intersected
-            } else {
-                indexed.to_vec()
-            };
-            result = Some(set);
+                    intersected
+                } else {
+                    indexed.to_vec()
+                };
+                result = Some(set);
+            }
+            return result.map(|slots| {
+                slots
+                    .into_iter()
+                    .filter(|s| active_slots.contains(s))
+                    .collect()
+            });
         }
-        // Filter to only active slots.
-        result.map(|slots| {
-            slots
-                .into_iter()
-                .filter(|s| active_slots.contains(s))
-                .collect()
-        })
+
+        // Fast path 2: single-field numeric range → range_index.
+        if let Some((field, lo, hi)) = extract_range_condition(filter) {
+            let slots = self.metadata.get_range_candidates(field, lo, hi)?;
+            return Some(
+                slots
+                    .into_iter()
+                    .filter(|s| active_slots.contains(s))
+                    .collect(),
+            );
+        }
+
+        None
     }
 
     /// Score a set of candidate slots against `query` and return the top-`top_k` results.
@@ -1634,7 +1694,6 @@ impl TurboQuantEngine {
         // Scoring: sequential for small N (avoids Rayon thread park/unpark on Windows
         // where scheduler granularity dominates the actual sub-millisecond work);
         // parallel chunk-based for large N where the work outweighs the thread overhead.
-        const SEQ_THRESHOLD: usize = 20_000;
         const CHUNK: usize = 512;
         let n_candidates = candidate_slots.len();
         let scored: Vec<(u32, f64)> = if n_candidates <= SEQ_THRESHOLD {
@@ -2348,10 +2407,14 @@ impl TurboQuantEngine {
     }
 
     fn live_mse_len(&self) -> usize {
-        (self.quantizer.n * (self.b - 1)).div_ceil(8)
+        (self.quantizer.n * self.quantizer.mse_bits_per_idx()).div_ceil(8)
     }
     fn live_qjl_len(&self) -> usize {
-        self.quantizer.n.div_ceil(8)
+        if self.quantizer.fast_mode {
+            0
+        } else {
+            self.quantizer.n.div_ceil(8)
+        }
     }
     fn live_stride(&self) -> usize {
         self.live_mse_len()
@@ -2505,7 +2568,9 @@ impl TurboQuantEngine {
         let packed_mse = self.quantizer.pack_mse_indices(indices);
         let rec = self.live_codes.get_slot_mut(new_slot);
         rec[0..mse_len].copy_from_slice(&packed_mse);
-        rec[mse_len..mse_len + qjl_len].copy_from_slice(qjl);
+        if qjl_len > 0 {
+            rec[mse_len..mse_len + qjl_len].copy_from_slice(qjl);
+        }
         rec[mse_len + qjl_len..mse_len + qjl_len + 4].copy_from_slice(&gamma.to_le_bytes());
         rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].copy_from_slice(&norm.to_le_bytes());
         rec[mse_len + qjl_len + 8] = 0u8;
@@ -2526,7 +2591,9 @@ impl TurboQuantEngine {
             let packed_mse = self.quantizer.pack_mse_indices(indices);
             let rec = self.live_codes.get_slot_mut(slot as usize);
             rec[0..mse_len].copy_from_slice(&packed_mse);
-            rec[mse_len..mse_len + qjl_len].copy_from_slice(qjl);
+            if qjl_len > 0 {
+                rec[mse_len..mse_len + qjl_len].copy_from_slice(qjl);
+            }
             rec[mse_len + qjl_len..mse_len + qjl_len + 4].copy_from_slice(&gamma.to_le_bytes());
             rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].copy_from_slice(&norm.to_le_bytes());
             rec[mse_len + qjl_len + 8] = 0u8;

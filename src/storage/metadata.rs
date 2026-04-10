@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +22,22 @@ fn value_to_index_key(v: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Map an f64 to a u64 that preserves numeric ordering for use as a BTreeMap key.
+///
+/// The encoding:
+/// - Positive numbers: flip the sign bit → u64 values that sort ascending.
+/// - Negative numbers: flip all bits → u64 values that sort ascending (most-negative first).
+/// - NaN maps to the same key as positive infinity; callers should treat NaN fields as
+///   non-indexed and let the scalar filter handle them.
+pub(crate) fn f64_to_ord(v: f64) -> u64 {
+    let bits = v.to_bits();
+    if bits >> 63 == 0 {
+        bits | (1u64 << 63)
+    } else {
+        !bits
+    }
+}
+
 pub struct MetadataStore {
     path: PathBuf,
     data: HashMap<u32, VectorMetadata>,
@@ -30,6 +46,10 @@ pub struct MetadataStore {
     /// Covers scalar (string/number/bool/null) top-level fields only.
     /// Enables O(1) pre-filter candidate lookup for $eq filter conditions.
     eq_index: HashMap<String, HashMap<String, Vec<u32>>>,
+    /// Range index: field -> BTreeMap<ord_key, sorted slot list>.
+    /// Covers numeric (f64) top-level fields only.
+    /// Enables sub-linear pre-filter for $gt/$gte/$lt/$lte conditions.
+    range_index: HashMap<String, BTreeMap<u64, Vec<u32>>>,
 }
 
 impl MetadataStore {
@@ -46,11 +66,13 @@ impl MetadataStore {
             HashMap::new()
         };
         let eq_index = Self::build_eq_index(&data);
+        let range_index = Self::build_range_index(&data);
         Ok(Self {
             path,
             data,
             dirty: false,
             eq_index,
+            range_index,
         })
     }
 
@@ -122,6 +144,57 @@ impl MetadataStore {
         }
     }
 
+    /// Return all slots where `field` falls within a numeric range.
+    ///
+    /// `lo` and `hi` are `(ord_key, inclusive)` pairs produced by [`f64_to_ord`].
+    /// Either bound may be `None` (open-ended). Returns `None` when the field has
+    /// no range index (not a numeric field or never seen in any inserted vector).
+    pub fn get_range_candidates(
+        &self,
+        field: &str,
+        lo: Option<(u64, bool)>,
+        hi: Option<(u64, bool)>,
+    ) -> Option<Vec<u32>> {
+        let btree = self.range_index.get(field)?;
+        let iter: Box<dyn Iterator<Item = (&u64, &Vec<u32>)>> = match (lo, hi) {
+            (Some((lo_k, lo_incl)), Some((hi_k, hi_incl))) => {
+                let lo_bound = if lo_incl {
+                    std::ops::Bound::Included(lo_k)
+                } else {
+                    std::ops::Bound::Excluded(lo_k)
+                };
+                let hi_bound = if hi_incl {
+                    std::ops::Bound::Included(hi_k)
+                } else {
+                    std::ops::Bound::Excluded(hi_k)
+                };
+                Box::new(btree.range((lo_bound, hi_bound)))
+            }
+            (Some((lo_k, lo_incl)), None) => {
+                let lo_bound = if lo_incl {
+                    std::ops::Bound::Included(lo_k)
+                } else {
+                    std::ops::Bound::Excluded(lo_k)
+                };
+                Box::new(btree.range((lo_bound, std::ops::Bound::Unbounded)))
+            }
+            (None, Some((hi_k, hi_incl))) => {
+                let hi_bound = if hi_incl {
+                    std::ops::Bound::Included(hi_k)
+                } else {
+                    std::ops::Bound::Excluded(hi_k)
+                };
+                Box::new(btree.range((std::ops::Bound::Unbounded, hi_bound)))
+            }
+            (None, None) => return None,
+        };
+
+        let mut slots: Vec<u32> = iter.flat_map(|(_, v)| v.iter().copied()).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        if slots.is_empty() { None } else { Some(slots) }
+    }
+
     pub fn clear(&mut self) {
         if self.data.is_empty() {
             return;
@@ -177,6 +250,7 @@ impl MetadataStore {
 
     fn index_add(&mut self, slot: u32, meta: &VectorMetadata) {
         for (field, val) in &meta.properties {
+            // Equality index (all scalars).
             if let Some(key) = value_to_index_key(val) {
                 let slots = self
                     .eq_index
@@ -189,6 +263,22 @@ impl MetadataStore {
                     slots.insert(pos, slot);
                 }
             }
+            // Range index (numeric fields only).
+            if let Some(n) = val.as_f64() {
+                if n.is_finite() {
+                    let ord = f64_to_ord(n);
+                    let slots = self
+                        .range_index
+                        .entry(field.clone())
+                        .or_default()
+                        .entry(ord)
+                        .or_default();
+                    let pos = slots.partition_point(|&s| s < slot);
+                    if slots.get(pos) != Some(&slot) {
+                        slots.insert(pos, slot);
+                    }
+                }
+            }
         }
     }
 
@@ -197,11 +287,25 @@ impl MetadataStore {
             return;
         };
         for (field, val) in &meta.properties {
+            // Equality index removal.
             if let Some(key) = value_to_index_key(val) {
                 if let Some(val_map) = self.eq_index.get_mut(field.as_str()) {
                     if let Some(slots) = val_map.get_mut(key.as_str()) {
                         if let Ok(pos) = slots.binary_search(&slot) {
                             slots.remove(pos);
+                        }
+                    }
+                }
+            }
+            // Range index removal.
+            if let Some(n) = val.as_f64() {
+                if n.is_finite() {
+                    let ord = f64_to_ord(n);
+                    if let Some(btree) = self.range_index.get_mut(field.as_str()) {
+                        if let Some(slots) = btree.get_mut(&ord) {
+                            if let Ok(pos) = slots.binary_search(&slot) {
+                                slots.remove(pos);
+                            }
                         }
                     }
                 }
@@ -224,6 +328,29 @@ impl MetadataStore {
                         .entry(key)
                         .or_default()
                         .push(slot);
+                }
+            }
+        }
+        idx
+    }
+
+    fn build_range_index(
+        data: &HashMap<u32, VectorMetadata>,
+    ) -> HashMap<String, BTreeMap<u64, Vec<u32>>> {
+        let mut idx: HashMap<String, BTreeMap<u64, Vec<u32>>> = HashMap::new();
+        let mut slots_sorted: Vec<u32> = data.keys().copied().collect();
+        slots_sorted.sort_unstable();
+        for slot in slots_sorted {
+            let meta = &data[&slot];
+            for (field, val) in &meta.properties {
+                if let Some(n) = val.as_f64() {
+                    if n.is_finite() {
+                        idx.entry(field.clone())
+                            .or_default()
+                            .entry(f64_to_ord(n))
+                            .or_default()
+                            .push(slot);
+                    }
                 }
             }
         }

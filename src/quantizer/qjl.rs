@@ -67,7 +67,8 @@ impl QjlQuantizer {
     }
 
     /// Exact-paper mode: dense i.i.d. N(0,1) Gaussian projection matrix.
-    /// Output is normalized by 1/√d so the scoring scale factor is identical to SRHT.
+    /// Output is normalized by 1/√d, so exact-mode query scoring must compensate
+    /// with `sqrt(pi/2) / sqrt(d)` rather than the SRHT `sqrt(pi/2) / n`.
     /// O(d²) apply time, O(d²) storage.
     pub fn new_exact(d: usize, seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
