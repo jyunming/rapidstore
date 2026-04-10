@@ -792,27 +792,16 @@ impl TurboQuantEngine {
         use_ann_opt: Option<bool>,
     ) -> Result<Vec<Vec<SearchResult>>, Box<dyn std::error::Error + Send + Sync>> {
         let use_ann = use_ann_opt.unwrap_or_else(|| self.auto_use_ann());
-        let n = self.id_pool.active_count();
-        if use_ann || n <= SEQ_THRESHOLD {
-            // ANN path: safe to parallelize (beam search, moderate CPU per query).
-            // Small-N brute-force: inner loop is sequential per query (< SEQ_THRESHOLD
-            // slots), so parallelise across queries instead to use idle cores.
-            queries
-                .par_iter()
-                .map(|q| {
-                    self.search_with_filter_and_ann(q, top_k, filter, ann_search_list_size, use_ann)
-                })
-                .collect()
-        } else {
-            // Large-N brute-force: each query already saturates the thread pool via
-            // par_chunks internally. Nesting par_iter causes contention — keep sequential.
-            queries
-                .iter()
-                .map(|q| {
-                    self.search_with_filter_and_ann(q, top_k, filter, ann_search_list_size, use_ann)
-                })
-                .collect()
-        }
+        // Always parallelise across queries. Rayon's work-stealing handles nested
+        // parallelism (outer: queries, inner: par_chunks over vectors) without
+        // over-subscribing the thread pool. For batch calls, throughput > per-query
+        // latency, so outer parallelism is always beneficial.
+        queries
+            .par_iter()
+            .map(|q| {
+                self.search_with_filter_and_ann(q, top_k, filter, ann_search_list_size, use_ann)
+            })
+            .collect()
     }
 
     ///
