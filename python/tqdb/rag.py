@@ -81,6 +81,9 @@ class TurboQuantRetriever:
         if hasattr(self.db, "insert_batch"):
             self.db.insert_batch(ids, vectors, metadatas, texts, "insert")
             return
+        if hasattr(self.db, "insert_many"):
+            self.db.insert_many(ids, vectors, metadatas, texts, "insert")
+            return
 
         for i, doc_id in enumerate(ids):
             self.db.insert(doc_id, vectors[i], metadatas[i], texts[i])
@@ -100,8 +103,11 @@ class TurboQuantRetriever:
 
         output: List[Dict[str, Any]] = []
         for r in results:
-            doc_id = r["id"]
-            score = r["score"]
+            if isinstance(r, (tuple, list)):
+                doc_id, score = r[0], r[1]
+            else:
+                doc_id = r["id"]
+                score = r["score"]
             if doc_id in self.doc_store:
                 doc = self.doc_store[doc_id]
                 output.append({

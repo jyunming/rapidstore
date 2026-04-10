@@ -66,6 +66,16 @@ def _sanitize_metadata(m: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _validate_collection_name(name: str) -> None:
+    """Reject names with path traversal sequences."""
+    if not name or name == ".." or "/" in name or "\\" in name or "\0" in name or ".." in name.split("/"):
+        raise ValueError(f"Collection name contains invalid characters or path traversal sequences: {name!r}")
+
+
+_VALID_GET_INCLUDE = {"ids", "metadatas", "documents", "embeddings"}
+_VALID_QUERY_INCLUDE = {"ids", "metadatas", "documents", "embeddings", "distances"}
+
+
 def _apply_filter(records: List[Dict[str, Any]], where: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Very small subset of Chroma where-filter evaluation."""
     def _matches(metadata: Dict[str, Any], expr: Dict[str, Any]) -> bool:
@@ -77,6 +87,12 @@ def _apply_filter(records: List[Dict[str, Any]], where: Dict[str, Any]) -> List[
             val = metadata.get(field)
             if isinstance(cond, dict):
                 op, rhs = next(iter(cond.items()))
+                _KNOWN_OPS = {
+                    "$eq", "$ne", "$gt", "$gte", "$lt", "$lte",
+                    "$in", "$nin", "$exists", "$contains",
+                }
+                if op not in _KNOWN_OPS:
+                    raise ValueError(f"Unknown filter operator '{op}'")
                 if op == "$eq" and val != rhs:
                     return False
                 elif op == "$ne" and val == rhs:
@@ -292,6 +308,10 @@ class CompatCollection:
         offset: int = 0,
         include: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
+        if include is not None:
+            unknown = set(include) - _VALID_GET_INCLUDE
+            if unknown:
+                raise ValueError(f"Unknown include fields: {unknown}. Valid: {_VALID_GET_INCLUDE}")
         if not os.path.exists(os.path.join(self._path, "manifest.json")):
             return {"ids": [], "metadatas": [], "documents": []}
         include_set = set(include or ["metadatas", "documents"])
@@ -328,6 +348,10 @@ class CompatCollection:
     ) -> Dict[str, Any]:
         if where_document is not None:
             raise NotImplementedError("where_document is not supported (tqdb has no full-text index)")
+        if include is not None:
+            unknown = set(include) - _VALID_QUERY_INCLUDE
+            if unknown:
+                raise ValueError(f"Unknown include fields: {unknown}. Valid: {_VALID_QUERY_INCLUDE}")
         query_embeddings = self._embed(query_texts or [], query_embeddings)
         include_set = set(include or ["metadatas", "documents", "distances"])
         db = self._open_db(None)
@@ -388,6 +412,8 @@ class CompatClient:
     def __init__(self, path: str):
         self._path = os.path.abspath(path)
         os.makedirs(self._path, exist_ok=True)
+        import threading
+        self._lock = threading.Lock()
 
     def _meta_path(self, name: str) -> str:
         return os.path.join(self._path, name, "_chroma_meta.json")
@@ -419,13 +445,15 @@ class CompatClient:
         embedding_function=None,
         get_or_create: bool = False,
     ) -> "CompatCollection":
-        if self._is_collection(name):
-            if get_or_create:
-                return self.get_collection(name, embedding_function=embedding_function)
-            raise ValueError(f"Collection '{name}' already exists. Use get_or_create_collection().")
-        metric = _parse_metric(metadata)
-        self._save_meta(name, metadata, metric)
-        return CompatCollection(self._collection_dir(name), name, metric, embedding_function)
+        _validate_collection_name(name)
+        with self._lock:
+            if self._is_collection(name):
+                if get_or_create:
+                    return self.get_collection(name, embedding_function=embedding_function)
+                raise ValueError(f"Collection '{name}' already exists. Use get_or_create_collection().")
+            metric = _parse_metric(metadata)
+            self._save_meta(name, metadata, metric)
+            return CompatCollection(self._collection_dir(name), name, metric, embedding_function)
 
     def get_or_create_collection(
         self,

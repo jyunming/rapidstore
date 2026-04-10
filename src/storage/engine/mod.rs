@@ -2039,8 +2039,11 @@ impl TurboQuantEngine {
         metric: DistanceMetric,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let path = format!("{local_root}/{tenant}/{database}/{collection}");
+        // Build a scoped URI so the storage backend writes to the collection directory,
+        // not the top-level storage root (which would pollute root with manifest.json).
+        let scoped_uri = format!("{uri}/{tenant}/{database}/{collection}");
         Self::open_with_options(
-            uri,
+            &scoped_uri,
             &path,
             d,
             b,

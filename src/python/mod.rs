@@ -835,6 +835,16 @@ impl Database {
         };
         let batch = py.allow_threads(|| {
             let engine = self.read_engine()?;
+            for (i, row) in queries.iter().enumerate() {
+                if row.len() != engine.d {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "query dimension mismatch: expected {}, got {} (row {})",
+                        engine.d,
+                        row.len(),
+                        i
+                    )));
+                }
+            }
             engine
                 .search_batch(
                     &queries,

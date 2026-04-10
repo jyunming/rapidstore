@@ -62,6 +62,12 @@ def _map_metric(m: str) -> str:
     return _METRIC_MAP[key]
 
 
+def _validate_name_component(name: str, label: str) -> None:
+    """Reject names with path traversal sequences."""
+    if not name or name == ".." or "/" in name or "\\" in name or "\0" in name or ".." in name.split("/"):
+        raise ValueError(f"{label} contains invalid characters or path traversal sequences: {name!r}")
+
+
 # ---------------------------------------------------------------------------
 # SQL WHERE parser (minimal subset)
 # ---------------------------------------------------------------------------
@@ -82,7 +88,7 @@ _FIELD_EQ_NUM_PATTERN = re.compile(
     r"""^\s*(\w+)\s*=\s*(\d+(?:\.\d+)?)\s*$"""
 )
 _FIELD_CMP_PATTERN = re.compile(
-    r"""^\s*(\w+)\s*(>=|<=|>|<)\s*(\d+(?:\.\d+)?)\s*$"""
+    r"""^\s*(\w+)\s*(>=|<=|>|<)\s*(-?\d+(?:\.\d+)?)\s*$"""
 )
 
 _CMP_OPS = {">=": "$gte", "<=": "$lte", ">": "$gt", "<": "$lt"}
@@ -105,13 +111,19 @@ def _parse_sql_where(where: str) -> Dict[str, Any]:
     m = _ID_IN_PATTERN.match(where)
     if m:
         ids_raw = m.group(1)
-        ids = [s.strip().strip("'\"") for s in ids_raw.split(",")]
+        parts = [s.strip() for s in ids_raw.split(",")]
+        if not parts[-1]:
+            raise ValueError(f"Syntax error in IN clause (trailing comma?): '{where}'")
+        ids = [s.strip("'\"") for s in parts]
         return {"id": {"$in": ids}}
     m = _FIELD_IN_PATTERN.match(where)
     if m:
         field = m.group(1)
         vals_raw = m.group(2)
-        vals = [s.strip().strip("'\"") for s in vals_raw.split(",")]
+        parts = [s.strip() for s in vals_raw.split(",")]
+        if not parts[-1]:  # trailing comma leaves an empty last part
+            raise ValueError(f"Syntax error in IN clause (trailing comma?): '{where}'")
+        vals = [s.strip("'\"") for s in parts]
         return {field: {"$in": vals}}
     m = _FIELD_EQ_STR_PATTERN.match(where)
     if m:
@@ -183,6 +195,8 @@ class CompatQuery:
         return self
 
     def limit(self, k: int) -> "CompatQuery":
+        if k < 0:
+            raise ValueError(f"limit must be non-negative, got {k}")
         self._k = k
         return self
 
@@ -311,6 +325,8 @@ class CompatTable:
         return self._name
 
     def add(self, data: Any, mode: str = "append") -> None:
+        if mode not in ("append", "overwrite"):
+            raise ValueError(f"Unsupported mode '{mode}'. Use 'append' or 'overwrite'.")
         rows = _extract_rows(data)
         if not rows:
             return
@@ -425,6 +441,8 @@ class CompatConnection:
             )
         self._root = os.path.abspath(uri)
         os.makedirs(self._root, exist_ok=True)
+        import threading
+        self._lock = threading.Lock()
 
     def _table_dir(self, name: str) -> str:
         return os.path.join(self._root, name)
@@ -458,20 +476,25 @@ class CompatConnection:
         schema=None,
         mode: str = "create",
     ) -> CompatTable:
-        if mode not in ("create", "overwrite"):
-            raise ValueError(f"Unsupported mode '{mode}'. Use 'create' or 'overwrite'.")
+        _validate_name_component(name, "table name")
+        with self._lock:
+            if mode not in ("create", "overwrite"):
+                raise ValueError(f"Unsupported mode '{mode}'. Use 'create' or 'overwrite'.")
 
-        tbl_dir = self._table_dir(name)
-        if mode == "overwrite" and os.path.exists(tbl_dir):
-            shutil.rmtree(tbl_dir)
-        os.makedirs(tbl_dir, exist_ok=True)
+            if mode == "create" and self._is_table(name):
+                raise ValueError(f"Table '{name}' already exists. Use mode='overwrite' to replace it.")
 
-        metric = "ip"  # default; LanceDB default metric is "dot" ≡ ip
-        self._save_meta(name, metric)
-        tbl = CompatTable(tbl_dir, name, metric)
-        if data is not None:
-            # Dir was already wiped above for overwrite; always use append here
-            tbl.add(data, mode="append")
+            tbl_dir = self._table_dir(name)
+            if mode == "overwrite" and os.path.exists(tbl_dir):
+                shutil.rmtree(tbl_dir)
+            os.makedirs(tbl_dir, exist_ok=True)
+
+            metric = "ip"  # default; LanceDB default metric is "dot" ≡ ip
+            self._save_meta(name, metric)
+            tbl = CompatTable(tbl_dir, name, metric)
+            if data is not None:
+                # Dir was already wiped above for overwrite; always use append here
+                tbl.add(data, mode="append")
         return tbl
 
     def open_table(self, name: str) -> CompatTable:

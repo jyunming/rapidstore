@@ -69,7 +69,10 @@ class TestInputHardening:
     def test_search_never_returns_nan_score(self, tmp_path):
         db = Database.open(str(tmp_path / "db"), dimension=8, bits=4, metric="ip")
         db.insert("x", np.ones(8, dtype=np.float32))
-        db.insert("inf", np.full(8, np.inf, dtype=np.float32))
+        db.insert("y", np.zeros(8, dtype=np.float32))
+        # inf vectors are rejected at insert time; verify normal search returns finite scores
+        with pytest.raises(Exception):
+            db.insert("inf", np.full(8, np.inf, dtype=np.float32))
         out = db.search(np.ones(8, dtype=np.float32), top_k=2)
         scores = [r.get("score") for r in out]
         assert all(np.isfinite(s) for s in scores), scores
