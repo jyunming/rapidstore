@@ -36,11 +36,12 @@ impl Database {
     ///     metric: Distance metric — ``"ip"`` (inner product), ``"cosine"``,
     ///             or ``"l2"`` (Euclidean). Fixed at creation. Default ``"ip"``.
     ///     rerank: Enable reranking of HNSW candidates. Default ``True``.
-    ///     fast_mode: MSE-only mode — all ``bits`` go to the MSE codebook; QJL residual
-    ///                is not stored or scored. Recommended for RAG/ANN search: gives
-    ///                ~5 % higher R@1 than prod mode and matches paper Figure 5 recall.
-    ///                Set ``False`` only for LLM KV-cache inner-product estimation where
-    ///                unbiased absolute scores matter over ranking. Default ``True``.
+    ///     fast_mode: When ``True``, all ``bits`` go to the MSE codebook and the QJL
+    ///                residual is not stored. When ``False`` (default), the QJL residual
+    ///                is stored and used during dequantization reranking, giving significantly
+    ///                higher recall (e.g. +9–15 pp R@1 on GloVe-200 b=4). Set ``True`` only
+    ///                to match paper Figure 5 recall curves (MSE-only bit allocation) or for
+    ///                ~30% faster ingest when recall is not critical. Default ``False``.
     ///     rerank_precision: Raw-vector reranking precision:
     ///         - ``None`` (default): dequantization reranking — no extra disk/RAM.
     ///         - ``"f16"``: store raw vectors as float16 (+n×d×2 bytes), exact reranking.
@@ -74,7 +75,7 @@ impl Database {
     ///     # Equivalent cosine-via-IP with auto-normalization:
     ///     db = Database.open("mydb", dimension=1536, bits=4, metric="ip", normalize=True)
     #[staticmethod]
-    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=true, fast_mode=true, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false, quantizer_type=None))]
+    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false, quantizer_type=None))]
     fn open(
         path: String,
         dimension: Option<usize>,

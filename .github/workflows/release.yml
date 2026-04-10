@@ -141,43 +141,20 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Generate changelog from git log
+      - name: Extract release notes from CHANGELOG.md
         run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          if [ -n "$PREV_TAG" ]; then
-            RANGE="$PREV_TAG..HEAD"
-          else
-            RANGE="HEAD"
+          VERSION="${{ steps.version.outputs.VERSION }}"
+
+          # Extract the section for this version: from "## [VERSION]" up to (not including) the next "## ["
+          awk "/^## \[${VERSION}\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md \
+            > CHANGELOG_RELEASE.md
+
+          if [ ! -s CHANGELOG_RELEASE.md ]; then
+            echo "WARNING: No section found for [${VERSION}] in CHANGELOG.md — falling back to empty body"
+            echo "(No changelog entry found for v${VERSION})" > CHANGELOG_RELEASE.md
           fi
 
-          echo "## What's Changed" > CHANGELOG_RELEASE.md
-          echo "" >> CHANGELOG_RELEASE.md
-
-          FEATURES=$(git log $RANGE --oneline --no-merges --grep="^feat" 2>/dev/null || true)
-          if [ -n "$FEATURES" ]; then
-            echo "### ✨ New Features" >> CHANGELOG_RELEASE.md
-            git log $RANGE --oneline --no-merges --grep="^feat" | sed 's/^/- /' >> CHANGELOG_RELEASE.md
-            echo "" >> CHANGELOG_RELEASE.md
-          fi
-
-          PERF=$(git log $RANGE --oneline --no-merges --grep="^perf" 2>/dev/null || true)
-          if [ -n "$PERF" ]; then
-            echo "### ⚡ Performance" >> CHANGELOG_RELEASE.md
-            git log $RANGE --oneline --no-merges --grep="^perf" | sed 's/^/- /' >> CHANGELOG_RELEASE.md
-            echo "" >> CHANGELOG_RELEASE.md
-          fi
-
-          FIXES=$(git log $RANGE --oneline --no-merges --grep="^fix" 2>/dev/null || true)
-          if [ -n "$FIXES" ]; then
-            echo "### 🐛 Bug Fixes" >> CHANGELOG_RELEASE.md
-            git log $RANGE --oneline --no-merges --grep="^fix" | sed 's/^/- /' >> CHANGELOG_RELEASE.md
-            echo "" >> CHANGELOG_RELEASE.md
-          fi
-
-          echo "### 📋 All Changes" >> CHANGELOG_RELEASE.md
-          git log $RANGE --oneline --no-merges | sed 's/^/- /' >> CHANGELOG_RELEASE.md
-
-          echo "Generated changelog:"
+          echo "Release notes for v${VERSION}:"
           cat CHANGELOG_RELEASE.md
 
       - name: Create GitHub Release
@@ -217,92 +194,23 @@ jobs:
           sed -i "s|<div class=\"badge\">v[^<]*</div>|<div class=\"badge\">${VERSION} Released</div>|g" website/index.html
           echo "Updated badge to: ${VERSION} Released"
 
-      - name: Prepend release entry to CHANGELOG.md
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          TAG="${GITHUB_REF_NAME}"
-          TODAY=$(date -u '+%Y-%m-%d')
-
-          # Determine commit range since last tag
-          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
-          if [ -n "$PREV_TAG" ]; then
-            RANGE="${PREV_TAG}..${TAG}"
-          else
-            RANGE="${TAG}"
-          fi
-
-          # Build the new changelog block
-          {
-            echo "## [${VERSION}] — ${TODAY}"
-            echo ""
-
-            FEATS=$(git log $RANGE --oneline --no-merges --grep="^feat" 2>/dev/null || true)
-            if [ -n "$FEATS" ]; then
-              echo "### Added"
-              git log $RANGE --oneline --no-merges --grep="^feat" | sed 's/^[a-f0-9]* /- /'
-              echo ""
-            fi
-
-            FIXES=$(git log $RANGE --oneline --no-merges --grep="^fix" 2>/dev/null || true)
-            if [ -n "$FIXES" ]; then
-              echo "### Fixed"
-              git log $RANGE --oneline --no-merges --grep="^fix" | sed 's/^[a-f0-9]* /- /'
-              echo ""
-            fi
-
-            PERFS=$(git log $RANGE --oneline --no-merges --grep="^perf" 2>/dev/null || true)
-            if [ -n "$PERFS" ]; then
-              echo "### Performance"
-              git log $RANGE --oneline --no-merges --grep="^perf" | sed 's/^[a-f0-9]* /- /'
-              echo ""
-            fi
-
-            REFACTORS=$(git log $RANGE --oneline --no-merges --grep="^refactor\|^chore\|^docs" 2>/dev/null || true)
-            if [ -n "$REFACTORS" ]; then
-              echo "### Changed"
-              git log $RANGE --oneline --no-merges --grep="^refactor\|^chore\|^docs" | sed 's/^[a-f0-9]* /- /'
-              echo ""
-            fi
-
-            echo "---"
-            echo ""
-          } > NEW_SECTION.md
-
-          # Insert after the [Unreleased] block (after the "---" that follows it)
-          # Pattern: find "## [Unreleased]", skip to the next "---", then insert
-          awk '
-            /^## \[Unreleased\]/ { print; unreleased=1; next }
-            unreleased && /^---/ {
-              print
-              print ""
-              while ((getline line < "NEW_SECTION.md") > 0) print line
-              close("NEW_SECTION.md")
-              unreleased=0
-              next
-            }
-            { print }
-          ' CHANGELOG.md > CHANGELOG.md.tmp && mv CHANGELOG.md.tmp CHANGELOG.md
-
-          echo "CHANGELOG.md updated for ${TAG}:"
-          head -30 CHANGELOG.md
-
       - name: Commit and open PR (branch protection requires PR to merge to main)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "jyunming"
           git config user.email "69726231+jyunming@users.noreply.github.com"
-          git add website/index.html CHANGELOG.md
+          git add website/index.html
           if git diff --cached --quiet; then
             echo "No changes — skipping"
           else
             BRANCH="chore/release-docs-${GITHUB_REF_NAME}"
             git checkout -b "${BRANCH}"
-            git commit -m "chore(release): bump version badge and CHANGELOG for ${GITHUB_REF_NAME}"
+            git commit -m "chore(release): bump version badge for ${GITHUB_REF_NAME}"
             git push origin "${BRANCH}"
             gh pr create \
               --base main \
               --head "${BRANCH}" \
-              --title "chore(release): bump version badge and CHANGELOG for ${GITHUB_REF_NAME}" \
+              --title "chore(release): bump version badge for ${GITHUB_REF_NAME}" \
               --body "Auto-generated by the release workflow. Merge to complete the ${GITHUB_REF_NAME} release docs update."
           fi

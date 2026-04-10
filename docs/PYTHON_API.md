@@ -29,10 +29,10 @@ db = Database.open(
     seed=42,                 # int — RNG seed for quantizer, must stay the same across sessions
     metric="ip",             # str — "ip" (inner product), "cosine", or "l2"
     rerank=True,             # bool — enable reranking of ANN candidates; precision via rerank_precision
-    fast_mode=True,          # bool — MSE-only mode: all bits go to the MSE codebook (default).
-                             #        Recommended for RAG/ANN search — matches paper Figure 5 recall.
-                             #        Set False only for LLM KV-cache inner-product estimation
-                             #        where unbiased absolute scores matter over ranking order.
+    fast_mode=False,         # bool — When False (default), QJL residual is stored and used
+                             #        during reranking for best recall (+9–15 pp R@1 vs True).
+                             #        Set True for MSE-only mode (paper Figure 5 allocation,
+                             #        ~30% faster ingest, no recall benefit from rerank=True).
     rerank_precision=None,   # str|None — None = dequant reranking (no extra storage)
                              #            "f16" = float16 exact reranking (+n×d×2 bytes)
                              #            "f32" = float32 exact reranking (+n×d×4 bytes)
@@ -72,14 +72,25 @@ TurboQuantDB exposes the same two-stage MSE + residual-QJL layout through two qu
 
 - **`None` / `"dense"` (default)** — Haar-uniform QR rotation + dense i.i.d. Gaussian QJL with `n = d`. Best recall; O(d²) ingest cost. `"exact"` is a legacy alias.
 - **`"srht"`** — structured Walsh-Hadamard + random-sign transforms, `n = next_power_of_two(d)`, O(d log d) ingest. Use for streaming or frequent-ingest workloads at high d.
-- **`fast_mode=True` (default)** — All `b` bits go to the MSE codebook. No QJL residual is stored or scored. Recommended for RAG/ANN search — matches the paper's Figure 5 bit allocation and recall numbers.
-- **`fast_mode=False`** — Splits the budget: `b-1` bits to MSE, 1 bit to a QJL Johnson-Lindenstrauss residual sketch. The QJL provides an *unbiased inner-product estimator*, useful for LLM KV-cache attention scoring where absolute inner-product accuracy matters more than ranking order.
+
+### `fast_mode` and `rerank` interaction
+
+These two parameters work together and must be understood as a pair:
+
+| `fast_mode` | `rerank` | What happens | Recall impact |
+|-------------|----------|--------------|---------------|
+| `False` (default) | `True` (default) | QJL residual stored; dequantize() uses MSE + QJL to rerank top candidates | **Best** — recommended |
+| `False` | `False` | QJL residual stored; initial scoring includes QJL contribution but no rerank step | Modest gain over fast_mode=True |
+| `True` | `False` | No QJL stored; MSE-only scoring | Paper Figure 5 baseline; ~30% faster ingest |
+| `True` | `True` | No QJL stored; rerank is a no-op (dequantize returns MSE-only) | Same as above — adds latency for no gain |
+
+**Rule:** `rerank=True` only improves recall when `fast_mode=False`. With `fast_mode=True`, `rerank=True` adds latency but provides no recall benefit — set `rerank=False` in that case.
 
 ---
 
 ## Recommended Presets
 
-Unless stated otherwise, the presets below use the default `fast_mode=True` (all bits → MSE, paper-aligned) and `quantizer_type=None/"dense"` path.
+Unless stated otherwise, the presets below use the default `fast_mode=False, rerank=True` (QJL reranking enabled — best recall) and `quantizer_type=None/"dense"` path.
 
 ### High Quality — float16 rerank, highest recall
 

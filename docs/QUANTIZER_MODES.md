@@ -70,7 +70,7 @@ codes — net RAM advantage shifts back to SRHT.
 | Rotation matrix (in `quantizer.bin`) | Negligible | 18.9 MB at d=1536 |
 | `live_vectors.bin` (rerank=True) | `d × 4` B/vec | Same |
 
-At d=1536, 100k vectors, `fast_mode=True`, `rerank=False`:
+At d=1536, 100k vectors, `rerank=False` (codes only):
 - SRHT: ~103 MB (codes only)
 - Dense: ~78 MB (codes) + 19 MB (rotation matrix) ≈ **97 MB** — roughly similar total
 

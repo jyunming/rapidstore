@@ -15,7 +15,7 @@ except ImportError:
             seed: int = 42,
             metric: str = "ip",
             rerank: bool = True,
-            fast_mode: bool = True,
+            fast_mode: bool = False,
             rerank_precision: Optional[str] = None,
         ):
             raise RuntimeError("tqdb extension not available")
@@ -34,10 +34,9 @@ class TurboQuantRetriever:
         seed: Random seed for reproducibility.
         metric: Distance metric — ``"ip"`` (inner product) or ``"l2"``.
         rerank_precision: Optional rerank dtype (``"f32"`` or ``"f16"``).
-        fast_mode: If True (default), all ``bits`` go to the MSE codebook
-            — recommended for RAG/ANN search, matches paper Figure 5 recall.
-            Set False only for LLM KV-cache inner-product estimation where
-            unbiased absolute scores matter more than ranking order.
+        fast_mode: When False (default), QJL residual is stored and used
+            during reranking for best recall. Set True for ~30% faster ingest
+            (MSE-only, no recall benefit from rerank).
     """
 
     def __init__(
@@ -48,7 +47,7 @@ class TurboQuantRetriever:
         seed: int = 42,
         metric: str = "ip",
         rerank_precision: Optional[str] = None,
-        fast_mode: bool = True,
+        fast_mode: bool = False,
     ):
         self.db = Database.open(
             db_path, dimension, bits=bits, seed=seed, metric=metric,
