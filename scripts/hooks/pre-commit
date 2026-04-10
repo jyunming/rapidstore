@@ -53,38 +53,33 @@ if ! cargo test -q --lib 2>/dev/null; then
 fi
 pass "unit tests ok"
 
-# ── 4. Build & reinstall wheel when src/ is touched ──────────────────────────
+# ── 4. Build & reinstall into active env when src/ is touched ────────────────
 SRC_CHANGED=$(git diff --cached --name-only | grep -c '^src/' || true)
 
 if [ "${SRC_CHANGED}" -gt 0 ]; then
-    # Detect Python executable
-    PYTHON=""
-    for py in python python3; do
-        if command -v "$py" &>/dev/null; then
-            PYTHON="$py"
-            break
-        fi
-    done
-
-    [ -n "$PYTHON" ] || fail "python not found in PATH"
     command -v maturin &>/dev/null || fail "maturin not found in PATH (install with: pip install maturin)"
 
-    echo -n "[pre-commit] build wheel (${SRC_CHANGED} src/ file(s) changed) ... "
-    if ! maturin build --release --interpreter "$PYTHON" >/dev/null 2>&1; then
-        echo ""
-        fail "wheel build failed"
+    # Detect Python executable — prefer the active venv if present.
+    if [ -n "${VIRTUAL_ENV:-}${CONDA_PREFIX:-}" ]; then
+        PYTHON="python"
+    else
+        PYTHON=""
+        for py in python python3; do
+            if command -v "$py" &>/dev/null; then
+                PYTHON="$py"
+                break
+            fi
+        done
     fi
-    pass "wheel built"
+    [ -n "$PYTHON" ] || fail "python not found in PATH"
 
-    WHEEL_PATH=$(ls -t dist/*.whl 2>/dev/null | head -n 1 || true)
-    [ -n "$WHEEL_PATH" ] || fail "no wheel found in dist/ after build"
-
-    echo -n "[pre-commit] install wheel ... "
-    if ! "$PYTHON" -m pip install --force-reinstall --no-deps "$WHEEL_PATH" >/dev/null 2>&1; then
+    echo "[pre-commit] building and installing into $("$PYTHON" -c 'import sys; print(sys.executable)') (${SRC_CHANGED} src/ file(s) changed)"
+    echo -n "[pre-commit] maturin develop --release ... "
+    if ! maturin develop --release >/dev/null 2>&1; then
         echo ""
-        fail "wheel install failed"
+        fail "maturin develop failed"
     fi
-    pass "wheel installed"
+    pass "maturin develop ok"
 
     echo -n "[pre-commit] python import smoke ... "
     if ! "$PYTHON" -c "import tqdb; _=tqdb.Database; print('ok')" >/dev/null 2>&1; then

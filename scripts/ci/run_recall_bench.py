@@ -215,7 +215,11 @@ def run_benchmark(args):
     # TurboQuantDB benchmark
     with tempfile.TemporaryDirectory() as db_dir:
         print(f"\nInserting {args.n:,} vectors into TurboQuantDB (b={args.bits})...")
-        db = tq.Database.open(db_dir, dimension=args.d, bits=args.bits)
+        # Use fast_mode=True (MSE-only) so the 75% recall threshold reflects
+        # stable quantizer quality independent of QJL residual behaviour at
+        # variable dimensions.  QJL reranking is exercised separately.
+        db = tq.Database.open(db_dir, dimension=args.d, bits=args.bits,
+                              fast_mode=True, rerank=False)
 
         t_insert_start = time.perf_counter()
         for i, vec in enumerate(corpus):

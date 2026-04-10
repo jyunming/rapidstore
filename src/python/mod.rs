@@ -92,14 +92,17 @@ impl Database {
     ) -> PyResult<Self> {
         let engine_path = match collection {
             Some(col) if !col.is_empty() => {
-                // Reject path traversal: collection must not contain separators or ..
+                // Reject path traversal: collection must be a single, safe path component.
                 let col_path = std::path::Path::new(col);
                 if col_path.components().any(|c| {
                     matches!(
                         c,
-                        std::path::Component::ParentDir | std::path::Component::RootDir
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::CurDir
                     )
-                }) || col.contains('/')
+                }) || col == "."
+                    || col.contains('/')
                     || col.contains('\\')
                 {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(

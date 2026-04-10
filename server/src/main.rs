@@ -2689,10 +2689,10 @@ fn validate_path_component(
 ) -> Result<(), ApiError> {
     if name.is_empty()
         || name == ".."
+        || name == "."
         || name.contains('/')
         || name.contains('\\')
         || name.contains('\0')
-        || name.split('/').any(|c| c == "..")
     {
         return Err(ApiError::invalid_argument(
             format!("{label} contains invalid characters or path traversal sequences"),

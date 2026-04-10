@@ -37,18 +37,20 @@ Building from source (Rust toolchain required): see [`DEVELOPMENT.md`](https://g
 
 ## Recommended Setup
 
-Default config: `fast_mode=False, rerank=True` — QJL residual stored and used during reranking for best recall.
+Default config: `fast_mode=False, rerank=True` — QJL residual stored and used during reranking for best recall **at d ≥ 1536**.
+
+> **Note:** At d < 512, QJL projections are too noisy and `fast_mode=False` reduces recall below the MSE-only baseline. Use `fast_mode=True, rerank=False` for d < 512.
 
 ```python
 from tqdb import Database
 
-# Recommended — brute-force with QJL reranking (default config)
+# High-d (d ≥ 1536) — default config, QJL reranking enabled
 db = Database.open(path, dimension=DIM, bits=4)
 results = db.search(query, top_k=10)
-# 81.4% Recall@1, 98.8% Recall@4 at 100k×200  |  22.5 MB disk
+# 92.2% Recall@1, 99.9% Recall@4 at 100k×1536  |  108 MB disk
 
-# Minimum disk — 9.9× compression, still good recall
-db = Database.open(path, dimension=DIM, bits=2)
+# Low-d (d < 512) — MSE-only for best recall at low dimensions
+db = Database.open(path, dimension=DIM, bits=4, fast_mode=True, rerank=False)
 results = db.search(query, top_k=10)
 
 # Optional: build an HNSW index after bulk load for sub-10ms queries

@@ -79,12 +79,14 @@ These two parameters work together and must be understood as a pair:
 
 | `fast_mode` | `rerank` | What happens | Recall impact |
 |-------------|----------|--------------|---------------|
-| `False` (default) | `True` (default) | QJL residual stored; dequantize() uses MSE + QJL to rerank top candidates | **Best** — recommended |
-| `False` | `False` | QJL residual stored; initial scoring includes QJL contribution but no rerank step | Modest gain over fast_mode=True |
-| `True` | `False` | No QJL stored; MSE-only scoring | Paper Figure 5 baseline; ~30% faster ingest |
+| `False` (default) | `True` (default) | QJL residual stored; dequantize() uses MSE + QJL to rerank top candidates | **Best at d ≥ 1536** — recommended |
+| `False` | `False` | QJL residual stored; initial scoring includes QJL contribution but no rerank step | Modest gain over fast_mode=True at d ≥ 1536 |
+| `True` | `False` | No QJL stored; MSE-only scoring | Paper Figure 5 baseline; ~30% faster ingest; best at d < 1536 |
 | `True` | `True` | No QJL stored; rerank is a no-op (dequantize returns MSE-only) | Same as above — adds latency for no gain |
 
 **Rule:** `rerank=True` only improves recall when `fast_mode=False`. With `fast_mode=True`, `rerank=True` adds latency but provides no recall benefit — set `rerank=False` in that case.
+
+**Dimensional note:** `fast_mode=False` stores 1-bit QJL projections and incorporates them into scoring. At high dimensionality (d ≥ 1536), enough projection bits accumulate to provide a strong signal; recall equals or slightly exceeds `fast_mode=True`. At lower dimensionality (d < 512), the 1-bit projections are too noisy and **reduce** recall below the MSE-only baseline. For d < 512, use `fast_mode=True, rerank=False` to get the best recall.
 
 ---
 

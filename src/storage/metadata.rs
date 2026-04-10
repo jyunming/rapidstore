@@ -11,13 +11,17 @@ pub struct VectorMetadata {
     pub document: Option<String>,
 }
 
-/// Convert a scalar JSON value to an index key. Object/Array -> None (not indexable).
+/// Convert a scalar JSON value to a typed index key. Object/Array -> None (not indexable).
+///
+/// Each key is prefixed with a one-character type tag so that values of different types
+/// that stringify identically (e.g. boolean `true` vs string `"true"`, number `1` vs
+/// string `"1"`, null vs string `"__null__"`) never collide in the eq_index.
 fn value_to_index_key(v: &serde_json::Value) -> Option<String> {
     match v {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        serde_json::Value::Bool(b) => Some(b.to_string()),
-        serde_json::Value::Null => Some("__null__".to_string()),
+        serde_json::Value::String(s) => Some(format!("s:{}", s)),
+        serde_json::Value::Number(n) => Some(format!("n:{}", n)),
+        serde_json::Value::Bool(b) => Some(format!("b:{}", b)),
+        serde_json::Value::Null => Some("z:".to_string()),
         _ => None,
     }
 }
@@ -136,12 +140,10 @@ impl MetadataStore {
     /// Returns `None` when the field is not indexed or `value` is not scalar.
     pub fn get_eq_candidates(&self, field: &str, value: &serde_json::Value) -> Option<&[u32]> {
         let key = value_to_index_key(value)?;
-        let v = self.eq_index.get(field)?.get(&key)?;
-        if v.is_empty() {
-            None
-        } else {
-            Some(v.as_slice())
-        }
+        // The field is indexed — return the candidate slice (may be empty, which
+        // short-circuits the caller to zero results rather than falling back to a full scan).
+        let field_map = self.eq_index.get(field)?;
+        Some(field_map.get(&key).map(Vec::as_slice).unwrap_or(&[]))
     }
 
     /// Return all slots where `field` falls within a numeric range.
@@ -200,10 +202,14 @@ impl MetadataStore {
             return;
         }
         self.data.clear();
+        self.eq_index.clear();
+        self.range_index.clear();
         self.dirty = true;
     }
 
     pub fn replace_all(&mut self, data: HashMap<u32, VectorMetadata>) {
+        self.eq_index = Self::build_eq_index(&data);
+        self.range_index = Self::build_range_index(&data);
         self.data = data;
         self.dirty = true;
     }
@@ -641,14 +647,21 @@ mod tests {
     }
 
     #[test]
-    fn eq_index_missing_value_returns_none() {
+    fn eq_index_missing_value_returns_empty_slice() {
+        // The field "status" IS indexed (we inserted "active"), so querying a
+        // value that has no matches returns Some(&[]) rather than None — this
+        // lets callers short-circuit to zero results without a full scan.
         let dir = tempdir().unwrap();
         let mut store = open_store(&dir, "meta.bin");
         store.put(0, &make_meta("status", "active")).unwrap();
+        let result = store.get_eq_candidates("status", &json!("pending"));
         assert!(
-            store
-                .get_eq_candidates("status", &json!("pending"))
-                .is_none()
+            result.is_some(),
+            "indexed field should return Some, not None"
+        );
+        assert!(
+            result.unwrap().is_empty(),
+            "should be empty for an unmatched value"
         );
     }
 
@@ -698,11 +711,9 @@ mod tests {
         let mut store = open_store(&dir, "meta.bin");
         store.put(0, &make_meta("status", "active")).unwrap();
         store.put(0, &make_meta("status", "inactive")).unwrap();
-        assert!(
-            store
-                .get_eq_candidates("status", &json!("active"))
-                .is_none()
-        );
+        // "active" was removed; field is still indexed → Some(&[]) not None.
+        let active = store.get_eq_candidates("status", &json!("active"));
+        assert!(active.is_some_and(|v| v.is_empty()));
         assert_eq!(
             store
                 .get_eq_candidates("status", &json!("inactive"))

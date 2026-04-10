@@ -11,7 +11,7 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 ### Added
 
 - **`quantizer_type="dense"` is now the default** — the Haar-uniform QR + dense Gaussian quantizer (paper-faithful) replaced `"srht"` as the default. `"srht"` remains available for streaming/high-d ingest workloads. `"exact"` is accepted as a backward-compatible alias for `"dense"`.
-- **`fast_mode=False` is now the default** — QJL residual is stored and used during `rerank=True` dequantization, giving +9–15 pp R@1 over `fast_mode=True`. Set `fast_mode=True` explicitly to reproduce paper Figure 5 recall numbers (MSE-only bit allocation) or for ~30% faster ingest.
+- **`fast_mode=False` is now the default** — QJL residual is stored and used during `rerank=True` dequantization, giving +9–15 pp R@1 over `fast_mode=True` at d ≥ 1536. Set `fast_mode=True, rerank=False` for d < 512 (QJL projections are too noisy at low d and reduce recall below the MSE-only baseline) or to reproduce paper Figure 5 recall numbers.
 - **Auto query planner** — `_use_ann` now accepts `None` (the new default). When `None`, the engine automatically selects HNSW search when an index exists, N ≥ 10,000, and the unindexed delta is ≤ 20% of the corpus. Pass `True`/`False` to force a mode.
 - **Range index for numeric metadata** — `$gt`/`$gte`/`$lt`/`$lte` filters now use a per-field BTreeMap index (IEEE-754 ordered keys) instead of a full scan, updated incrementally on insert/delete.
 - **Equality index for metadata** — `$eq` filters resolved via an in-memory inverted index (O(1) candidate lookup), removing the need to scan all vectors on selective equality filters.

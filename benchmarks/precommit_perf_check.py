@@ -185,7 +185,7 @@ def _run_one_config_for_history(
         try:
             if sampler:
                 sampler.start()
-            db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip")
+            db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, fast_mode=True, metric="ip")
             t0 = time.perf_counter()
             for start in range(0, n, CHUNK_SIZE):
                 db.insert_batch(ids[start:start + CHUNK_SIZE], corpus[start:start + CHUNK_SIZE])
@@ -195,7 +195,7 @@ def _run_one_config_for_history(
             ram_mb = db.stats()["ram_estimate_bytes"] / (1 << 20)
             db.close()
             # Reopen then close to trim pre-allocated mmap capacity before measuring disk
-            tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip").close()
+            tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, fast_mode=True, metric="ip").close()
             disk_mb = sum(
                 p.stat().st_size for p in Path(db_dir).iterdir() if p.is_file()
             ) / (1 << 20)
@@ -205,7 +205,7 @@ def _run_one_config_for_history(
 
     # Query pass (with optional ANN index)
     with tempfile.TemporaryDirectory() as db_dir:
-        db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip")
+        db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, fast_mode=True, metric="ip")
         for start in range(0, n, CHUNK_SIZE):
             db.insert_batch(ids[start:start + CHUNK_SIZE], corpus[start:start + CHUNK_SIZE])
         db.flush()
@@ -422,7 +422,7 @@ def run_benchmark(config: dict) -> dict:
     print(f"  ingest ({INGEST_ROUNDS} rounds, median) ...", flush=True)
     for _ in range(INGEST_ROUNDS):
         with tempfile.TemporaryDirectory() as db_dir:
-            db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=False, metric="ip")
+            db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=False, fast_mode=True, metric="ip")
             wall_start = time.perf_counter()
             for start in range(0, n, CHUNK_SIZE):
                 db.insert_batch(ids[start:start + CHUNK_SIZE],
@@ -445,7 +445,7 @@ def run_benchmark(config: dict) -> dict:
     recalls_by_k: dict[int, list[float]] = {k: [] for k in k_values}
 
     with tempfile.TemporaryDirectory() as db_dir:
-        db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=False, metric="ip")
+        db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=False, fast_mode=True, metric="ip")
         for start in range(0, n, CHUNK_SIZE):
             db.insert_batch(ids[start:start + CHUNK_SIZE],
                             corpus[start:start + CHUNK_SIZE])
