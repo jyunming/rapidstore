@@ -27,6 +27,9 @@ struct AppState {
     /// Last time `collect_collection_gauges` ran.  Shared across clones so
     /// concurrent requests do not all trigger a full directory scan.
     last_gauge_collect: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Serializes concurrent `create_collection` calls to prevent TOCTOU races
+    /// where two requests both see "not found" and both attempt to write the manifest.
+    collection_create_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -757,6 +760,7 @@ async fn main() {
         job_worker_concurrency,
         metrics_handle,
         last_gauge_collect: Arc::new(Mutex::new(None)),
+        collection_create_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     dispatch_queued_jobs(&state);
@@ -900,6 +904,8 @@ async fn list_collections(
     Extension(ctx): Extension<RequestContext>,
 ) -> Result<Json<ListCollectionsResponse>, ApiError> {
     authorize(&ctx, &state.auth, "read", &tenant, &database, None)?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
     let collections =
         TurboQuantEngine::list_collections_scoped(&state.storage.local_root, &tenant, &database)
             .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?
@@ -916,6 +922,10 @@ async fn create_collection(
     Json(body): Json<CreateCollectionRequest>,
 ) -> Result<(StatusCode, Json<CreateCollectionResponse>), ApiError> {
     authorize(&ctx, &state.auth, "write", &tenant, &database, None)?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&body.name, "collection", ctx.request_id.clone())?;
+    let _create_guard = state.collection_create_lock.lock().await;
     if body.dimension == 0 || body.bits == 0 {
         return Err(ApiError::invalid_argument(
             "dimension and bits must be greater than 0",
@@ -1004,6 +1014,9 @@ async fn delete_collection(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     let deleted = TurboQuantEngine::delete_collection_scoped_with_uri(
         &state.storage.uri,
         &state.storage.local_root,
@@ -1038,6 +1051,9 @@ async fn add_vectors(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     if body.ids.is_empty() {
         return Err(ApiError::invalid_argument(
             "ids cannot be empty",
@@ -1220,6 +1236,9 @@ async fn upsert_vectors(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     if body.ids.is_empty() {
         return Err(ApiError::invalid_argument(
             "ids cannot be empty",
@@ -1391,6 +1410,9 @@ async fn delete_vectors(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
 
     let mut engine = open_scoped_engine_from_manifest(&state, &tenant, &database, &collection)
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
@@ -1445,6 +1467,9 @@ async fn get_vectors(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     let include_set = parse_include_set(
         body.include.as_ref(),
         &["ids", "metadatas", "documents"],
@@ -1542,6 +1567,9 @@ async fn query_vectors(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     let top_k = body.top_k.or(body.n_results).unwrap_or(10);
     if top_k == 0 {
         return Err(ApiError::invalid_argument(
@@ -1640,6 +1668,9 @@ async fn start_compact_job(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     enforce_job_enqueue_quota(
         &state,
         &tenant,
@@ -1676,6 +1707,9 @@ async fn start_index_job(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     enforce_job_enqueue_quota(
         &state,
         &tenant,
@@ -1712,6 +1746,9 @@ async fn start_snapshot_job(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     enforce_job_enqueue_quota(
         &state,
         &tenant,
@@ -1755,6 +1792,9 @@ async fn start_restore_job(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     enforce_job_enqueue_quota(
         &state,
         &tenant,
@@ -1819,6 +1859,9 @@ async fn list_collection_jobs(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     let jobs = state
         .jobs
         .lock()
@@ -2476,6 +2519,8 @@ async fn get_quota_usage(
     Extension(ctx): Extension<RequestContext>,
 ) -> Result<Json<QuotaUsageResponse>, ApiError> {
     authorize(&ctx, &state.auth, "read", &tenant, &database, None)?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
 
     let collection_names =
         TurboQuantEngine::list_collections_scoped(&state.storage.local_root, &tenant, &database)
@@ -2597,6 +2642,26 @@ fn enforce_job_enqueue_quota(
     }
     Ok(())
 }
+fn validate_path_component(
+    name: &str,
+    label: &str,
+    request_id: Option<String>,
+) -> Result<(), ApiError> {
+    if name.is_empty()
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name.split('/').any(|c| c == "..")
+    {
+        return Err(ApiError::invalid_argument(
+            format!("{label} contains invalid characters or path traversal sequences"),
+            request_id,
+        ));
+    }
+    Ok(())
+}
+
 fn parse_metric(
     metric: Option<&str>,
     request_id: Option<String>,
@@ -2717,6 +2782,7 @@ mod tests {
             job_worker_concurrency: 1,
             metrics_handle: mk_test_metrics_handle(),
             last_gauge_collect: Arc::new(Mutex::new(None)),
+            collection_create_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -2897,6 +2963,7 @@ mod tests {
             job_worker_concurrency: 1,
             metrics_handle: mk_test_metrics_handle(),
             last_gauge_collect: Arc::new(Mutex::new(None)),
+            collection_create_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
