@@ -36,8 +36,12 @@ impl Database {
     ///     metric: Distance metric — ``"ip"`` (inner product), ``"cosine"``,
     ///             or ``"l2"`` (Euclidean). Fixed at creation. Default ``"ip"``.
     ///     rerank: Enable reranking of HNSW candidates. Default ``True``.
-    ///     fast_mode: Skip QJL residual quantization (~30 % faster ingest, slightly
-    ///                lower recall). Default ``False``.
+    ///     fast_mode: When ``True``, all ``bits`` go to the MSE codebook and the QJL
+    ///                residual is not stored. When ``False`` (default), the QJL residual
+    ///                is stored and used during dequantization reranking, giving significantly
+    ///                higher recall (e.g. +9–15 pp R@1 on GloVe-200 b=4). Set ``True`` only
+    ///                to match paper Figure 5 recall curves (MSE-only bit allocation) or for
+    ///                ~30% faster ingest when recall is not critical. Default ``False``.
     ///     rerank_precision: Raw-vector reranking precision:
     ///         - ``None`` (default): dequantization reranking — no extra disk/RAM.
     ///         - ``"f16"``: store raw vectors as float16 (+n×d×2 bytes), exact reranking.
@@ -51,6 +55,14 @@ impl Database {
     ///         query vector internally so that IP scoring equals cosine similarity.  Callers
     ///         that already emit unit vectors can set this to avoid repeating the normalisation
     ///         themselves.  Default ``False``.
+    ///     quantizer_type: Which quantizer rotation to use:
+    ///         - ``None`` / ``"dense"`` (default): Haar-uniform QR rotation + dense Gaussian
+    ///           projection. n=d (no padding). Best recall; O(d²) ingest cost.
+    ///           ``"exact"`` is accepted as a legacy alias.
+    ///         - ``"srht"``: structured Walsh-Hadamard rotation. n=next_power_of_two(d).
+    ///           O(d log d) ingest; ~25% more subspaces scored at search time.
+    ///           Use for streaming or frequent-ingest workloads at high d.
+    ///         See `docs/QUANTIZER_MODES.md` for a full CPU/RAM/disk/recall comparison.
     ///
     /// Returns:
     ///     An open :class:`Database` instance.
@@ -63,7 +75,7 @@ impl Database {
     ///     # Equivalent cosine-via-IP with auto-normalization:
     ///     db = Database.open("mydb", dimension=1536, bits=4, metric="ip", normalize=True)
     #[staticmethod]
-    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false))]
+    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false, quantizer_type=None))]
     fn open(
         path: String,
         dimension: Option<usize>,
@@ -76,9 +88,28 @@ impl Database {
         collection: Option<&str>,
         wal_flush_threshold: Option<usize>,
         normalize: bool,
+        quantizer_type: Option<String>,
     ) -> PyResult<Self> {
         let engine_path = match collection {
             Some(col) if !col.is_empty() => {
+                // Reject path traversal: collection must be a single, safe path component.
+                let col_path = std::path::Path::new(col);
+                if col_path.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::CurDir
+                    )
+                }) || col == "."
+                    || col.contains('/')
+                    || col.contains('\\')
+                {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid collection name {:?}: must be a single path component with no separators",
+                        col
+                    )));
+                }
                 let p = std::path::Path::new(&path).join(col);
                 p.to_string_lossy().into_owned()
             }
@@ -134,6 +165,17 @@ impl Database {
             }
         };
 
+        if bits < 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "bits must be >= 2, got {}",
+                bits
+            )));
+        }
+        if dimension == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "dimension must be > 0",
+            ));
+        }
         let engine = TurboQuantEngine::open_with_options(
             &engine_path,
             &engine_path,
@@ -146,6 +188,7 @@ impl Database {
             precision,
             wal_flush_threshold,
             normalize,
+            quantizer_type,
         )
         .map_err(to_py_runtime)?;
         Ok(Self {
@@ -171,9 +214,17 @@ impl Database {
                 .as_array()
                 .to_owned()
         };
+        check_finite(&vec.view(), "vector")?;
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
             let mut engine = self.write_engine()?;
+            if vec.len() != engine.d {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "vector dimension mismatch: expected {}, got {}",
+                    engine.d,
+                    vec.len()
+                )));
+            }
             engine
                 .insert_with_document(id, &vec, props, document)
                 .map_err(to_py_runtime)
@@ -200,7 +251,26 @@ impl Database {
         if let Ok(v32) = vectors.extract::<PyReadonlyArray2<f32>>(py) {
             let matrix = v32.as_array();
             if ids.len() != matrix.nrows() {
-                return Err(pyo3::exceptions::PyValueError::new_err("mismatch"));
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "ids length ({}) does not match number of vectors ({})",
+                    ids.len(),
+                    matrix.nrows()
+                )));
+            }
+            {
+                let engine = self.read_engine()?;
+                if !matrix.is_empty() && matrix.ncols() != engine.d {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "vector dimension mismatch: expected {}, got {}",
+                        engine.d,
+                        matrix.ncols()
+                    )));
+                }
+            }
+            if matrix.iter().any(|&x| !x.is_finite()) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "vectors contain non-finite values (NaN or Inf)",
+                ));
             }
             let metas = parse_metadata_rows(metadatas, ids.len())?;
             let docs = parse_document_rows(documents, ids.len())?;
@@ -228,7 +298,26 @@ impl Database {
             let v64 = vectors.extract::<PyReadonlyArray2<f64>>(py)?;
             let matrix = v64.as_array();
             if ids.len() != matrix.nrows() {
-                return Err(pyo3::exceptions::PyValueError::new_err("mismatch"));
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "ids length ({}) does not match number of vectors ({})",
+                    ids.len(),
+                    matrix.nrows()
+                )));
+            }
+            {
+                let engine = self.read_engine()?;
+                if !matrix.is_empty() && matrix.ncols() != engine.d {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "vector dimension mismatch: expected {}, got {}",
+                        engine.d,
+                        matrix.ncols()
+                    )));
+                }
+            }
+            if matrix.iter().any(|&x| !x.is_finite()) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "vectors contain non-finite values (NaN or Inf)",
+                ));
             }
             let metas = parse_metadata_rows(metadatas, ids.len())?;
             let docs = parse_document_rows(documents, ids.len())?;
@@ -340,6 +429,10 @@ impl Database {
     ) -> PyResult<usize> {
         let has_filter = where_filter.is_some();
         let parsed_filter = parse_pydict(where_filter)?;
+        if !parsed_filter.is_empty() {
+            crate::storage::engine::filter::validate_filter_operators(&parsed_filter)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+        }
         py.allow_threads(|| {
             let mut engine = self.write_engine()?;
             let mut deleted = if !ids.is_empty() {
@@ -375,6 +468,10 @@ impl Database {
     #[pyo3(signature = (filter=None))]
     fn count(&self, py: Python<'_>, filter: Option<&Bound<'_, PyDict>>) -> PyResult<usize> {
         let parsed_filter = parse_pydict(filter)?;
+        if !parsed_filter.is_empty() {
+            crate::storage::engine::filter::validate_filter_operators(&parsed_filter)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+        }
         let filter_ref = if parsed_filter.is_empty() {
             None
         } else {
@@ -436,17 +533,24 @@ impl Database {
     ///
     /// Returns:
     ///     List of dicts, each with keys ``id``, ``score``, ``metadata``, ``document``.
-    #[pyo3(signature = (query, top_k, filter=None, _use_ann=false, ann_search_list_size=None, include=None))]
+    #[pyo3(signature = (query, top_k, filter=None, _use_ann=None, ann_search_list_size=None, include=None))]
     fn search(
         &self,
         py: Python<'_>,
         query: PyObject,
-        top_k: usize,
+        top_k: i64,
         filter: Option<&Bound<'_, PyDict>>,
-        _use_ann: bool,
+        _use_ann: Option<bool>,
         ann_search_list_size: Option<usize>,
         include: Option<Vec<String>>,
     ) -> PyResult<PyObject> {
+        if top_k <= 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "top_k must be a positive integer, got {}",
+                top_k
+            )));
+        }
+        let top_k = top_k as usize;
         let q = if let Ok(v) = query.extract::<PyReadonlyArray1<f32>>(py) {
             v.as_array().mapv(|x| x as f64)
         } else {
@@ -455,19 +559,32 @@ impl Database {
                 .as_array()
                 .to_owned()
         };
+        check_finite(&q.view(), "query vector")?;
         let parsed_filter = parse_pydict(filter)?;
+        if !parsed_filter.is_empty() {
+            crate::storage::engine::filter::validate_filter_operators(&parsed_filter)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+        }
         let filter_ref = if parsed_filter.is_empty() {
             None
         } else {
             Some(&parsed_filter)
         };
 
-        let inc = parse_include_set(include, &["id", "score", "metadata", "document"]);
+        let inc = parse_include_set(include, &["id", "score", "metadata", "document"])?;
 
         let results = py.allow_threads(|| {
             let engine = self.read_engine()?;
+            if q.len() != engine.d {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "query dimension mismatch: expected {}, got {}",
+                    engine.d,
+                    q.len()
+                )));
+            }
+            let use_ann = _use_ann.unwrap_or_else(|| engine.auto_use_ann());
             engine
-                .search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size, _use_ann)
+                .search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size, use_ann)
                 .map_err(to_py_runtime)
         })?;
 
@@ -511,6 +628,35 @@ impl Database {
             let mut engine = self.write_engine()?;
             engine
                 .create_index_with_params(
+                    max_degree.unwrap_or(32),
+                    ef_construction.unwrap_or(200),
+                    search_list_size.unwrap_or(128),
+                    alpha.unwrap_or(1.2),
+                    n_refinements.unwrap_or(5),
+                )
+                .map_err(to_py_runtime)
+        })
+    }
+
+    /// Incrementally extend an existing HNSW index with vectors inserted since the last
+    /// ``create_index()`` call. If no graph exists, behaves like ``create_index()``.
+    ///
+    /// Significantly faster than a full rebuild for small deltas (< ~10% of corpus).
+    /// For large deltas, prefer ``create_index()`` to get the full quality build.
+    #[pyo3(signature = (max_degree=None, ef_construction=None, search_list_size=None, alpha=None, n_refinements=None))]
+    fn update_index(
+        &self,
+        py: Python<'_>,
+        max_degree: Option<usize>,
+        ef_construction: Option<usize>,
+        search_list_size: Option<usize>,
+        alpha: Option<f64>,
+        n_refinements: Option<usize>,
+    ) -> PyResult<()> {
+        py.allow_threads(|| {
+            let mut engine = self.write_engine()?;
+            engine
+                .create_index_incremental(
                     max_degree.unwrap_or(32),
                     ef_construction.unwrap_or(200),
                     search_list_size.unwrap_or(128),
@@ -635,29 +781,46 @@ impl Database {
     ///         query_embeddings=np.stack([q1, q2, q3]),
     ///         n_results=5,
     ///     )
-    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=false, ann_search_list_size=None))]
+    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=None, ann_search_list_size=None))]
     fn query(
         &self,
         py: Python<'_>,
         query_embeddings: PyObject,
-        n_results: usize,
+        n_results: i64,
         where_filter: Option<&Bound<'_, PyDict>>,
-        _use_ann: bool,
+        _use_ann: Option<bool>,
         ann_search_list_size: Option<usize>,
     ) -> PyResult<PyObject> {
+        if n_results <= 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "n_results must be a positive integer, got {}",
+                n_results
+            )));
+        }
+        let n_results = n_results as usize;
         let queries: Vec<ndarray::Array1<f64>> =
             if let Ok(m) = query_embeddings.extract::<PyReadonlyArray2<f32>>(py) {
-                m.as_array()
+                let rows: Vec<_> = m
+                    .as_array()
                     .rows()
                     .into_iter()
                     .map(|r| r.mapv(|x| x as f64))
-                    .collect()
+                    .collect();
+                for (i, row) in rows.iter().enumerate() {
+                    check_finite(&row.view(), &format!("query_embeddings row {}", i))?;
+                }
+                rows
             } else if let Ok(m) = query_embeddings.extract::<PyReadonlyArray2<f64>>(py) {
-                m.as_array()
+                let rows: Vec<_> = m
+                    .as_array()
                     .rows()
                     .into_iter()
                     .map(|r| r.to_owned())
-                    .collect()
+                    .collect();
+                for (i, row) in rows.iter().enumerate() {
+                    check_finite(&row.view(), &format!("query_embeddings row {}", i))?;
+                }
+                rows
             } else {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "query_embeddings must be a 2-D numpy array (float32 or float64)",
@@ -665,14 +828,27 @@ impl Database {
             };
 
         let parsed_filter = parse_pydict(where_filter)?;
+        if !parsed_filter.is_empty() {
+            crate::storage::engine::filter::validate_filter_operators(&parsed_filter)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+        }
         let filter_ref = if parsed_filter.is_empty() {
             None
         } else {
             Some(&parsed_filter)
         };
-
         let batch = py.allow_threads(|| {
             let engine = self.read_engine()?;
+            for (i, row) in queries.iter().enumerate() {
+                if row.len() != engine.d {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "query dimension mismatch: expected {}, got {} (row {})",
+                        engine.d,
+                        row.len(),
+                        i
+                    )));
+                }
+            }
             engine
                 .search_batch(
                     &queries,
@@ -725,10 +901,30 @@ impl Database {
         &self,
         py: Python<'_>,
         where_filter: Option<&Bound<'_, PyDict>>,
-        limit: Option<usize>,
-        offset: usize,
+        limit: Option<i64>,
+        offset: i64,
     ) -> PyResult<Vec<String>> {
+        if offset < 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "offset must be >= 0, got {}",
+                offset
+            )));
+        }
+        if let Some(lim) = limit {
+            if lim < 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "limit must be >= 0, got {}",
+                    lim
+                )));
+            }
+        }
+        let offset = offset as usize;
+        let limit = limit.map(|l| l as usize);
         let parsed_filter = parse_pydict(where_filter)?;
+        if !parsed_filter.is_empty() {
+            crate::storage::engine::filter::validate_filter_operators(&parsed_filter)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+        }
         let filter_ref = if parsed_filter.is_empty() {
             None
         } else {
@@ -932,15 +1128,32 @@ fn to_py_runtime(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
 }
 
+fn check_finite(vec: &ndarray::ArrayView1<f64>, label: &str) -> PyResult<()> {
+    if vec.iter().any(|&x| !x.is_finite()) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{} contains non-finite values (NaN or Inf)",
+            label
+        )));
+    }
+    Ok(())
+}
+
 fn parse_include_set(
     include: Option<Vec<String>>,
     defaults: &[&str],
-) -> std::collections::HashSet<String> {
-    include
-        .unwrap_or_else(|| defaults.iter().map(|s| s.to_string()).collect())
-        .into_iter()
-        .map(|s| s.to_ascii_lowercase())
-        .collect()
+) -> PyResult<std::collections::HashSet<String>> {
+    let items = include.unwrap_or_else(|| defaults.iter().map(|s| s.to_string()).collect());
+    let valid: std::collections::HashSet<&str> = defaults.iter().copied().collect();
+    for item in &items {
+        if !valid.contains(item.to_ascii_lowercase().as_str()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid include field {:?}; valid values are: {}",
+                item,
+                defaults.join(", ")
+            )));
+        }
+    }
+    Ok(items.into_iter().map(|s| s.to_ascii_lowercase()).collect())
 }
 
 pub fn register(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {

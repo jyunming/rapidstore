@@ -6,7 +6,43 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
-## [Unreleased]
+## [0.5.0] — 2026-04-10
+
+### Added
+
+- **`quantizer_type="dense"` is now the default** — the Haar-uniform QR + dense Gaussian quantizer (paper-faithful) replaced `"srht"` as the default. `"srht"` remains available for streaming/high-d ingest workloads. `"exact"` is accepted as a backward-compatible alias for `"dense"`.
+- **`fast_mode=False` is now the default** — QJL residual is stored and used during `rerank=True` dequantization, giving +9–15 pp R@1 over `fast_mode=True` at d ≥ 1536. Set `fast_mode=True, rerank=False` for d < 512 (QJL projections are too noisy at low d and reduce recall below the MSE-only baseline) or to reproduce paper Figure 5 recall numbers.
+- **Auto query planner** — `_use_ann` now accepts `None` (the new default). When `None`, the engine automatically selects HNSW search when an index exists, N ≥ 10,000, and the unindexed delta is ≤ 20% of the corpus. Pass `True`/`False` to force a mode.
+- **Range index for numeric metadata** — `$gt`/`$gte`/`$lt`/`$lte` filters now use a per-field BTreeMap index (IEEE-754 ordered keys) instead of a full scan, updated incrementally on insert/delete.
+- **Equality index for metadata** — `$eq` filters resolved via an in-memory inverted index (O(1) candidate lookup), removing the need to scan all vectors on selective equality filters.
+- **Filter pushdown** — the query planner resolves selective `$eq` filters to a candidate slot list before entering the scoring loop, avoiding full-corpus scans when filters are highly selective.
+- **Incremental HNSW build** — `create_index()` can now build the graph layer-by-layer from existing segment data without reloading all raw vectors.
+- **AVX2 SIMD paths** — `unpack_mse_indices` (b=4: 16 bytes → 32 u16 per AVX2 iteration) and float32 exact-rerank dot-product now have AVX2 fast paths.
+- **`DEVELOPMENT.md`** — new contributor guide with prerequisites, build/test/benchmark commands, and sprint workflow.
+
+### Fixed
+
+- **`fast_mode=True` dequantize panic** — `dequantize()` now short-circuits to MSE-only in fast mode, preventing a zero-length QJL slice panic during rerank.
+- **`live_codes` stride correctness** — stride now computed from `quantizer.n` instead of `next_power_of_two(d)`, so dense mode (n=d) and srht mode (n=next_power_of_two(d)) both get correct slot offsets on insert and search.
+- **Delete-reinsert correctness** — WAL entries applied in insertion order so a delete-then-reinsert sequence preserves the latest slot across flush and reopen.
+- **Python boundary hardening** — NaN/Inf rejection in insert/search vectors; dimension mismatch, invalid `bits`/`dimension`, negative `top_k`/`offset`/`limit` all raise `ValueError` instead of `PanicException`.
+- **Unknown filter operators** — `search()`, `query()`, `list_ids()`, `count()`, and `delete_batch()` now raise `ValueError` on unrecognised `$`-prefixed operators.
+- **`include=` validation** — unknown field names in the `include` parameter raise `ValueError` instead of silently returning empty dicts.
+- **Collection path traversal** — collection names containing `..`, `/`, or `\` raise `ValueError` at the Python layer.
+- **Server: concurrent create race** — `create_collection` serialised with a per-state mutex, preventing TOCTOU corruption when two requests both see "not found" and write the manifest simultaneously.
+- **Server: path traversal** — all route handlers validate tenant/database/collection path components, rejecting `..` and separator characters.
+- **Server: lock ordering** — jobs lock released before `dispatch_queued_jobs` to eliminate self-deadlock.
+- **Server: scoped URI** — `open_collection_scoped` now uses the flat storage path, fixing 500 errors from manifest path mismatches in tests.
+- **ChromaDB/LanceDB compat** — threading locks on `ChromaClient` and `LanceDBConnection` create paths; unknown operator rejection; SQL `IN` clause trailing-comma fix; `limit(-1)` raises `ValueError`; duplicate `create_table` raises `ValueError` in create mode.
+- **`rag.py`** — `float64→float32` dtype cast; `similarity_search` returns dict results correctly; class/method docstrings added.
+- **QA pass** — 381/381 tests passing (adversarial, market simulation, server blackbox suites added).
+
+### Performance
+
+- **WAL write coalescing** — `append_batch` pre-builds the full byte buffer and calls `write_all` + `flush` once per batch, eliminating per-entry syscall overhead.
+- **WAL `BufWriter` increased to 4 MB** — reduces system calls per `append_batch` from ~5,000 to ~8 for 1536-dim entries.
+- **ANN `search_batch` parallelised** — Rayon `par_iter` across queries for the ANN path; 1.46× throughput improvement at batch=8.
+- **Brute-force batch queries always parallelised** — removed the large-N sequential guard; Rayon work-stealing handles nested `par_iter` + `par_chunks` without over-subscribing the thread pool.
 
 ---
 
@@ -101,23 +137,6 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
-## [0.2.0] — 2026-04-15
-
-### Changed
-
-- **Package renamed from `turboquantdb` to `tqdb`** — `import tqdb` replaces `import turboquantdb`; the `Database` class is the same
-- `src/lib.rs` doc comment updated to reference `tqdb` Python package
-
----
-
-## [0.1.1] — 2026-04-10
-
-### Fixed
-
-- Release CI: replaced `--find-interpreter` with `-i python` in Windows and macOS matrix jobs to prevent duplicate wheels and "ZIP archive: Trailing data" PyPI upload failures
-
----
-
 ## [0.1.0] — 2026-04-03
 
 ### Added
@@ -157,7 +176,7 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ### Features (algorithm)
 
-- **feat(quantizer)**: switch to paper-conformant QR rotation and Gaussian QJL projection
+- **feat(quantizer)**: switch quantizer internals to the paper-faithful QR rotation + Gaussian QJL formulation (the current docs refer to this formulation as the `exact` path)
 - **feat(storage)**: de-duplicate codes and persist id pool
 - **feat(storage)**: dequantization-based reranking — no `live_vectors.bin` overhead by default
 

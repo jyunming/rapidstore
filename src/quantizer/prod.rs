@@ -52,10 +52,44 @@ impl ProdQuantizer {
         }
     }
 
+    /// Dense mode: Haar-uniform QR rotation (MSE) + dense N(0,1) Gaussian projection (QJL),
+    /// as specified in arXiv:2504.19874. No padding: n=d.
+    /// O(d²) quantize/score time and O(d²) storage vs O(d log d) / O(d) for SRHT.
+    pub fn new_dense(d: usize, b: usize, seed: u64) -> Self {
+        assert!(b >= 2, "ProdQuantizer requires at least b=2");
+        let mse_quantizer = MseQuantizer::new_dense(d, b - 1, seed);
+        let qjl_quantizer = QjlQuantizer::new_dense(d, seed ^ 0xdeadbeef);
+        Self {
+            d,
+            n: d, // no padding in exact mode
+            b,
+            mse_quantizer,
+            qjl_quantizer,
+            fast_mode: false,
+        }
+    }
+
+    /// Dense fast-path: Haar-uniform QR rotation + all b bits to MSE (no QJL).
+    /// Best recall of all modes; O(d²) ingest cost.
+    pub fn new_dense_fast(d: usize, b: usize, seed: u64) -> Self {
+        assert!(b >= 2, "ProdQuantizer requires at least b=2");
+        let mse_quantizer = MseQuantizer::new_dense(d, b, seed);
+        let qjl_quantizer = QjlQuantizer::new_dense(d, seed ^ 0xdeadbeef);
+        Self {
+            d,
+            n: d,
+            b,
+            mse_quantizer,
+            qjl_quantizer,
+            fast_mode: true,
+        }
+    }
+
     /// Fast-path: skips the QJL residual quantization step. Ingest is ~30% faster;
     /// approximate scores omit the residual correction (slightly lower recall).
     pub fn new_srht(d: usize, b: usize, seed: u64) -> Self {
-        let mse_quantizer = MseQuantizer::new(d, b - 1, seed);
+        // fast_mode: QJL not stored, so all b bits go to MSE codebook (not b-1).
+        let mse_quantizer = MseQuantizer::new(d, b, seed);
         let qjl_quantizer = QjlQuantizer::new(d, seed ^ 0xdeadbeef);
         let n = d.next_power_of_two();
 
@@ -66,6 +100,24 @@ impl ProdQuantizer {
             mse_quantizer,
             qjl_quantizer,
             fast_mode: true,
+        }
+    }
+
+    /// Bits used per MSE code index. Equals `mse_quantizer.b`:
+    /// `b-1` in prod mode (QJL takes 1 bit) or `b` in fast_mode (all bits → MSE).
+    pub fn mse_bits_per_idx(&self) -> usize {
+        self.mse_quantizer.b
+    }
+
+    fn qjl_query_scale(&self) -> f32 {
+        if self.qjl_quantizer.projection_matrix.is_some() {
+            // Exact mode uses sq = S q / sqrt(d), so the correction term needs
+            // sqrt(pi/2) / sqrt(d) to match gamma * sqrt(pi/2) / d * S^T z.
+            (PI / 2.0).sqrt() / (self.d as f32).sqrt()
+        } else {
+            // SRHT output is unit-variance per dim (normalized Hadamard), so scale
+            // matches qjl.rs dequant scale_base = sqrt(pi/(2n)) = sqrt(pi/2)/sqrt(n).
+            (PI / 2.0).sqrt() / (self.n as f32).sqrt()
         }
     }
 
@@ -95,7 +147,7 @@ impl ProdQuantizer {
             mse_lut,
             mse_lut_width: lut_w,
             sq,
-            qjl_scale: (PI / 2.0).sqrt() / self.n as f32,
+            qjl_scale: self.qjl_query_scale(),
         }
     }
 
@@ -112,7 +164,7 @@ impl ProdQuantizer {
         PreparedIpQueryLite {
             y,
             sq,
-            qjl_scale: (PI / 2.0).sqrt() / self.n as f32,
+            qjl_scale: self.qjl_query_scale(),
         }
     }
 
@@ -145,7 +197,7 @@ impl ProdQuantizer {
         PreparedIpQueryLite {
             y,
             sq: vec![0.0f32; self.n],
-            qjl_scale: (PI / 2.0).sqrt() / self.n as f32,
+            qjl_scale: self.qjl_query_scale(),
         }
     }
 
@@ -494,6 +546,10 @@ impl ProdQuantizer {
 
     pub fn dequantize(&self, idx: &[CodeIndex], qjl: &[u8], gamma: f64) -> Array1<f64> {
         let x_mse = self.mse_quantizer.dequantize(idx);
+        if self.fast_mode {
+            // fast_mode: no QJL stored — MSE reconstruction is the full estimate.
+            return x_mse;
+        }
         let x_qjl = self.qjl_quantizer.dequantize(qjl, gamma);
         x_mse + x_qjl
     }
@@ -527,7 +583,7 @@ impl ProdQuantizer {
     }
 
     pub fn pack_mse_indices(&self, indices: &[CodeIndex]) -> Vec<u8> {
-        let bits_per_idx = self.b - 1;
+        let bits_per_idx = self.mse_quantizer.b;
         if bits_per_idx == 8 {
             return indices.iter().map(|v| *v as u8).collect();
         }
@@ -549,7 +605,67 @@ impl ProdQuantizer {
     }
 
     pub fn unpack_mse_indices(&self, packed: &[u8], out: &mut [CodeIndex]) {
-        let bits_per_idx = self.b - 1;
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { self.unpack_mse_indices_avx2(packed, out) };
+        }
+        self.unpack_mse_indices_scalar(packed, out);
+    }
+
+    /// SIMD nibble unpacker for b=4 (the common production case).
+    ///
+    /// Processes 16 packed bytes per iteration → 32 u16 indices using:
+    ///   - `_mm_and_si128` to extract lo/hi nibbles
+    ///   - `_mm_unpacklo/hi_epi8` to interleave them in index order
+    ///   - `_mm256_cvtepu8_epi16` to zero-extend u8 → u16 for storage
+    ///
+    /// b=2 and b=8 fall through to the scalar path (uncommon in practice).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn unpack_mse_indices_avx2(&self, packed: &[u8], out: &mut [CodeIndex]) {
+        use std::arch::x86_64::*;
+
+        let bits_per_idx = self.mse_quantizer.b;
+
+        if bits_per_idx == 4 {
+            // Each byte holds 2 nibbles: lo=index[2i], hi=index[2i+1].
+            // Process 16 packed bytes → 32 u16 output values per iteration.
+            let mask_lo = _mm_set1_epi8(0x0F_u8 as i8);
+            let n_full = (self.n / 32) * 32; // full 32-index chunks
+            let mut out_i = 0usize;
+            let mut byte_i = 0usize;
+
+            while out_i < n_full {
+                let v = _mm_loadu_si128(packed.as_ptr().add(byte_i) as *const __m128i);
+                // lo nibbles: bits[3:0] of each byte → index[2i]
+                let lo = _mm_and_si128(v, mask_lo);
+                // hi nibbles: bits[7:4] → index[2i+1] (shift right 4 within each u16 lane)
+                let hi = _mm_and_si128(_mm_srli_epi16(v, 4), mask_lo);
+                // Interleave: [lo0,hi0,lo1,hi1,...] within each 8-byte half
+                let interleaved_lo = _mm_unpacklo_epi8(lo, hi);
+                let interleaved_hi = _mm_unpackhi_epi8(lo, hi);
+                // Zero-extend u8 → u16 and store
+                let out16_lo = _mm256_cvtepu8_epi16(interleaved_lo);
+                let out16_hi = _mm256_cvtepu8_epi16(interleaved_hi);
+                _mm256_storeu_si256(out.as_mut_ptr().add(out_i) as *mut __m256i, out16_lo);
+                _mm256_storeu_si256(out.as_mut_ptr().add(out_i + 16) as *mut __m256i, out16_hi);
+                out_i += 32;
+                byte_i += 16;
+            }
+            // Scalar tail for any remainder.
+            if out_i < self.n {
+                self.unpack_mse_indices_scalar(&packed[byte_i..], &mut out[out_i..]);
+            }
+            return;
+        }
+
+        // b=2 and b=8: scalar path (uncommon configs).
+        self.unpack_mse_indices_scalar(packed, out);
+    }
+
+    fn unpack_mse_indices_scalar(&self, packed: &[u8], out: &mut [CodeIndex]) {
+        let bits_per_idx = self.mse_quantizer.b;
         if bits_per_idx == 8 {
             for (dst, src) in out.iter_mut().zip(packed.iter()) {
                 *dst = *src as CodeIndex;
@@ -558,7 +674,7 @@ impl ProdQuantizer {
         }
         let mask = (1u32 << bits_per_idx) - 1;
         let mut bit_pos = 0usize;
-        for i in 0..self.n {
+        for i in 0..out.len().min(self.n) {
             let byte_idx = bit_pos >> 3;
             let bit_off = bit_pos & 7;
             let mut val = (packed[byte_idx] as u32) >> bit_off;
@@ -634,6 +750,10 @@ mod tests {
 
     fn make_pq(d: usize) -> ProdQuantizer {
         ProdQuantizer::new(d, 4, 42)
+    }
+
+    fn make_dense_pq(d: usize) -> ProdQuantizer {
+        ProdQuantizer::new_dense(d, 4, 42)
     }
 
     #[test]
@@ -883,6 +1003,42 @@ mod tests {
             "full vs lite score should be reasonably close: {} vs {}",
             score_full,
             score_lite
+        );
+    }
+
+    #[test]
+    fn exact_mode_scores_match_dequantized_inner_product() {
+        let d = 32;
+        let pq = make_dense_pq(d);
+        let x: Vec<f32> = (0..d)
+            .map(|i| ((i as f32 * 0.17).sin() + 0.25).cos())
+            .collect();
+        let query = Array1::from_iter(
+            (0..d).map(|i| ((i as f64 * 0.11).cos() - 0.2) * (1.0 + i as f64 * 0.001)),
+        );
+
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        let dequantized = pq.dequantize(&idx, &qjl, gamma);
+        let direct: f64 = query
+            .iter()
+            .zip(dequantized.iter())
+            .map(|(q, x_hat)| q * x_hat)
+            .sum();
+
+        let prep = pq.prepare_ip_query(&query);
+        let score = pq.score_ip_encoded(&prep, &idx, &qjl, gamma);
+        let full_diff = (score - direct).abs();
+        assert!(
+            full_diff < 1e-4,
+            "exact-mode full score should match query·dequantize(code): score={score}, direct={direct}, diff={full_diff}"
+        );
+
+        let prep_lite = pq.prepare_ip_query_lite(&query);
+        let score_lite = pq.score_ip_encoded_lite(&prep_lite, &idx, &qjl, gamma);
+        let lite_diff = (score_lite - direct).abs();
+        assert!(
+            lite_diff < 1e-4,
+            "exact-mode lite score should match query·dequantize(code): score={score_lite}, direct={direct}, diff={lite_diff}"
         );
     }
 

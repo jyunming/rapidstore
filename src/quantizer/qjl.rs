@@ -3,6 +3,7 @@ use ndarray::Array1;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
@@ -35,7 +36,12 @@ use crate::linalg::hadamard::srht;
 pub struct QjlQuantizer {
     pub d: usize,
     pub n: usize,
+    /// SRHT diagonal sign vector (length n). Empty when `projection_matrix` is `Some`.
     pub projection_signs: Vec<f32>,
+    /// Exact-paper mode: d×d i.i.d. N(0,1) Gaussian matrix, row-major.
+    /// `None` → use SRHT. `Some` → dense matrix-vector multiply normalized by 1/√d.
+    #[serde(default)]
+    pub projection_matrix: Option<Vec<f32>>,
 }
 
 impl QjlQuantizer {
@@ -51,6 +57,7 @@ impl QjlQuantizer {
             d,
             n,
             projection_signs,
+            projection_matrix: None,
         }
     }
 
@@ -59,9 +66,37 @@ impl QjlQuantizer {
         Self::new(d, seed)
     }
 
-    /// Forward projection: y = H * D * (x, 0)
+    /// Exact-paper mode: dense i.i.d. N(0,1) Gaussian projection matrix.
+    /// Dense mode: full N(0,1) Gaussian projection matrix, n=d (no padding).
+    /// Output is normalized by 1/√d, so dense-mode query scoring must compensate
+    /// with `sqrt(pi/2) / sqrt(d)` rather than the SRHT `sqrt(pi/2) / n`.
+    /// O(d²) apply time, O(d²) storage.
+    pub fn new_dense(d: usize, seed: u64) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let matrix: Vec<f32> = (0..d * d).map(|_| rng.sample(StandardNormal)).collect();
+        Self {
+            d,
+            n: d, // no zero-padding needed
+            projection_signs: vec![],
+            projection_matrix: Some(matrix),
+        }
+    }
+
+    /// Forward projection: S·x/√d (exact) or H·D·(x,0) (SRHT).
     pub fn apply_projection(&self, x: &[f32], out: &mut [f32]) {
-        srht(x, &self.projection_signs, out);
+        if let Some(mat) = &self.projection_matrix {
+            let scale = 1.0 / (self.d as f32).sqrt();
+            for row in 0..self.d {
+                out[row] = mat[row * self.d..(row + 1) * self.d]
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>()
+                    * scale;
+            }
+        } else {
+            srht(x, &self.projection_signs, out);
+        }
     }
 
     /// Encode a `d`-dimensional residual vector `r` (as `f64`) into a bit-packed byte
@@ -103,7 +138,7 @@ impl QjlQuantizer {
                 let r_col_view = rs.column(col);
                 let r_col = r_col_view.as_slice();
                 let mut s_r = vec![0.0f32; self.n];
-                srht(r_col, &self.projection_signs, &mut s_r);
+                self.apply_projection(r_col, &mut s_r);
                 for row in 0..self.n {
                     if s_r[row] >= 0.0 {
                         let byte_idx = row / 8;
@@ -133,20 +168,37 @@ impl QjlQuantizer {
 
         let n_vecs = encoded.len();
         let scale_base = (PI / (2.0 * self.n as f32)).sqrt();
+        let is_exact = self.projection_matrix.is_some();
 
         let mut out = vec![Array1::zeros(self.d); n_vecs];
         out.par_iter_mut().enumerate().for_each(|(col, result)| {
             let (qjl, gamma) = &encoded[col];
-            let mut qjl_f32 = vec![0.0f32; self.n];
+            let mut signs_f32 = vec![0.0f32; self.n];
             for row in 0..self.n {
                 let byte_idx = row / 8;
                 let bit_idx = row % 8;
                 let bit_set = ((qjl[byte_idx] >> bit_idx) & 1u8) == 1u8;
-                qjl_f32[row] = if bit_set { 1.0 } else { -1.0 };
+                signs_f32[row] = if bit_set { 1.0 } else { -1.0 };
             }
 
             let mut st_qjl = vec![0.0f32; self.d];
-            crate::linalg::hadamard::inverse_srht(&qjl_f32, &self.projection_signs, &mut st_qjl);
+            if is_exact {
+                // S^T · signs / √d  (S is the stored Gaussian matrix)
+                let mat = self.projection_matrix.as_ref().unwrap();
+                let scale = 1.0 / (self.d as f32).sqrt();
+                for col_idx in 0..self.d {
+                    st_qjl[col_idx] = (0..self.d)
+                        .map(|row_idx| mat[row_idx * self.d + col_idx] * signs_f32[row_idx])
+                        .sum::<f32>()
+                        * scale;
+                }
+            } else {
+                crate::linalg::hadamard::inverse_srht(
+                    &signs_f32,
+                    &self.projection_signs,
+                    &mut st_qjl,
+                );
+            }
 
             let multiplier = (scale_base * *gamma as f32) as f64;
             for row in 0..self.d {

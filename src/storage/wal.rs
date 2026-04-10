@@ -52,7 +52,7 @@ impl Wal {
 
         Ok(Self {
             path,
-            writer: BufWriter::new(file),
+            writer: BufWriter::with_capacity(4 * 1024 * 1024, file),
             entry_count: 0,
             quantizer: None,
         })
@@ -82,6 +82,12 @@ impl Wal {
             }
             return Ok(());
         }
+
+        // Pre-allocate a single buffer for the whole batch (rough estimate: 512 bytes/entry).
+        // Serialising all entries first then issuing one write_all eliminates per-entry
+        // syscall overhead and avoids partial BufWriter flushes mid-batch.
+        let mut buf: Vec<u8> = Vec::with_capacity(entries.len() * 512);
+
         for entry in entries {
             let encoded = if let Some(q) = &self.quantizer {
                 // Delete tombstones carry empty quantized_indices; skip packing for them.
@@ -103,16 +109,21 @@ impl Wal {
             } else {
                 bincode::serialize(entry)?
             };
+
             let len = encoded.len() as u64;
             let len_bytes = len.to_le_bytes();
-            self.writer.write_all(&len_bytes)?;
-            self.writer.write_all(&encoded)?;
             let mut hasher = crc32fast::Hasher::new();
             hasher.update(&len_bytes);
             hasher.update(&encoded);
-            self.writer.write_all(&hasher.finalize().to_le_bytes())?;
+
+            buf.extend_from_slice(&len_bytes);
+            buf.extend_from_slice(&encoded);
+            buf.extend_from_slice(&hasher.finalize().to_le_bytes());
             self.entry_count += 1;
         }
+
+        // One write_all + one flush for the entire batch.
+        self.writer.write_all(&buf)?;
         self.writer.flush()?;
         if force_sync {
             self.writer.get_ref().sync_data()?;

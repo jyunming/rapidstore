@@ -18,8 +18,8 @@
 //!         │     ├── storage::id_pool    ← ID ↔ slot hash table
 //!         │     └── storage::metadata   ← per-vector metadata + documents
 //!         └── quantizer::ProdQuantizer  ← two-stage MSE + QJL quantizer
-//!               ├── quantizer::mse  ← QR rotation + Lloyd-Max codebook
-//!               └── quantizer::qjl  ← dense Gaussian projection, 1-bit sign
+//!               ├── quantizer::mse  ← SRHT rotation + Lloyd-Max codebook (exact: QR)
+//!               └── quantizer::qjl  ← SRHT projection, 1-bit sign (exact: dense Gaussian)
 //! ```
 //!
 //! ## Data Flow

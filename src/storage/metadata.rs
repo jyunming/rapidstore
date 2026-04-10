@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -11,10 +11,49 @@ pub struct VectorMetadata {
     pub document: Option<String>,
 }
 
+/// Convert a scalar JSON value to a typed index key. Object/Array -> None (not indexable).
+///
+/// Each key is prefixed with a one-character type tag so that values of different types
+/// that stringify identically (e.g. boolean `true` vs string `"true"`, number `1` vs
+/// string `"1"`, null vs string `"__null__"`) never collide in the eq_index.
+fn value_to_index_key(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(format!("s:{}", s)),
+        serde_json::Value::Number(n) => Some(format!("n:{}", n)),
+        serde_json::Value::Bool(b) => Some(format!("b:{}", b)),
+        serde_json::Value::Null => Some("z:".to_string()),
+        _ => None,
+    }
+}
+
+/// Map an f64 to a u64 that preserves numeric ordering for use as a BTreeMap key.
+///
+/// The encoding:
+/// - Positive numbers: flip the sign bit → u64 values that sort ascending.
+/// - Negative numbers: flip all bits → u64 values that sort ascending (most-negative first).
+/// - NaN maps to the same key as positive infinity; callers should treat NaN fields as
+///   non-indexed and let the scalar filter handle them.
+pub(crate) fn f64_to_ord(v: f64) -> u64 {
+    let bits = v.to_bits();
+    if bits >> 63 == 0 {
+        bits | (1u64 << 63)
+    } else {
+        !bits
+    }
+}
+
 pub struct MetadataStore {
     path: PathBuf,
     data: HashMap<u32, VectorMetadata>,
     dirty: bool,
+    /// Equality index: field -> value_key -> sorted slot list.
+    /// Covers scalar (string/number/bool/null) top-level fields only.
+    /// Enables O(1) pre-filter candidate lookup for $eq filter conditions.
+    eq_index: HashMap<String, HashMap<String, Vec<u32>>>,
+    /// Range index: field -> BTreeMap<ord_key, sorted slot list>.
+    /// Covers numeric (f64) top-level fields only.
+    /// Enables sub-linear pre-filter for $gt/$gte/$lt/$lte conditions.
+    range_index: HashMap<String, BTreeMap<u64, Vec<u32>>>,
 }
 
 impl MetadataStore {
@@ -30,10 +69,14 @@ impl MetadataStore {
         } else {
             HashMap::new()
         };
+        let eq_index = Self::build_eq_index(&data);
+        let range_index = Self::build_range_index(&data);
         Ok(Self {
             path,
             data,
             dirty: false,
+            eq_index,
+            range_index,
         })
     }
 
@@ -42,7 +85,9 @@ impl MetadataStore {
         slot: u32,
         meta: &VectorMetadata,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.index_remove(slot);
         self.data.insert(slot, meta.clone());
+        self.index_add(slot, meta);
         self.dirty = true;
         Ok(())
     }
@@ -55,7 +100,9 @@ impl MetadataStore {
             return Ok(());
         }
         for (slot, meta) in entries {
+            self.index_remove(*slot);
             self.data.insert(*slot, meta.clone());
+            self.index_add(*slot, meta);
         }
         self.dirty = true;
         Ok(())
@@ -82,9 +129,89 @@ impl MetadataStore {
     }
 
     pub fn delete(&mut self, slot: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.index_remove(slot);
         self.data.remove(&slot);
         self.dirty = true;
         Ok(())
+    }
+
+    /// Return all slots where `field == value`.
+    /// Only works for scalar values (string, number, bool, null).
+    /// Returns `None` when the field is not indexed or `value` is not scalar.
+    pub fn get_eq_candidates(&self, field: &str, value: &serde_json::Value) -> Option<&[u32]> {
+        let key = value_to_index_key(value)?;
+        // The field is indexed — return the candidate slice (may be empty, which
+        // short-circuits the caller to zero results rather than falling back to a full scan).
+        let field_map = self.eq_index.get(field)?;
+        Some(field_map.get(&key).map(Vec::as_slice).unwrap_or(&[]))
+    }
+
+    /// Return all slots where `field` falls within a numeric range.
+    ///
+    /// `lo` and `hi` are `(ord_key, inclusive)` pairs produced by [`f64_to_ord`].
+    /// Either bound may be `None` (open-ended). Returns `None` when the field has
+    /// no range index (not a numeric field or never seen in any inserted vector).
+    pub fn get_range_candidates(
+        &self,
+        field: &str,
+        lo: Option<(u64, bool)>,
+        hi: Option<(u64, bool)>,
+    ) -> Option<Vec<u32>> {
+        let btree = self.range_index.get(field)?;
+        let iter: Box<dyn Iterator<Item = (&u64, &Vec<u32>)>> = match (lo, hi) {
+            (Some((lo_k, lo_incl)), Some((hi_k, hi_incl))) => {
+                let lo_bound = if lo_incl {
+                    std::ops::Bound::Included(lo_k)
+                } else {
+                    std::ops::Bound::Excluded(lo_k)
+                };
+                let hi_bound = if hi_incl {
+                    std::ops::Bound::Included(hi_k)
+                } else {
+                    std::ops::Bound::Excluded(hi_k)
+                };
+                Box::new(btree.range((lo_bound, hi_bound)))
+            }
+            (Some((lo_k, lo_incl)), None) => {
+                let lo_bound = if lo_incl {
+                    std::ops::Bound::Included(lo_k)
+                } else {
+                    std::ops::Bound::Excluded(lo_k)
+                };
+                Box::new(btree.range((lo_bound, std::ops::Bound::Unbounded)))
+            }
+            (None, Some((hi_k, hi_incl))) => {
+                let hi_bound = if hi_incl {
+                    std::ops::Bound::Included(hi_k)
+                } else {
+                    std::ops::Bound::Excluded(hi_k)
+                };
+                Box::new(btree.range((std::ops::Bound::Unbounded, hi_bound)))
+            }
+            (None, None) => return None,
+        };
+
+        let mut slots: Vec<u32> = iter.flat_map(|(_, v)| v.iter().copied()).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        if slots.is_empty() { None } else { Some(slots) }
+    }
+
+    pub fn clear(&mut self) {
+        if self.data.is_empty() {
+            return;
+        }
+        self.data.clear();
+        self.eq_index.clear();
+        self.range_index.clear();
+        self.dirty = true;
+    }
+
+    pub fn replace_all(&mut self, data: HashMap<u32, VectorMetadata>) {
+        self.eq_index = Self::build_eq_index(&data);
+        self.range_index = Self::build_range_index(&data);
+        self.data = data;
+        self.dirty = true;
     }
 
     pub fn len(&self) -> usize {
@@ -125,6 +252,115 @@ impl MetadataStore {
         std::fs::rename(&tmp, &self.path)?;
         self.dirty = false;
         Ok(())
+    }
+
+    fn index_add(&mut self, slot: u32, meta: &VectorMetadata) {
+        for (field, val) in &meta.properties {
+            // Equality index (all scalars).
+            if let Some(key) = value_to_index_key(val) {
+                let slots = self
+                    .eq_index
+                    .entry(field.clone())
+                    .or_default()
+                    .entry(key)
+                    .or_default();
+                let pos = slots.partition_point(|&s| s < slot);
+                if slots.get(pos) != Some(&slot) {
+                    slots.insert(pos, slot);
+                }
+            }
+            // Range index (numeric fields only).
+            if let Some(n) = val.as_f64() {
+                if n.is_finite() {
+                    let ord = f64_to_ord(n);
+                    let slots = self
+                        .range_index
+                        .entry(field.clone())
+                        .or_default()
+                        .entry(ord)
+                        .or_default();
+                    let pos = slots.partition_point(|&s| s < slot);
+                    if slots.get(pos) != Some(&slot) {
+                        slots.insert(pos, slot);
+                    }
+                }
+            }
+        }
+    }
+
+    fn index_remove(&mut self, slot: u32) {
+        let Some(meta) = self.data.get(&slot).cloned() else {
+            return;
+        };
+        for (field, val) in &meta.properties {
+            // Equality index removal.
+            if let Some(key) = value_to_index_key(val) {
+                if let Some(val_map) = self.eq_index.get_mut(field.as_str()) {
+                    if let Some(slots) = val_map.get_mut(key.as_str()) {
+                        if let Ok(pos) = slots.binary_search(&slot) {
+                            slots.remove(pos);
+                        }
+                    }
+                }
+            }
+            // Range index removal.
+            if let Some(n) = val.as_f64() {
+                if n.is_finite() {
+                    let ord = f64_to_ord(n);
+                    if let Some(btree) = self.range_index.get_mut(field.as_str()) {
+                        if let Some(slots) = btree.get_mut(&ord) {
+                            if let Ok(pos) = slots.binary_search(&slot) {
+                                slots.remove(pos);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn build_eq_index(
+        data: &HashMap<u32, VectorMetadata>,
+    ) -> HashMap<String, HashMap<String, Vec<u32>>> {
+        let mut idx: HashMap<String, HashMap<String, Vec<u32>>> = HashMap::new();
+        let mut slots_sorted: Vec<u32> = data.keys().copied().collect();
+        slots_sorted.sort_unstable();
+        for slot in slots_sorted {
+            let meta = &data[&slot];
+            for (field, val) in &meta.properties {
+                if let Some(key) = value_to_index_key(val) {
+                    idx.entry(field.clone())
+                        .or_default()
+                        .entry(key)
+                        .or_default()
+                        .push(slot);
+                }
+            }
+        }
+        idx
+    }
+
+    fn build_range_index(
+        data: &HashMap<u32, VectorMetadata>,
+    ) -> HashMap<String, BTreeMap<u64, Vec<u32>>> {
+        let mut idx: HashMap<String, BTreeMap<u64, Vec<u32>>> = HashMap::new();
+        let mut slots_sorted: Vec<u32> = data.keys().copied().collect();
+        slots_sorted.sort_unstable();
+        for slot in slots_sorted {
+            let meta = &data[&slot];
+            for (field, val) in &meta.properties {
+                if let Some(n) = val.as_f64() {
+                    if n.is_finite() {
+                        idx.entry(field.clone())
+                            .or_default()
+                            .entry(f64_to_ord(n))
+                            .or_default()
+                            .push(slot);
+                    }
+                }
+            }
+        }
+        idx
     }
 
     fn load_from_file(
@@ -378,5 +614,142 @@ mod tests {
         let meta = VectorMetadata::default();
         assert!(meta.properties.is_empty());
         assert!(meta.document.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // eq_index
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn eq_index_basic_string_lookup() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        store.put(0, &make_meta("status", "active")).unwrap();
+        store.put(1, &make_meta("status", "inactive")).unwrap();
+        store.put(2, &make_meta("status", "active")).unwrap();
+        let active = store.get_eq_candidates("status", &json!("active")).unwrap();
+        assert_eq!(active, &[0, 2]);
+        let inactive = store
+            .get_eq_candidates("status", &json!("inactive"))
+            .unwrap();
+        assert_eq!(inactive, &[1]);
+    }
+
+    #[test]
+    fn eq_index_missing_field_returns_none() {
+        let dir = tempdir().unwrap();
+        let store = open_store(&dir, "meta.bin");
+        assert!(
+            store
+                .get_eq_candidates("nonexistent", &json!("x"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn eq_index_missing_value_returns_empty_slice() {
+        // The field "status" IS indexed (we inserted "active"), so querying a
+        // value that has no matches returns Some(&[]) rather than None — this
+        // lets callers short-circuit to zero results without a full scan.
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        store.put(0, &make_meta("status", "active")).unwrap();
+        let result = store.get_eq_candidates("status", &json!("pending"));
+        assert!(
+            result.is_some(),
+            "indexed field should return Some, not None"
+        );
+        assert!(
+            result.unwrap().is_empty(),
+            "should be empty for an unmatched value"
+        );
+    }
+
+    #[test]
+    fn eq_index_object_value_not_indexable() {
+        let dir = tempdir().unwrap();
+        let store = open_store(&dir, "meta.bin");
+        assert!(
+            store
+                .get_eq_candidates("nested", &json!({"a": 1}))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn eq_index_number_value() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        let mut p0 = HashMap::new();
+        p0.insert("year".to_string(), json!(2024));
+        let mut p1 = HashMap::new();
+        p1.insert("year".to_string(), json!(2023));
+        store
+            .put(
+                0,
+                &VectorMetadata {
+                    properties: p0,
+                    document: None,
+                },
+            )
+            .unwrap();
+        store
+            .put(
+                1,
+                &VectorMetadata {
+                    properties: p1,
+                    document: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(store.get_eq_candidates("year", &json!(2024)).unwrap(), &[0]);
+    }
+
+    #[test]
+    fn eq_index_updated_on_overwrite() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        store.put(0, &make_meta("status", "active")).unwrap();
+        store.put(0, &make_meta("status", "inactive")).unwrap();
+        // "active" was removed; field is still indexed → Some(&[]) not None.
+        let active = store.get_eq_candidates("status", &json!("active"));
+        assert!(active.is_some_and(|v| v.is_empty()));
+        assert_eq!(
+            store
+                .get_eq_candidates("status", &json!("inactive"))
+                .unwrap(),
+            &[0]
+        );
+    }
+
+    #[test]
+    fn eq_index_removed_on_delete() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(&dir, "meta.bin");
+        store.put(0, &make_meta("status", "active")).unwrap();
+        store.put(1, &make_meta("status", "active")).unwrap();
+        store.delete(0).unwrap();
+        assert_eq!(
+            store.get_eq_candidates("status", &json!("active")).unwrap(),
+            &[1]
+        );
+    }
+
+    #[test]
+    fn eq_index_rebuilt_on_reload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.bin").to_str().unwrap().to_string();
+        {
+            let mut store = MetadataStore::open(&path).unwrap();
+            store.put(0, &make_meta("color", "red")).unwrap();
+            store.put(1, &make_meta("color", "blue")).unwrap();
+            store.put(2, &make_meta("color", "red")).unwrap();
+            store.flush().unwrap();
+        }
+        let store2 = MetadataStore::open(&path).unwrap();
+        assert_eq!(
+            store2.get_eq_candidates("color", &json!("red")).unwrap(),
+            &[0, 2]
+        );
     }
 }

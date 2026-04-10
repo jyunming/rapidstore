@@ -16,11 +16,11 @@
   "metrics": {
     "recall_1_at_1": {
       "higher_is_better": true,
-      "best": 0.77
+      "best": 0.86
     },
     "recall_1_at_4": {
       "higher_is_better": true,
-      "best": 0.95
+      "best": 1.0
     },
     "recall_1_at_8": {
       "higher_is_better": true,
@@ -28,31 +28,31 @@
     },
     "avg_latency_ms": {
       "higher_is_better": false,
-      "best": 1.264571000210708
+      "best": 0.8749449998140335
     },
     "p50_latency_ms": {
       "higher_is_better": false,
-      "best": 1.2655499995162245
+      "best": 0.8750000270083547
     },
     "p95_latency_ms": {
       "higher_is_better": false,
-      "best": 1.3188950029871194
+      "best": 0.9018049982842058
     },
     "disk_bytes": {
       "higher_is_better": false,
-      "best": 2460348.0
+      "best": 2498378.0
     },
     "compression_ratio": {
       "higher_is_better": true,
-      "best": 3.2515725417705137
+      "best": 3.2020775078871173
     },
     "ram_estimate_bytes": {
       "higher_is_better": false,
-      "best": 1740000.0
+      "best": 1460000.0
     },
     "live_codes_bytes": {
       "higher_is_better": false,
-      "best": 1370000.0
+      "best": 1090000.0
     },
     "live_vectors_bytes": {
       "higher_is_better": false,

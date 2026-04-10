@@ -29,7 +29,10 @@ db = Database.open(
     seed=42,                 # int — RNG seed for quantizer, must stay the same across sessions
     metric="ip",             # str — "ip" (inner product), "cosine", or "l2"
     rerank=True,             # bool — enable reranking of ANN candidates; precision via rerank_precision
-    fast_mode=False,         # bool — skip QJL stage: ~30% faster ingest, ~5pp recall loss
+    fast_mode=False,         # bool — When False (default), QJL residual is stored and used
+                             #        during reranking for best recall (+9–15 pp R@1 vs True).
+                             #        Set True for MSE-only mode (paper Figure 5 allocation,
+                             #        ~30% faster ingest, no recall benefit from rerank=True).
     rerank_precision=None,   # str|None — None = dequant reranking (no extra storage)
                              #            "f16" = float16 exact reranking (+n×d×2 bytes)
                              #            "f32" = float32 exact reranking (+n×d×4 bytes)
@@ -38,6 +41,11 @@ db = Database.open(
     normalize=False,         # bool — L2-normalize every inserted vector and every query at
                              #        write time; makes inner-product scoring equivalent to
                              #        cosine similarity without changing the metric parameter
+    quantizer_type=None,     # str|None — None/"dense" = default Haar-uniform QR path
+                             #            (O(d²) ingest, n=d, best recall)
+                             #            "exact" is a legacy alias for "dense"
+                             #            "srht" = structured fast path (O(d log d),
+                             #            n=next_power_of_two(d), faster ingest)
 )
 
 # Parameterless reopen — reads all parameters from manifest.json:
@@ -58,17 +66,42 @@ images   = Database.open("./mydb", dimension=512,  collection="images")
 # Stored at ./mydb/articles/ and ./mydb/images/ respectively
 ```
 
+### Quantizer modes
+
+TurboQuantDB exposes the same two-stage MSE + residual-QJL layout through two quantizer families:
+
+- **`None` / `"dense"` (default)** — Haar-uniform QR rotation + dense i.i.d. Gaussian QJL with `n = d`. Best recall; O(d²) ingest cost. `"exact"` is a legacy alias.
+- **`"srht"`** — structured Walsh-Hadamard + random-sign transforms, `n = next_power_of_two(d)`, O(d log d) ingest. Use for streaming or frequent-ingest workloads at high d.
+
+### `fast_mode` and `rerank` interaction
+
+These two parameters work together and must be understood as a pair:
+
+| `fast_mode` | `rerank` | What happens | Recall impact |
+|-------------|----------|--------------|---------------|
+| `False` (default) | `True` (default) | QJL residual stored; dequantize() uses MSE + QJL to rerank top candidates | **Best at d ≥ 1536** — recommended |
+| `False` | `False` | QJL residual stored; initial scoring includes QJL contribution but no rerank step | Modest gain over fast_mode=True at d ≥ 1536 |
+| `True` | `False` | No QJL stored; MSE-only scoring | Paper Figure 5 baseline; ~30% faster ingest; best at d < 1536 |
+| `True` | `True` | No QJL stored; rerank is a no-op (dequantize returns MSE-only) | Same as above — adds latency for no gain |
+
+**Rule:** `rerank=True` only improves recall when `fast_mode=False`. With `fast_mode=True`, `rerank=True` adds latency but provides no recall benefit — set `rerank=False` in that case.
+
+**Dimensional note:** `fast_mode=False` stores 1-bit QJL projections and incorporates them into scoring. At high dimensionality (d ≥ 1536), enough projection bits accumulate to provide a strong signal; recall equals or slightly exceeds `fast_mode=True`. At lower dimensionality (d < 512), the 1-bit projections are too noisy and **reduce** recall below the MSE-only baseline. For d < 512, use `fast_mode=True, rerank=False` to get the best recall.
+
 ---
 
 ## Recommended Presets
 
-### High Quality — recall matters most
+Unless stated otherwise, the presets below use the default `fast_mode=False, rerank=True` (QJL reranking enabled — best recall) and `quantizer_type=None/"dense"` path.
+
+### High Quality — float16 rerank, highest recall
 
 ```python
 db = Database.open(path, dimension=DIM, bits=4, rerank=True, rerank_precision="f16")
 db.create_index(max_degree=32, ef_construction=200, n_refinements=8)
 results = db.search(query, top_k=10, ann_search_list_size=200)
-# 100% Recall@10 at 100k×1536  |  401 MB disk  |  38ms p50 (brute-force)
+# Note: rerank_precision="f16" stores raw float16 vectors (+n×d×2 bytes).
+# Disk and recall figures for this config are not currently tracked in the benchmark suite.
 ```
 
 ### Balanced — default recommendation
@@ -77,8 +110,17 @@ results = db.search(query, top_k=10, ann_search_list_size=200)
 db = Database.open(path, dimension=DIM, bits=4, rerank=True)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
 results = db.search(query, top_k=10, ann_search_list_size=200)
-# 99.4% Recall@5, 96% Recall@10 at 100k×1536  |  117 MB disk  |  8ms (ANN) / 45ms (brute+dequant)
+# 96.2% Recall@1, 100% Recall@4 at 100k×1536  |  108 MB disk  |  ~14ms p50 (ANN) / ~48ms (brute+dequant)
 ```
+
+### Paper-faithful dense mode — research / comparison
+
+```python
+db = Database.open(path, dimension=DIM, bits=4, rerank=True, quantizer_type="dense")
+results = db.search(query, top_k=10)
+```
+
+`quantizer_type="dense"` is the default. Use `quantizer_type="srht"` if you need faster O(d log d) ingest at high d and can accept a small recall trade-off.
 
 ### Fast Build — ingest speed is priority
 
@@ -89,7 +131,7 @@ results = db.search(query, top_k=10, ann_search_list_size=200)
 # ~96% Recall@10 at 100k×1536  |  108 MB disk  |  8ms p50
 ```
 
-*Benchmarked at 100,000 vectors, dim=1536, DBpedia OpenAI3 embeddings, brute-force ground truth.*
+*Benchmarked at 100,000 vectors, dim=1536, DBpedia OpenAI3 embeddings, brute-force ground truth. Default mode is `quantizer_type="dense"` (Haar-uniform QR). Use `quantizer_type="srht"` for streaming/frequent-ingest workloads.*
 
 ---
 
@@ -190,7 +232,7 @@ results = db.search(
     query,                       # np.ndarray (float32) or list[float]
     top_k=10,                    # int
     filter=None,                 # dict | None  (see Metadata Filtering below)
-    _use_ann=False,              # bool — engage HNSW index (requires create_index() first)
+    _use_ann=None,               # None=auto, True=force ANN, False=force brute-force
     ann_search_list_size=None,   # int | None — HNSW ef_search (default: max_degree × 2)
     include=None,                # list[str] | None — fields to return; default all
                                  #   valid values: "id", "score", "metadata", "document"
@@ -198,7 +240,7 @@ results = db.search(
 # Returns list of dicts: {"id": str, "score": float, "metadata": dict, "document": str | None}
 ```
 
-The default (`_use_ann=False`) always uses exhaustive brute-force scoring — highest recall, linear scan time. Pass `_use_ann=True` to use the HNSW graph index for sub-linear approximate search (requires `create_index()` to have been called first; lower recall than brute-force).
+With `_use_ann=None` (default), the planner auto-selects: ANN if an index exists, N ≥ 10k, and delta < 20% of N; otherwise brute-force. Pass `_use_ann=True` to force ANN (requires `create_index()` first) or `_use_ann=False` to force brute-force.
 
 `ann_search_list_size` trades recall for latency — higher values find better results but take longer. Values between 64 and 256 cover the practical range.
 
@@ -211,7 +253,7 @@ all_results = db.query(
     query_embeddings,            # np.ndarray shape (N, D), float32 or float64
     n_results=10,                # int — results per query
     where_filter=None,           # dict | None
-    _use_ann=False,              # bool — engage HNSW index (same semantics as search())
+    _use_ann=None,               # None=auto, True=force ANN, False=force brute-force (same semantics as search())
     ann_search_list_size=None,
 )
 # Returns list[list[dict]] — one inner list per query vector

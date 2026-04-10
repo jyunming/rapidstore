@@ -29,6 +29,21 @@ if [ -z "$NON_DOC" ] && [ -n "$STAGED" ]; then
     exit 0
 fi
 
+# ── 0b. Version sync — pyproject.toml is the single source of truth ───────────
+# Read the version from pyproject.toml and auto-update Cargo.toml if they differ.
+PY_VER=$(grep '^version = ' pyproject.toml 2>/dev/null | head -1 | sed 's/^version = "//;s/"$//')
+CARGO_VER=$(grep '^version = ' Cargo.toml 2>/dev/null | head -1 | sed 's/^version = "//;s/"$//')
+if [ -n "$PY_VER" ] && [ "$PY_VER" != "$CARGO_VER" ]; then
+    warn "version mismatch — syncing Cargo.toml ($CARGO_VER → $PY_VER)"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        sed -i '' "s/^version = \"${CARGO_VER}\"/version = \"${PY_VER}\"/" Cargo.toml
+    else
+        sed -i "s/^version = \"${CARGO_VER}\"/version = \"${PY_VER}\"/" Cargo.toml
+    fi
+    git add Cargo.toml
+    pass "Cargo.toml synced to $PY_VER"
+fi
+
 # ── 1. Formatting ──────────────────────────────────────────────────────────────
 echo -n "[pre-commit] cargo fmt check ... "
 if ! cargo fmt --all -- --check 2>/dev/null; then
@@ -53,32 +68,53 @@ if ! cargo test -q --lib 2>/dev/null; then
 fi
 pass "unit tests ok"
 
-# ── 4. Performance check (only when src/ is touched) ─────────────────────────
+# ── 4. Build & reinstall into active env when src/ is touched ────────────────
 SRC_CHANGED=$(git diff --cached --name-only | grep -c '^src/' || true)
 
 if [ "${SRC_CHANGED}" -gt 0 ]; then
-    # Detect python executable
-    PYTHON=""
-    for py in python python3; do
-        if command -v "$py" &>/dev/null && $py -c "import tqdb" &>/dev/null 2>&1; then
-            PYTHON="$py"
-            break
-        fi
-    done
+    command -v maturin &>/dev/null || fail "maturin not found in PATH (install with: pip install maturin)"
 
-    if [ -n "$PYTHON" ] && [ -f "benchmarks/precommit_perf_check.py" ]; then
-        echo -n "[pre-commit] perf check (${SRC_CHANGED} src/ file(s) changed) ... "
+    # Detect Python executable — prefer the active venv if present.
+    if [ -n "${VIRTUAL_ENV:-}${CONDA_PREFIX:-}" ]; then
+        PYTHON="python"
+    else
+        PYTHON=""
+        for py in python python3; do
+            if command -v "$py" &>/dev/null; then
+                PYTHON="$py"
+                break
+            fi
+        done
+    fi
+    [ -n "$PYTHON" ] || fail "python not found in PATH"
+
+    echo "[pre-commit] building and installing into $("$PYTHON" -c 'import sys; print(sys.executable)') (${SRC_CHANGED} src/ file(s) changed)"
+    echo -n "[pre-commit] maturin develop --release ... "
+    if ! maturin develop --release >/dev/null 2>&1; then
+        echo ""
+        fail "maturin develop failed"
+    fi
+    pass "maturin develop ok"
+
+    echo -n "[pre-commit] python import smoke ... "
+    if ! "$PYTHON" -c "import tqdb; _=tqdb.Database; print('ok')" >/dev/null 2>&1; then
+        echo ""
+        fail "installed wheel import smoke failed"
+    fi
+    pass "python smoke ok"
+
+    # ── 5. Performance check (still only when src/ is touched) ──────────────
+    if [ -f "benchmarks/precommit_perf_check.py" ]; then
+        echo -n "[pre-commit] perf check ... "
         if ! "$PYTHON" benchmarks/precommit_perf_check.py \
                 --baseline benchmarks/perf_baseline.json 2>&1; then
             exit 1
         fi
-    elif [ -z "$PYTHON" ]; then
-        warn "skipping perf check — tqdb not installed (run: maturin develop --release)"
     else
         warn "skipping perf check — benchmarks/precommit_perf_check.py not found"
     fi
 else
-    warn "skipping perf check — no src/ files staged"
+    warn "skipping wheel build/install + perf check — no src/ files staged"
 fi
 
 pass "all checks passed"

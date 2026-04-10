@@ -59,13 +59,16 @@ PERF_PLAN.md
 RAM_PLAN.md
 RAM_DIAGNOSTIC_AND_FIX_PLAN.md
 BENCHMARK_GUIDEBOOK.md
-BENCHMARKS.md
+/BENCHMARKS.md
 BENCHMARK_ENGINE_MAP.md
 CLAUDE.md
 GEMINI.md
 AGENTS.md
+.mcp.json
+.pre-commit-config.yaml
 docs/PYTHON_MIGRATION.md
 docs/ROADMAP_BACKLOG.md
+docs/COMPETITOR_SIGNAL_TRACKING.md
 
 # Paper source files
 2504.19874v1.md
@@ -109,7 +112,13 @@ bench_results_*.json
 bench_plots.png
 /dist_tmp/
 coverage.lcov
+coverage_python.json
 .coverage
 
 /test_bench_tmp/
 benchmarks/rerank_mode_bench.py
+benchmarks/exact_mode_bench.py
+benchmarks/paper_score_compare.py
+benchmarks/_delta_assess.py
+benchmarks/_*_log.txt
+benchmarks/_private_plots_perf.png

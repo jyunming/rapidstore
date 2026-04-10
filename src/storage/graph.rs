@@ -519,6 +519,267 @@ impl GraphManager {
         self.parse_layout();
         Ok(())
     }
+
+    /// Return the HNSW level (0-indexed max layer) for `node_id`.
+    /// Reads `num_levels - 1` from the serialized record.
+    pub fn get_node_level(&self, node_id: u32) -> u32 {
+        let Some(mmap) = self.mmap.as_ref() else {
+            return 0;
+        };
+        let i = node_id as usize;
+        if i >= self.node_count {
+            return 0;
+        }
+        let start = self.data_start + self.offsets[i] as usize;
+        let end = self.data_start + self.offsets[i + 1] as usize;
+        let rec = &mmap[start..end];
+        if rec.len() < 4 {
+            return 0;
+        }
+        let num_levels = u32::from_le_bytes(rec[0..4].try_into().unwrap());
+        num_levels.saturating_sub(1)
+    }
+
+    /// Load the full adjacency list from the current mmap.
+    /// Returns `(node_levels, adjacency)` where `adjacency[i][l]` holds neighbors at level `l`.
+    fn load_adjacency(
+        &self,
+    ) -> Result<(Vec<u32>, Vec<Vec<Vec<u32>>>), Box<dyn std::error::Error + Send + Sync>> {
+        let n = self.node_count;
+        let mut node_levels = vec![0u32; n];
+        let mut adjacency = vec![vec![Vec::new(); 6]; n];
+        for i in 0..n {
+            let level = self.get_node_level(i as u32);
+            node_levels[i] = level;
+            for l in 0..=level {
+                adjacency[i][l as usize] =
+                    self.get_neighbors_at_level(i as u32, l).unwrap_or_default();
+            }
+        }
+        Ok((node_levels, adjacency))
+    }
+
+    /// Serialize `(node_levels, adjacency)` for `n` nodes and write to graph.bin.
+    fn serialize_and_persist(
+        &mut self,
+        n: usize,
+        ep: u32,
+        max_l: u32,
+        node_levels: &[u32],
+        adjacency: &[Vec<Vec<u32>>],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut payload = Vec::<u8>::new();
+        let mut offsets = Vec::<u64>::with_capacity(n + 1);
+        offsets.push(0);
+
+        for i in 0..n {
+            let l_count = node_levels[i] + 1;
+            payload.extend_from_slice(&l_count.to_le_bytes());
+            for l in 0..l_count {
+                let neighbors = &adjacency[i][l as usize];
+                let deg = neighbors.len() as u32;
+                payload.extend_from_slice(&deg.to_le_bytes());
+                let mut last_nb = 0u32;
+                for &nb in neighbors {
+                    let delta = nb - last_nb;
+                    encode_varint(delta, &mut payload);
+                    last_nb = nb;
+                }
+            }
+            offsets.push(payload.len() as u64);
+        }
+
+        let mut out = Vec::<u8>::with_capacity(16 + (n + 1) * 8 + payload.len());
+        out.extend_from_slice(GRAPH_V3_MAGIC);
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+        out.extend_from_slice(&ep.to_le_bytes());
+        out.extend_from_slice(&max_l.to_le_bytes());
+        for off in &offsets {
+            out.extend_from_slice(&off.to_le_bytes());
+        }
+        out.extend_from_slice(&payload);
+
+        std::fs::write(&self.local_cache_path, &out)?;
+        self.node_count = n;
+        self.entry_point = ep;
+        self.max_level = max_l;
+        self.backend.write("graph.bin", &out)?;
+        let file_ro = File::open(&self.local_cache_path)?;
+        self.mmap = Some(unsafe { Mmap::map(&file_ro)? });
+        self.parse_layout();
+        Ok(())
+    }
+
+    /// Incrementally insert `new_count - existing_count` new nodes into the existing graph.
+    ///
+    /// `new_count` is the total node count after insertion (existing + new nodes).
+    /// New nodes have IDs `existing_count..new_count`. `build_scorer(i, candidates)` returns
+    /// scored `(id, score)` pairs the same way as [`build`](Self::build).
+    ///
+    /// Existing adjacency is preserved; new nodes are connected via random-candidate sampling
+    /// followed by the same refinement used in the initial build. Existing nodes whose
+    /// neighbor lists are updated (to include new nodes) are serialized alongside new nodes.
+    pub fn build_incremental(
+        &mut self,
+        new_count: usize,
+        max_degree: usize,
+        ef_construction: usize,
+        n_refinements: usize,
+        _alpha: f64,
+        build_scorer: impl Fn(u32, &[u32]) -> Vec<(u32, f64)> + Sync,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let existing_count = self.node_count;
+        if new_count <= existing_count {
+            return Ok(());
+        }
+        if existing_count == 0 {
+            // Delegate to full build when there is no existing graph.
+            return self.build(
+                new_count,
+                max_degree,
+                ef_construction,
+                n_refinements,
+                _alpha,
+                build_scorer,
+            );
+        }
+
+        let (mut node_levels, mut adjacency) = self.load_adjacency()?;
+        // Extend to accommodate new nodes.
+        node_levels.resize(new_count, 0);
+        adjacency.resize(new_count, vec![Vec::new(); 6]);
+
+        let m = (max_degree / 2).max(4);
+        let m0 = max_degree.min(MAX_DEGREE);
+        let level_mult = 1.0 / (m as f64).ln();
+        let cand_pool = ef_construction;
+
+        let mut rng = rand::thread_rng();
+        let mut max_l = self.max_level;
+        let mut ep = self.entry_point;
+
+        // Assign levels and build local adjacency for new nodes level by level.
+        for i in existing_count..new_count {
+            let r: f64 = rng.gen_range(0.0..1.0);
+            let l = ((-r.ln() * level_mult) as u32).min(5);
+            node_levels[i] = l;
+            if l >= max_l {
+                max_l = l;
+                ep = i as u32;
+            }
+        }
+
+        // For each level, collect all nodes at that level (existing + new) and build
+        // or refine the adjacency for the NEW nodes only.
+        for l in 0..=max_l {
+            let degree_cap = if l == 0 { m0 } else { m };
+            let level_nodes: Vec<u32> = (0..new_count)
+                .filter(|&i| node_levels[i] >= l)
+                .map(|i| i as u32)
+                .collect();
+            let new_level_nodes: Vec<u32> = (existing_count..new_count)
+                .filter(|&i| node_levels[i] >= l)
+                .map(|i| i as u32)
+                .collect();
+            let ln = level_nodes.len();
+            if ln < 2 || new_level_nodes.is_empty() {
+                continue;
+            }
+
+            // Initial random-candidate pass for new nodes only.
+            let new_adj: Vec<Vec<u32>> = new_level_nodes
+                .par_iter()
+                .map(|&i| {
+                    let mut local_rng = rand::thread_rng();
+                    let mut candidates = HashSet::new();
+                    while candidates.len() < cand_pool && candidates.len() < ln - 1 {
+                        let cand = level_nodes[local_rng.gen_range(0..ln)];
+                        if cand != i {
+                            candidates.insert(cand);
+                        }
+                    }
+                    let cand_vec: Vec<u32> = candidates.into_iter().collect();
+                    let mut scored = build_scorer(i, &cand_vec);
+                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+                    let mut chosen: Vec<u32> = scored
+                        .into_iter()
+                        .take(degree_cap)
+                        .map(|(id, _)| id)
+                        .collect();
+                    chosen.sort_unstable();
+                    chosen
+                })
+                .collect();
+
+            for (idx, &i) in new_level_nodes.iter().enumerate() {
+                adjacency[i as usize][l as usize] = new_adj[idx].clone();
+            }
+
+            // Refinement iterations: explore neighbors-of-neighbors for new nodes.
+            for _ in 0..n_refinements {
+                let refined: Vec<Vec<u32>> = new_level_nodes
+                    .par_iter()
+                    .map(|&i| {
+                        let mut candidates = HashSet::new();
+                        for &nb in &adjacency[i as usize][l as usize] {
+                            candidates.insert(nb);
+                            for &nbnb in &adjacency[nb as usize][l as usize] {
+                                if nbnb != i {
+                                    candidates.insert(nbnb);
+                                }
+                            }
+                        }
+                        let cand_vec: Vec<u32> = candidates.into_iter().collect();
+                        let mut scored = build_scorer(i, &cand_vec);
+                        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+                        let mut chosen: Vec<u32> = scored
+                            .into_iter()
+                            .take(degree_cap)
+                            .map(|(id, _)| id)
+                            .collect();
+                        chosen.sort_unstable();
+                        chosen
+                    })
+                    .collect();
+                for (idx, &i) in new_level_nodes.iter().enumerate() {
+                    adjacency[i as usize][l as usize] = refined[idx].clone();
+                }
+            }
+
+            // Backlink: for each existing node that a new node linked to, add the new
+            // node as a neighbor (trimmed to degree_cap) so the graph remains bidirectional.
+            for &new_node in &new_level_nodes {
+                for &nb in &adjacency[new_node as usize][l as usize].clone() {
+                    if (nb as usize) < existing_count {
+                        let nb_neighbors = &mut adjacency[nb as usize][l as usize];
+                        if !nb_neighbors.contains(&new_node) {
+                            nb_neighbors.push(new_node);
+                            nb_neighbors.sort_unstable();
+                            if nb_neighbors.len() > degree_cap {
+                                // Score all neighbors and keep best degree_cap.
+                                let all: Vec<u32> = nb_neighbors.drain(..).collect();
+                                let mut scored = build_scorer(nb, &all);
+                                scored.sort_by(|a, b| {
+                                    b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+                                });
+                                *nb_neighbors = scored
+                                    .into_iter()
+                                    .take(degree_cap)
+                                    .map(|(id, _)| id)
+                                    .collect();
+                                nb_neighbors.sort_unstable();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Release the mmap before writing — required on Windows where an open
+        // memory-mapped section prevents overwriting the same file.
+        self.mmap = None;
+        self.serialize_and_persist(new_count, ep, max_l, &node_levels, &adjacency)
+    }
 }
 
 fn encode_varint(mut val: u32, out: &mut Vec<u8>) {

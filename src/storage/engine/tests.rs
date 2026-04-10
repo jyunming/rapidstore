@@ -301,6 +301,7 @@ fn f16_rerank_precision_stores_and_retrieves_vectors() {
         RerankPrecision::F16,
         None,
         false,
+        None,
     )
     .unwrap();
     let mut v = vec![0.0f64; d];
@@ -334,6 +335,7 @@ fn f16_roundtrip_within_half_precision_tolerance() {
         RerankPrecision::F16,
         None,
         false,
+        None,
     )
     .unwrap();
     // v = [0.1, 0.2, ..., 1.6]; expected IP = sum((0.1*i)^2) for i=1..=16
@@ -610,6 +612,7 @@ fn disabled_rerank_search_returns_results() {
         RerankPrecision::Disabled,
         None,
         false,
+        None,
     )
     .unwrap();
     for i in 0..5u32 {
@@ -742,6 +745,7 @@ fn l2_index_without_rerank_uses_dequantized_path() {
         RerankPrecision::Disabled,
         None,
         false,
+        None,
     )
     .unwrap();
     for i in 0..15u32 {
@@ -983,6 +987,7 @@ fn delete_triggers_wal_flush_at_threshold() {
         RerankPrecision::Disabled,
         Some(100),
         false,
+        None,
     )
     .unwrap();
     for i in 0..100 {
@@ -1039,6 +1044,7 @@ fn f16_rerank_cosine_ann_index_covers_f16_build_scorer_paths() {
         RerankPrecision::F16,
         None,
         false,
+        None,
     )
     .unwrap();
     for i in 0..30u32 {
@@ -1075,6 +1081,7 @@ fn f16_rerank_ip_ann_index_covers_f16_ip_build_scorer_path() {
         RerankPrecision::F16,
         None,
         false,
+        None,
     )
     .unwrap();
     for i in 0..30u32 {
@@ -1113,6 +1120,7 @@ fn l2_ann_index_without_raw_vectors_uses_precomputed_l2_path() {
         RerankPrecision::Disabled,
         None,
         false,
+        None,
     )
     .unwrap();
     for i in 0..30u32 {
@@ -1158,6 +1166,7 @@ fn l2_exhaustive_search_with_raw_f32_vectors_reranks_correctly() {
         RerankPrecision::F32,
         None,
         false,
+        None,
     )
     .unwrap();
     e.insert(
@@ -1236,6 +1245,7 @@ fn l2_exhaustive_rerank_without_raw_vectors_uses_dequant_path() {
         RerankPrecision::Disabled,
         None,
         false,
+        None,
     )
     .unwrap();
     e.insert("a".into(), &Array1::from_vec(vec![0.0f64; d]), no_meta())
@@ -1459,6 +1469,38 @@ fn wal_recovery_upsert_and_delete_skip_paths_covered() {
     //   entry "a" (upsert): get_slot → Some → overwrite → LINES 447-455
     let e2 = TurboQuantEngine::open(p, p, d, 2, 42).unwrap();
     assert!(e2.vector_count() >= 1, "at least 'a' should be recovered");
+}
+
+#[test]
+fn wal_recovery_with_stale_id_pool_preserves_delete_then_reinsert() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+
+    {
+        let mut e = open_default(p, d);
+        let mut meta = no_meta();
+        meta.insert("phase".into(), json!(1));
+        e.insert_with_document("x".into(), &make_vec(d, 0.1), meta, Some("first".into()))
+            .unwrap();
+        e.flush_wal_to_segment().unwrap();
+    }
+
+    {
+        let mut e = open_default(p, d);
+        assert!(e.delete("x".into()).unwrap());
+        let mut meta = no_meta();
+        meta.insert("phase".into(), json!(2));
+        e.insert_with_document("x".into(), &make_vec(d, 0.9), meta, Some("second".into()))
+            .unwrap();
+        drop(e);
+    }
+
+    let e2 = open_default(p, d);
+    assert_eq!(e2.vector_count(), 1);
+    let got = e2.get("x").unwrap().unwrap();
+    assert_eq!(got.metadata["phase"], json!(2));
+    assert_eq!(got.document.as_deref(), Some("second"));
 }
 
 // ── IP ANN index build without raw vectors (lines 748-749) ───────────────
@@ -1695,6 +1737,7 @@ fn cosine_ann_rerank_without_raw_vecs_uses_deq_path() {
         RerankPrecision::Disabled, // no raw vecs → live_vraw=None
         None,
         false,
+        None,
     )
     .unwrap();
     for i in 0..30u32 {
@@ -1846,6 +1889,32 @@ fn close_and_reopen_restores_id_pool() {
     // rebuild_lookup() called inside load_id_pool → covers id_pool.rs 123-132
     let e2 = open_default(p, d);
     assert_eq!(e2.vector_count(), 5);
+}
+
+#[test]
+fn delete_then_reinsert_persists_latest_metadata_across_reopen() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+    {
+        let mut e = open_default(p, d);
+        let mut first = no_meta();
+        first.insert("phase".into(), json!(1));
+        e.upsert_with_document("x".into(), &make_vec(d, 0.1), first, Some("first".into()))
+            .unwrap();
+        assert!(e.delete("x".into()).unwrap());
+        let mut second = no_meta();
+        second.insert("phase".into(), json!(2));
+        e.upsert_with_document("x".into(), &make_vec(d, 0.9), second, Some("second".into()))
+            .unwrap();
+        e.close().unwrap();
+    }
+
+    let e2 = open_default(p, d);
+    assert_eq!(e2.vector_count(), 1);
+    let got = e2.get("x").unwrap().unwrap();
+    assert_eq!(got.metadata["phase"], json!(2));
+    assert_eq!(got.document.as_deref(), Some("second"));
 }
 
 // ── update_with_document on existing id (lines 527-528) ──────────────────
@@ -2542,7 +2611,9 @@ fn search_batch_returns_one_result_set_per_query() {
     }
     let q1 = make_vec(d, 0.1);
     let q2 = make_vec(d, 0.9);
-    let results = e.search_batch(&[q1, q2], 2, None, None, true).unwrap();
+    let results = e
+        .search_batch(&[q1, q2], 2, None, None, Some(true))
+        .unwrap();
     assert_eq!(results.len(), 2, "one result set per query");
     assert_eq!(results[0].len(), 2, "top_k=2 for first query");
     assert_eq!(results[1].len(), 2, "top_k=2 for second query");
@@ -2554,7 +2625,7 @@ fn search_batch_empty_queries_returns_empty() {
     let p = dir.path().to_str().unwrap();
     let d = 8;
     let e = open_default(p, d);
-    let results = e.search_batch(&[], 5, None, None, true).unwrap();
+    let results = e.search_batch(&[], 5, None, None, Some(true)).unwrap();
     assert!(results.is_empty());
 }
 

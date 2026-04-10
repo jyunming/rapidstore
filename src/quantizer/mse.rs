@@ -3,12 +3,45 @@ use ndarray::Array1;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::CodeIndex;
 use super::codebook::lloyd_max;
 use crate::linalg::hadamard::{inverse_srht, srht};
+
+/// Generate a d×d Haar-random orthogonal matrix via modified Gram-Schmidt on i.i.d. N(0,1) columns.
+/// Returns a row-major `Vec<f32>` of shape d×d.
+fn random_orthogonal(d: usize, rng: &mut impl Rng) -> Vec<f32> {
+    // Sample d columns, each of length d, from N(0,1).
+    let mut cols: Vec<Vec<f32>> = (0..d)
+        .map(|_| (0..d).map(|_| rng.sample(StandardNormal)).collect())
+        .collect();
+    // Modified Gram-Schmidt orthogonalization.
+    for i in 0..d {
+        let norm: f32 = cols[i].iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-10 {
+            for x in &mut cols[i] {
+                *x /= norm;
+            }
+        }
+        for j in (i + 1)..d {
+            let dot: f32 = cols[i].iter().zip(cols[j].iter()).map(|(a, b)| a * b).sum();
+            for k in 0..d {
+                cols[j][k] -= dot * cols[i][k];
+            }
+        }
+    }
+    // Transpose to row-major so mat[row*d + col] = Q[row][col].
+    let mut mat = vec![0.0f32; d * d];
+    for row in 0..d {
+        for col in 0..d {
+            mat[row * d + col] = cols[col][row];
+        }
+    }
+    mat
+}
 
 /// MSE (Mean Squared Error) scalar quantizer using SRHT rotation + Lloyd-Max codebook.
 ///
@@ -32,9 +65,13 @@ pub struct MseQuantizer {
     pub d: usize,
     pub n: usize,
     pub b: usize,
-    /// SRHT diagonal sign vector (length n)
+    /// SRHT diagonal sign vector (length n). Empty when `rotation_matrix` is `Some`.
     pub rotation_signs: Vec<f32>,
     pub centroids: Vec<f32>,
+    /// Exact-paper mode: d×d Haar-random orthogonal matrix, row-major.
+    /// `None` → use SRHT (default). `Some` → dense matrix-vector multiply.
+    #[serde(default)]
+    pub rotation_matrix: Option<Vec<f32>>,
 }
 
 impl MseQuantizer {
@@ -65,17 +102,59 @@ impl MseQuantizer {
             b,
             rotation_signs,
             centroids,
+            rotation_matrix: None,
         }
     }
 
-    /// Forward rotation: y = H * D * (x, 0)
-    pub fn apply_rotation(&self, x: &[f32], out: &mut [f32]) {
-        srht(x, &self.rotation_signs, out);
+    /// Dense mode: Haar-uniform QR rotation (Haar measure on O(d)).
+    /// Uses a full d×d matrix instead of SRHT. O(d²) apply time, O(d²) storage.
+    pub fn new_dense(d: usize, b: usize, seed: u64) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let rotation_matrix = Some(random_orthogonal(d, &mut rng));
+        let centroids: Vec<f32> = lloyd_max(b, d, 20_000)
+            .into_iter()
+            .map(|c| c as f32)
+            .collect();
+        assert!(
+            centroids.len() <= u16::MAX as usize + 1,
+            "codebook too large for u16 indices; reduce bits"
+        );
+        Self {
+            d,
+            n: d, // no zero-padding: matrix is exactly d×d
+            b,
+            rotation_signs: vec![],
+            centroids,
+            rotation_matrix,
+        }
     }
 
-    /// Inverse rotation: (x, 0) = D * H * y
+    /// Forward rotation: Q·x (exact mode) or H·D·(x,0) (SRHT mode).
+    pub fn apply_rotation(&self, x: &[f32], out: &mut [f32]) {
+        if let Some(mat) = &self.rotation_matrix {
+            for row in 0..self.d {
+                out[row] = mat[row * self.d..(row + 1) * self.d]
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(a, b)| a * b)
+                    .sum();
+            }
+        } else {
+            srht(x, &self.rotation_signs, out);
+        }
+    }
+
+    /// Inverse rotation: Q^T·y (exact mode, Q orthogonal so Q^T = Q^{-1}) or inverse SRHT.
     pub fn apply_rotation_transpose(&self, y: &[f32], out: &mut [f32]) {
-        inverse_srht(y, &self.rotation_signs, out);
+        if let Some(mat) = &self.rotation_matrix {
+            for col in 0..self.d {
+                out[col] = (0..self.d)
+                    .map(|row| mat[row * self.d + col] * y[row])
+                    .sum();
+            }
+        } else {
+            inverse_srht(y, &self.rotation_signs, out);
+        }
     }
 
     /// Quantize a single `d`-dimensional vector: apply SRHT rotation, then map each
@@ -172,7 +251,11 @@ impl MseQuantizer {
                 y_tilde[row] = centroids[indices[row] as usize];
             }
             let mut x_rec = vec![0.0f32; self.d];
-            inverse_srht(&y_tilde, signs, &mut x_rec);
+            if self.rotation_matrix.is_some() {
+                self.apply_rotation_transpose(&y_tilde, &mut x_rec);
+            } else {
+                inverse_srht(&y_tilde, signs, &mut x_rec);
+            }
             for row in 0..self.d {
                 out[(row, col)] = x_rec[row];
             }

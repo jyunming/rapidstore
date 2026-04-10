@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/jyunming/TurboQuantDB/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/tqdb)](https://pypi.org/project/tqdb/)
 
-An embedded vector database written in Rust with Python bindings, implementing the **TurboQuant** algorithm ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) — zero training time, 2–4 bit compression, and provably unbiased inner product estimation.
+An embedded vector database with a Python API, built around the **TurboQuant** algorithm ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) — two-stage quantization that achieves near-optimal vector compression with zero training time.
 
 **Goal:** make massive embedding datasets practical on lightweight hardware. A 100k-vector, 1536-dim collection that would occupy 586 MB as raw float32 fits in **108 MB on disk** with TQDB b=4, or just **59 MB** with b=2 — enabling laptop-scale RAG over millions of documents without a dedicated server.
 
@@ -17,55 +17,41 @@ Two deployment modes:
 
 - **Zero training** — No `train()` step. Vectors are quantized and stored immediately on insert.
 - **5–10× compression** — b=4 reduces 1536-dim float32 embeddings from 586 MB to 108 MB (5.4×); b=2 reaches 59 MB (9.9×) at 100k vectors.
-- **Unbiased scoring** — QJL transform guarantees unbiased inner product estimation.
+- **Two quantizer modes** — default (`dense`, best recall) and a faster ingest variant (`srht`) for streaming/high-d workloads. See [docs/QUANTIZER_MODES.md](https://github.com/jyunming/TurboQuantDB/blob/main/docs/QUANTIZER_MODES.md) for a full breakdown.
 - **Optional ANN index** — Build an HNSW graph after loading data for fast approximate search.
 - **Metadata filtering** — MongoDB-style filter operators on any metadata field.
 - **Crash recovery** — Write-ahead log (WAL) ensures durability without explicit flushing.
-- **Python native** — Built with PyO3 and Maturin; no server or sidecar required.
+- **Python native** — `pip install tqdb`; no server or sidecar required.
 
 ---
 
 ## Installation
 
-### Prerequisites
-
-- [Rust](https://rustup.rs/) stable toolchain
-- Python 3.10+
-- C++ compiler: Visual Studio Build Tools (Windows) · `xcode-select --install` (macOS) · `build-essential` (Linux)
-
-### Build from source
-
-```bash
-python -m venv venv
-source venv/bin/activate        # Windows: .\venv\Scripts\activate
-pip install maturin
-maturin develop --release
-```
-
-### Install pre-built wheel
-
 ```bash
 pip install tqdb
 ```
+
+Building from source (Rust toolchain required): see [`DEVELOPMENT.md`](https://github.com/jyunming/TurboQuantDB/blob/main/DEVELOPMENT.md).
 
 ---
 
 ## Recommended Setup
 
-Two presets cover most use cases — no indexing required to get started:
+Default config: `fast_mode=False, rerank=True` — QJL residual stored and used during reranking for best recall **at d ≥ 1536**.
+
+> **Note:** At d < 512, QJL projections are too noisy and `fast_mode=False` reduces recall below the MSE-only baseline. Use `fast_mode=True, rerank=False` for d < 512.
 
 ```python
 from tqdb import Database
 
-# Recommended — brute-force with dequantization reranking
-db = Database.open(path, dimension=DIM, bits=4, rerank=True)
+# High-d (d ≥ 1536) — default config, QJL reranking enabled
+db = Database.open(path, dimension=DIM, bits=4)
 results = db.search(query, top_k=10)
-# 95.5% Recall@1, 100% Recall@4 at 100k×1536  |  108 MB disk  |  ~50ms p50
+# 92.2% Recall@1, 99.9% Recall@4 at 100k×1536  |  108 MB disk
 
-# Minimum disk — 9.9× compression, still excellent recall
-db = Database.open(path, dimension=DIM, bits=2, rerank=True)
+# Low-d (d < 512) — MSE-only for best recall at low dimensions
+db = Database.open(path, dimension=DIM, bits=4, fast_mode=True, rerank=False)
 results = db.search(query, top_k=10)
-# 86.8% Recall@1, 99.3% Recall@4 at 100k×1536  |  60 MB disk  |  ~43ms p50
 
 # Optional: build an HNSW index after bulk load for sub-10ms queries
 db.create_index()
@@ -102,7 +88,10 @@ for r in results:
 # Open / create
 db = Database.open(path, dimension, bits=4, seed=42, metric="ip",
                    rerank=True, fast_mode=False, rerank_precision=None,
-                   collection=None, wal_flush_threshold=None)  # wal_flush_threshold default=5000; set higher for bulk loads
+                   collection=None, wal_flush_threshold=None,
+                   quantizer_type=None)  # None/"dense" = default (Haar QR + Gaussian); "srht" = fast O(d log d) ingest
+# NOTE: rerank=True only improves recall when fast_mode=False (the default).
+#       With fast_mode=True, rerank=True adds latency but no recall gain.
 
 # Write
 db.insert(id, vector, metadata=None, document=None)
@@ -143,128 +132,22 @@ db.search(query, top_k=5, filter={"$and": [{"topic": "ml"}, {"year": {"$gte": 20
 
 ---
 
-## Recommended Presets
-
-### Recommended — brute-force + reranking
-
-```python
-db = Database.open(path, dimension=DIM, bits=4, rerank=True)
-results = db.search(query, top_k=10, _use_ann=False)
-# 95.5% Recall@1, 100% Recall@4 at 100k×1536  |  108 MB disk  |  ~50ms p50 (brute-force)
-```
-
-### Minimum Disk — compress aggressively
-
-```python
-db = Database.open(path, dimension=DIM, bits=2, rerank=True)
-results = db.search(query, top_k=10, _use_ann=False)
-# 86.8% Recall@1, 99.3% Recall@4 at 100k×1536  |  60 MB disk (9.9× smaller)  |  ~43ms p50
-```
-
-### Optional — ANN index for lower latency
-
-```python
-# Build once after inserting data; recall scales with ann_search_list_size
-db.create_index()
-results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
-```
-
----
-
 ## Benchmarks
 
-Three datasets from [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) — n=100k vectors each. Full script: [`benchmarks/paper_recall_bench.py`](https://github.com/jyunming/TurboQuantDB/blob/main/benchmarks/paper_recall_bench.py).
-
-<!-- PAPER_BENCH_START -->
-### Algorithm Validation — Recall vs Paper
+Three datasets, 100k vectors each, matching [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) Figure 5. Default config: `quantizer_type=None` (dense), `fast_mode=False, rerank=True` (QJL reranking enabled — best recall).
 
 ![Benchmark recall curves — TQDB vs paper](https://raw.githubusercontent.com/jyunming/TurboQuantDB/main/benchmarks/benchmark_plots.png)
 
-Brute-force recall across all three datasets from [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) Figure 5 — n=100k vectors, paper values read visually from plots (approximate).
+Key results at 100k × d=1536 (DBpedia), brute-force, b=4, rerank=True:
 
-**GloVe-200** (d=200, 100,000 corpus, 10,000 queries)
+| Metric | Value |
+|--------|-------|
+| Recall@1 | 92.2% |
+| Recall@4 | 99.9% |
+| Disk | 108 MB (5.4× compression) |
+| p50 latency | ~51ms |
 
-| Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| TurboQuant 2-bit (paper Fig. 5a) | ≈55.0% | ≈70.0% | ≈83.0% | ≈91.0% | ≈96.0% | ≈99.0% | ≈100.0% |
-| **TQDB b=2 rerank=F** | 37.1% | 50.0% | 62.0% | 73.0% | 82.0% | 88.9% | 93.5% |
-| **TQDB b=2 rerank=T** | 52.8% | 68.4% | 81.1% | 90.3% | 95.5% | 98.4% | 99.5% |
-| TurboQuant 4-bit (paper Fig. 5a) | ≈86.0% | ≈96.0% | ≈99.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% |
-| **TQDB b=4 rerank=F** | 73.9% | 88.3% | 96.4% | 99.2% | 99.9% | 100.0% | 100.0% |
-| **TQDB b=4 rerank=T** | 82.6% | 94.2% | 98.7% | 99.9% | 100.0% | 100.0% | 100.0% |
-
-**DBpedia OpenAI3 d=1536** (d=1536, 100,000 corpus, 1,000 queries)
-
-| Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| TurboQuant 2-bit (paper Fig. 5b) | ≈89.5% | ≈98.0% | ≈99.5% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% |
-| **TQDB b=2 rerank=F** | 79.7% | 93.3% | 98.3% | 99.7% | 99.9% | 100.0% | 100.0% |
-| **TQDB b=2 rerank=T** | 86.8% | 96.2% | 99.3% | 99.9% | 100.0% | 100.0% | 100.0% |
-| TurboQuant 4-bit (paper Fig. 5b) | ≈97.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% |
-| **TQDB b=4 rerank=F** | 92.6% | 99.1% | 99.9% | 100.0% | 100.0% | 100.0% | 100.0% |
-| **TQDB b=4 rerank=T** | 95.5% | 99.5% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
-
-**DBpedia OpenAI3 d=3072** (d=3072, 100,000 corpus, 1,000 queries)
-
-| Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| TurboQuant 2-bit (paper Fig. 5c) | ≈90.5% | ≈98.5% | ≈99.5% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% |
-| **TQDB b=2 rerank=F** | 84.6% | 95.1% | 99.0% | 100.0% | 100.0% | 100.0% | 100.0% |
-| **TQDB b=2 rerank=T** | 89.2% | 98.6% | 99.8% | 100.0% | 100.0% | 100.0% | 100.0% |
-| TurboQuant 4-bit (paper Fig. 5c) | ≈97.5% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% |
-| **TQDB b=4 rerank=F** | 94.8% | 99.1% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
-| **TQDB b=4 rerank=T** | 96.0% | 99.8% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
-
-The GloVe gap (~12–18% at k=1) is expected: d=200 is the hardest case (fewest bits per dimension), and we evaluate on the first 100k vectors from a 1.18M corpus while the paper used a random sample. From k=4 onward the gap is ≤2.6% on GloVe and ≤1% on DBpedia. For high-dimensional embeddings (d≥1536), TQDB matches the paper within ~5% at k=1 and within 1% from k=4.
-
-### Performance & Config Trade-offs
-
-![Config trade-off overview — latency, disk, RAM, CPU](https://raw.githubusercontent.com/jyunming/TurboQuantDB/main/benchmarks/benchmark_plots_perf.png)
-
-All 8 configs — brute-force and ANN (HNSW md=32, ef=128). Disk MB for ANN includes `graph.bin`. RAM = peak RSS during query phase. Index = HNSW build time (ANN only).
-
-**GloVe-200** (d=200, 100,000 corpus, 10,000 queries)
-
-| Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 1.1s | — | 16.8 | 206 | 13.97 | 18.73 | 37.1% | 0.502 |
-| b=2 rerank=T | Brute | 1.4s | — | 16.8 | 209 | 18.89 | 21.49 | 52.8% | 0.666 |
-| b=4 rerank=F | Brute | 1.9s | — | 22.9 | 214 | 17.60 | 38.56 | 73.9% | 0.842 |
-| b=4 rerank=T | Brute | 2.5s | — | 22.9 | 216 | 20.72 | 42.72 | 82.6% | 0.900 |
-| b=2 rerank=F | ANN | 1.9s | 19.3s | 25.4 | 234 | 7.82 | 28.38 | 21.5% | 0.282 |
-| b=2 rerank=T | ANN | 1.3s | 19.5s | 25.4 | 240 | 11.39 | 32.27 | 37.4% | 0.460 |
-| b=4 rerank=F | ANN | 1.8s | 18.1s | 31.5 | 246 | 6.59 | 23.02 | 45.1% | 0.501 |
-| b=4 rerank=T | ANN | 2.3s | 17.6s | 31.5 | 245 | 11.54 | 34.35 | 61.2% | 0.658 |
-
-**DBpedia OpenAI3 d=1536** (d=1536, 100,000 corpus, 1,000 queries)
-
-| Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 4.5s | — | 59.5 | 759 | 39.98 | 45.60 | 79.7% | 0.882 |
-| b=2 rerank=T | Brute | 7.5s | — | 59.5 | 812 | 46.81 | 72.57 | 86.8% | 0.926 |
-| b=4 rerank=F | Brute | 8.0s | — | 108.3 | 811 | 46.15 | 50.99 | 92.6% | 0.961 |
-| b=4 rerank=T | Brute | 8.8s | — | 108.3 | 861 | 53.25 | 58.44 | 95.5% | 0.977 |
-| b=2 rerank=F | ANN | 6.4s | 69.1s | 68.1 | 775 | 11.62 | 14.88 | 75.0% | 0.827 |
-| b=2 rerank=T | ANN | 6.7s | 68.9s | 68.1 | 776 | 35.38 | 50.56 | 83.9% | 0.893 |
-| b=4 rerank=F | ANN | 7.8s | 69.3s | 116.9 | 824 | 11.75 | 16.25 | 88.4% | 0.915 |
-| b=4 rerank=T | ANN | 9.1s | 70.2s | 116.9 | 824 | 39.84 | 56.82 | 93.7% | 0.958 |
-
-**DBpedia OpenAI3 d=3072** (d=3072, 100,000 corpus, 1,000 queries)
-
-| Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 8.1s | — | 108.3 | 1401 | 76.44 | 87.06 | 84.6% | 0.913 |
-| b=2 rerank=T | Brute | 11.4s | — | 108.3 | 1419 | 86.75 | 99.18 | 89.2% | 0.943 |
-| b=4 rerank=F | Brute | 16.8s | — | 206.0 | 1497 | 89.86 | 101.15 | 94.8% | 0.972 |
-| b=4 rerank=T | Brute | 17.7s | — | 206.0 | 1518 | 101.23 | 113.31 | 96.0% | 0.980 |
-| b=2 rerank=F | ANN | 11.3s | 128.0s | 117.0 | 1416 | 15.94 | 22.14 | 80.7% | 0.867 |
-| b=2 rerank=T | ANN | 10.1s | 128.4s | 116.9 | 1418 | 63.59 | 92.24 | 87.2% | 0.921 |
-| b=4 rerank=F | ANN | 17.6s | 127.5s | 214.6 | 1514 | 17.60 | 26.17 | 90.3% | 0.926 |
-| b=4 rerank=T | ANN | 17.4s | 129.3s | 214.6 | 1516 | 72.50 | 106.91 | 94.8% | 0.967 |
-
-**Reproduction:** `maturin develop --release && python benchmarks/paper_recall_bench.py --update-readme --track`  (requires `pip install datasets psutil matplotlib`)
-
-<!-- PAPER_BENCH_END -->
+Full tables (all 8 configs × 3 datasets), ANN guidance, and reproduction steps: **[docs/BENCHMARKS.md](https://github.com/jyunming/TurboQuantDB/blob/main/docs/BENCHMARKS.md)**
 
 ---
 
@@ -283,99 +166,9 @@ for r in results:
 
 ---
 
-## Architecture
-
-TurboQuantDB is an embedded database — it runs in-process with no daemon.
-
-```
-./my_db/
-├── manifest.json        — DB config (dimension, bits, seed, metric)
-├── quantizer.bin        — Serialized quantizer state
-├── live_codes.bin       — Memory-mapped quantized vectors (hot path)
-├── live_vectors.bin     — Raw vectors for exact reranking (only if rerank_precision="f16" or "f32")
-├── wal.log              — Write-ahead log
-├── metadata.bin         — Per-vector metadata and documents
-├── live_ids.bin         — ID → slot index
-├── graph.bin            — HNSW adjacency list (if index built)
-└── seg-XXXXXXXX.bin     — Immutable flushed segment files
-```
-
-**Write path:** `insert()` → quantize (QR rotation → MSE → Gaussian QJL) → WAL → `live_codes.bin` → flush to segment
-
-**Search (brute-force):** query → precompute lookup tables → score all live vectors → top-k
-
-**Search (ANN):** query → HNSW beam search → rerank → top-k
-
-**Quantization:** Two-stage pipeline:
-1. **MSE** — QR rotation + Lloyd-Max scalar quantization to `bits` per coordinate
-2. **QJL** — Dense Gaussian projection, 1-bit quantized, bit-packed
-
-The combination gives unbiased inner product estimates with near-optimal distortion, requiring no training data.
-
-### What comes from the paper vs. what is added here
-
-The TurboQuant paper contributes the **quantization algorithm** — how to compress vectors and estimate inner products accurately. Its experiments use flat (exhaustive) search: all database vectors are scored against every query using the LUT-based asymmetric scorer. The paper's "indexing time virtually zero" claim refers to the quantizer requiring no training data, not to graph construction.
-
-**From the paper:** two-stage MSE + QJL quantization, QR rotation, Lloyd-Max codebook, asymmetric LUT scoring, unbiased inner product estimation.
-
-**Added by TurboQuantDB (not in the paper):** WAL persistence, memory-mapped storage, metadata/documents, HNSW graph index, reranking, Python bindings, and the HTTP server.
-
-The brute-force search path (`_use_ann=False`, the default) is the paper-conformant mode — it scores all vectors using TurboQuant's LUT scorer, matching the paper's experimental setup exactly. The HNSW index is a practical engineering addition that reduces the candidate set before scoring, enabling sub-linear search at the cost of approximate recall. Pass `_use_ann=True` to engage the HNSW index (requires `create_index()` to have been called first).
-
-### Module Map
-
-| Path | Responsibility |
-|------|---------------|
-| `src/python/mod.rs` | `Database` class — Python-facing API |
-| `src/storage/engine.rs` | `TurboQuantEngine` — insert/search/delete orchestration |
-| `src/storage/wal.rs` | Write-ahead log |
-| `src/storage/segment.rs` | Immutable append-only segments |
-| `src/storage/live_codes.rs` | Memory-mapped hot vector cache |
-| `src/storage/graph.rs` | HNSW graph index |
-| `src/quantizer/prod.rs` | `ProdQuantizer` — MSE + QJL orchestrator |
-| `src/quantizer/mse.rs` | `MseQuantizer` — QR rotation + Lloyd-Max codebook |
-| `src/quantizer/qjl.rs` | `QjlQuantizer` — 1-bit Gaussian projection, bit-packed |
-| `python/tqdb/rag.py` | `TurboQuantRetriever` — LangChain-style wrapper |
-| `server/` | Optional Axum HTTP service (separate Cargo workspace) |
-
----
-
 ## Server Mode
 
-> **Status: experimental.** The server crate compiles and the core endpoints work, but it has not been hardened for production use. The embedded library (`tqdb` Python package, `from tqdb import Database`) is the primary supported interface.
-
-An optional Axum-based HTTP server is available in `server/` for multi-tenant deployments. It adds API key authentication, quota enforcement, and async job management (compaction, index building, snapshots).
-
-```bash
-cd server && cargo build --release
-TQ_SERVER_ADDR=0.0.0.0:8080 TQ_LOCAL_ROOT=./data ./target/release/tqdb-server
-```
-
-See [`server/README.md`](https://github.com/jyunming/TurboQuantDB/blob/main/server/README.md) for the full endpoint reference. Key env vars:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `TQ_SERVER_ADDR` | `127.0.0.1:8080` | Bind address |
-| `TQ_LOCAL_ROOT` | `./data` | Storage root |
-| `TQ_JOB_WORKERS` | `2` | Async job thread count |
-
----
-
-## Performance Roadmap
-
-The current implementation uses SIMD-accelerated scoring (AVX2) for the brute-force search inner loop, the MSE centroid scan,
-and the QJL bit-unpack inner product. The FWHT transform (legacy SRHT path) also has an AVX2 fast path.
-
-**GPU acceleration** — batch ingest would benefit from cuBLAS GEMM (~3–5× for
-large batches on high-end cards). The ANN search path is memory-bound, not
-compute-bound, so GPU benefit there is minimal; the bottleneck is random cache
-misses during HNSW graph traversal rather than floating-point throughput.
-
-**AVX-512 codebook scan** — on modern Intel CPUs the MSE centroid lookup can be
-vectorised 2× wider with AVX-512, potentially halving scoring latency per batch.
-
-**Persistent HNSW** — incremental graph updates (no full rebuild after each ingest
-batch) would allow streaming use cases without periodic `create_index()` calls.
+An optional Axum HTTP server in `server/` adds multi-tenancy, RBAC, and async jobs. See [`server/README.md`](https://github.com/jyunming/TurboQuantDB/blob/main/server/README.md) for setup and endpoint reference.
 
 ---
 

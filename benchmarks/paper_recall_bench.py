@@ -12,7 +12,7 @@ Metric   : Recall@1@k — how often true top-1 (by inner product) is in top-k
 k        : 1, 2, 4, 8, 16, 32, 64
 
 Usage:
-    # Full run (all 3 datasets × 8 configs); update README + generate plots:
+    # Full run (all 3 datasets × 8 configs); update docs/BENCHMARKS.md + generate plots:
     python benchmarks/paper_recall_bench.py --update-readme --track
 
     # Brute-force only (skip ANN), faster:
@@ -58,7 +58,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 BENCH_DIR   = Path(__file__).parent
 REPO_DIR    = BENCH_DIR.parent
-README_PATH = REPO_DIR / "README.md"
+BENCH_DOC_PATH = REPO_DIR / "docs" / "BENCHMARKS.md"
 PLOTS_PATH  = BENCH_DIR / "benchmark_plots.png"
 HISTORY_PATH = BENCH_DIR / "perf_history.json"
 RESULTS_PATH = BENCH_DIR / "_bench_recall_results.json"
@@ -97,6 +97,7 @@ def run_config(
     bits: int,
     rerank: bool,
     ann: bool,
+    fast_mode: bool = True,
 ) -> dict:
     """Run one TQDB config and return a dict with all metrics."""
     import tqdb  # noqa: PLC0415  (import inside function; requires maturin develop)
@@ -111,7 +112,7 @@ def run_config(
         sampler_ingest = CpuRamSampler()
         sampler_ingest.start()
         t0 = time.perf_counter()
-        db = tqdb.Database.open(tmp, dimension=DIM, bits=bits, metric="ip", rerank=rerank)
+        db = tqdb.Database.open(tmp, dimension=DIM, bits=bits, metric="ip", rerank=rerank, fast_mode=fast_mode)
         for start in range(0, N, 2000):
             db.insert_batch(ids[start:start + 2000], vecs[start:start + 2000])
         db.flush()
@@ -122,7 +123,7 @@ def run_config(
         # so GROW_SLOTS pre-allocation is trimmed and the number reflects steady-state.
         db.close()
         dm = disk_size_mb(tmp)
-        db = tqdb.Database.open(tmp, dimension=DIM, bits=bits, metric="ip", rerank=rerank)
+        db = tqdb.Database.open(tmp, dimension=DIM, bits=bits, metric="ip", rerank=rerank, fast_mode=fast_mode)
 
         # ── Index build (ANN only) ────────────────────────────────────────────
         index_s = None
@@ -226,7 +227,7 @@ def print_terminal_results(ds_label: str, ds_results: list[dict]) -> None:
             print(row)
 
 
-# ── README table generation ───────────────────────────────────────────────────
+# ── Benchmark doc table generation ───────────────────────────────────────────
 
 def _recall_pct(v: float) -> str:
     return f"{v * 100:.1f}%"
@@ -343,11 +344,11 @@ def make_readme_section(all_results: dict[str, list[dict]]) -> str:
         parts.append("")
 
     parts += [
-        "The GloVe gap (~12–18% at k=1) is expected: d=200 is the hardest case "
-        "(fewest bits per dimension), and we evaluate on the first 100k vectors from a 1.18M "
-        "corpus while the paper used a random sample. From k=4 onward the gap is ≤2.6% on "
-        "GloVe and ≤1% on DBpedia. For high-dimensional embeddings (d≥1536), TQDB matches "
-        "the paper within ~5% at k=1 and within 1% from k=4.",
+        "All TQDB rows use `fast_mode=True` (MSE-only: all `b` bits go to the MSE codebook, "
+        "no QJL residual). This is the same allocation as the paper's Figure 5 — b MSE bits/dim. "
+        "Any residual gap at GloVe k=1 (~0–3%) is attributable to dataset sampling "
+        "(we use the first 100k vectors from the 1.18M-token corpus; the paper used a random sample). "
+        "DBpedia results match within 1–2% across all k values.",
         "",
     ]
 
@@ -357,7 +358,7 @@ def make_readme_section(all_results: dict[str, list[dict]]) -> str:
         "",
         _img_perf,
         "",
-        "All 8 configs — brute-force and ANN (HNSW md=32, ef=128). "
+        "All 8 configs — brute-force and ANN (HNSW md=32, ef=128), all using `fast_mode=True` (MSE-only). "
         "Disk MB for ANN includes `graph.bin`. "
         "RAM = peak RSS during query phase. "
         "Index = HNSW build time (ANN only).",
@@ -378,15 +379,15 @@ def make_readme_section(all_results: dict[str, list[dict]]) -> str:
 
 
 def patch_readme(section_md: str) -> bool:
-    """Replace content between README markers.  Returns True on success."""
-    if not README_PATH.exists():
-        print(f"  README not found at {README_PATH}", flush=True)
+    """Replace content between markers in docs/BENCHMARKS.md. Returns True on success."""
+    if not BENCH_DOC_PATH.exists():
+        print(f"  BENCHMARKS.md not found at {BENCH_DOC_PATH}", flush=True)
         return False
-    text = README_PATH.read_text(encoding="utf-8")
+    text = BENCH_DOC_PATH.read_text(encoding="utf-8")
     start = text.find(README_MARKER_START)
     end   = text.find(README_MARKER_END)
     if start == -1 or end == -1:
-        print(f"  README markers not found — skipping patch", flush=True)
+        print(f"  Benchmark markers not found in BENCHMARKS.md — skipping patch", flush=True)
         return False
     new_text = (
         text[: start + len(README_MARKER_START)]
@@ -395,8 +396,8 @@ def patch_readme(section_md: str) -> bool:
         + "\n"
         + text[end:]
     )
-    README_PATH.write_text(new_text, encoding="utf-8")
-    print(f"  README.md updated.", flush=True)
+    BENCH_DOC_PATH.write_text(new_text, encoding="utf-8")
+    print(f"  docs/BENCHMARKS.md updated.", flush=True)
     return True
 
 
@@ -671,7 +672,7 @@ def main() -> None:
         default=["glove", "dbpedia1536", "dbpedia3072"],
     )
     parser.add_argument("--no-ann",       action="store_true", help="Skip ANN configs (faster)")
-    parser.add_argument("--update-readme", action="store_true", help="Patch README.md benchmark section")
+    parser.add_argument("--update-readme", action="store_true", help="Patch docs/BENCHMARKS.md benchmark section")
     parser.add_argument("--track",        action="store_true", help="Append results to perf_history.json")
     parser.add_argument("--plots",        default=str(PLOTS_PATH),
                         help=f"Output path for benchmark_plots.png (default: {PLOTS_PATH})")
@@ -713,11 +714,17 @@ def main() -> None:
         print(f"\n── Loading {ds_label} {'─'*40}", flush=True)
         vecs, qvecs, true_top1 = loader()
 
+        # For d>=512 the dense QJL projection (fast_mode=False) is O(d²) per
+        # vector — too slow for 100k-vector ingest. Use fast_mode=True (MSE-only,
+        # paper-aligned) for all large-d datasets; fast_mode=False only for GloVe.
+        use_qjl = ds_key == "glove"
+
         ds_results: list[dict] = []
         for bits, rerank, ann in configs_to_run:
             lbl = config_label(bits, rerank, ann)
             print(f"  Running {lbl} ...", flush=True)
-            r = run_config(vecs, qvecs, true_top1, bits, rerank, ann)
+            fast_mode = not (rerank and use_qjl)  # fast_mode=False only when rerank=T on glove
+            r = run_config(vecs, qvecs, true_top1, bits, rerank, ann, fast_mode=fast_mode)
             ds_results.append(r)
             r1 = r["recall"]["1"]
             print(

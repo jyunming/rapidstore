@@ -12,9 +12,9 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{error, info};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tqdb::storage::engine::{BatchWriteItem, DistanceMetric, GetResult, TurboQuantEngine};
+use tracing::{error, info};
 
 #[derive(Clone)]
 struct AppState {
@@ -27,6 +27,12 @@ struct AppState {
     /// Last time `collect_collection_gauges` ran.  Shared across clones so
     /// concurrent requests do not all trigger a full directory scan.
     last_gauge_collect: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Serializes concurrent `create_collection` calls to prevent TOCTOU races
+    /// where two requests both see "not found" and both attempt to write the manifest.
+    collection_create_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-collection mutex to serialize all engine open/close cycles on the same
+    /// collection directory.  Prevents WAL and manifest corruption from concurrent writes.
+    collection_op_locks: Arc<Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Clone)]
@@ -709,8 +715,7 @@ fn now_ts() -> String {
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "tqdb_server=info,axum=info".to_string()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "tqdb_server=info,axum=info".to_string()),
         )
         .init();
 
@@ -757,6 +762,8 @@ async fn main() {
         job_worker_concurrency,
         metrics_handle,
         last_gauge_collect: Arc::new(Mutex::new(None)),
+        collection_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+        collection_op_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     dispatch_queued_jobs(&state);
@@ -786,13 +793,18 @@ const GAUGE_COLLECT_TTL: std::time::Duration = std::time::Duration::from_secs(10
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     // Only re-scan if the TTL has elapsed since the last collection.
     let should_collect = {
-        let last = state.last_gauge_collect.lock().unwrap_or_else(|e| e.into_inner());
+        let last = state
+            .last_gauge_collect
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         last.map_or(true, |t| t.elapsed() >= GAUGE_COLLECT_TTL)
     };
     if should_collect {
         collect_collection_gauges(&state);
-        *state.last_gauge_collect.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(std::time::Instant::now());
+        *state
+            .last_gauge_collect
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
     }
     (
         [(
@@ -809,7 +821,11 @@ fn collect_collection_gauges(state: &AppState) {
         return;
     };
     for tenant_entry in tenant_entries.flatten() {
-        if !tenant_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if !tenant_entry
+            .file_type()
+            .map(|t| t.is_dir())
+            .unwrap_or(false)
+        {
             continue;
         }
         let tenant = tenant_entry.file_name().to_string_lossy().to_string();
@@ -900,6 +916,8 @@ async fn list_collections(
     Extension(ctx): Extension<RequestContext>,
 ) -> Result<Json<ListCollectionsResponse>, ApiError> {
     authorize(&ctx, &state.auth, "read", &tenant, &database, None)?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
     let collections =
         TurboQuantEngine::list_collections_scoped(&state.storage.local_root, &tenant, &database)
             .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?
@@ -916,6 +934,10 @@ async fn create_collection(
     Json(body): Json<CreateCollectionRequest>,
 ) -> Result<(StatusCode, Json<CreateCollectionResponse>), ApiError> {
     authorize(&ctx, &state.auth, "write", &tenant, &database, None)?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&body.name, "collection", ctx.request_id.clone())?;
+    let _create_guard = state.collection_create_lock.lock().await;
     if body.dimension == 0 || body.bits == 0 {
         return Err(ApiError::invalid_argument(
             "dimension and bits must be greater than 0",
@@ -1004,6 +1026,9 @@ async fn delete_collection(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     let deleted = TurboQuantEngine::delete_collection_scoped_with_uri(
         &state.storage.uri,
         &state.storage.local_root,
@@ -1038,6 +1063,9 @@ async fn add_vectors(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     if body.ids.is_empty() {
         return Err(ApiError::invalid_argument(
             "ids cannot be empty",
@@ -1068,6 +1096,8 @@ async fn add_vectors(
     }
 
     let report_mode = body.report.unwrap_or(false);
+    let _op_lock = acquire_collection_op_lock(&state, &tenant, &database, &collection);
+    let _op_guard = _op_lock.lock().await;
     let mut engine = open_scoped_engine_from_manifest(&state, &tenant, &database, &collection)
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
     if let Err(err) = enforce_vector_quota_for_ids(
@@ -1220,6 +1250,9 @@ async fn upsert_vectors(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     if body.ids.is_empty() {
         return Err(ApiError::invalid_argument(
             "ids cannot be empty",
@@ -1250,6 +1283,8 @@ async fn upsert_vectors(
     }
 
     let report_mode = body.report.unwrap_or(false);
+    let _op_lock = acquire_collection_op_lock(&state, &tenant, &database, &collection);
+    let _op_guard = _op_lock.lock().await;
     let mut engine = open_scoped_engine_from_manifest(&state, &tenant, &database, &collection)
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
     if let Err(err) = enforce_vector_quota_for_ids(
@@ -1391,7 +1426,12 @@ async fn delete_vectors(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
 
+    let _op_lock = acquire_collection_op_lock(&state, &tenant, &database, &collection);
+    let _op_guard = _op_lock.lock().await;
     let mut engine = open_scoped_engine_from_manifest(&state, &tenant, &database, &collection)
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
 
@@ -1445,6 +1485,9 @@ async fn get_vectors(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     let include_set = parse_include_set(
         body.include.as_ref(),
         &["ids", "metadatas", "documents"],
@@ -1462,6 +1505,8 @@ async fn get_vectors(
         ));
     }
 
+    let _op_lock = acquire_collection_op_lock(&state, &tenant, &database, &collection);
+    let _op_guard = _op_lock.lock().await;
     let mut engine = open_scoped_engine_from_manifest(&state, &tenant, &database, &collection)
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
 
@@ -1542,6 +1587,9 @@ async fn query_vectors(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     let top_k = body.top_k.or(body.n_results).unwrap_or(10);
     if top_k == 0 {
         return Err(ApiError::invalid_argument(
@@ -1566,6 +1614,8 @@ async fn query_vectors(
     let candidate_n = top_k.saturating_add(offset);
     let where_filter = body.filter.as_ref().or(body.where_filter.as_ref());
 
+    let _op_lock = acquire_collection_op_lock(&state, &tenant, &database, &collection);
+    let _op_guard = _op_lock.lock().await;
     let mut engine = open_scoped_engine_from_manifest(&state, &tenant, &database, &collection)
         .map_err(|e| map_engine_err(e, ctx.request_id.clone()))?;
     let mut rows = Vec::new();
@@ -1640,6 +1690,9 @@ async fn start_compact_job(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     enforce_job_enqueue_quota(
         &state,
         &tenant,
@@ -1676,6 +1729,9 @@ async fn start_index_job(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     enforce_job_enqueue_quota(
         &state,
         &tenant,
@@ -1712,6 +1768,9 @@ async fn start_snapshot_job(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     enforce_job_enqueue_quota(
         &state,
         &tenant,
@@ -1755,6 +1814,9 @@ async fn start_restore_job(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     enforce_job_enqueue_quota(
         &state,
         &tenant,
@@ -1819,6 +1881,9 @@ async fn list_collection_jobs(
         &database,
         Some(&collection),
     )?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
+    validate_path_component(&collection, "collection", ctx.request_id.clone())?;
     let jobs = state
         .jobs
         .lock()
@@ -2024,6 +2089,8 @@ fn enqueue_job(
     save_job_store(&state.storage.job_store_path, &guard)
         .map_err(|e| ApiError::internal(e.to_string(), request_id.clone()))?;
 
+    // Release the jobs lock before dispatching — dispatch acquires the same lock.
+    drop(guard);
     dispatch_queued_jobs(state);
 
     Ok((job_id, JobStatus::Queued))
@@ -2168,8 +2235,10 @@ fn open_scoped_engine_from_manifest(
         metric: DistanceMetric,
     }
 
-    let collection_dir =
-        scoped_collection_dir(&state.storage.local_root, tenant, database, collection);
+    let collection_dir = PathBuf::from(&state.storage.local_root)
+        .join(tenant)
+        .join(database)
+        .join(collection);
     let manifest_path = collection_dir.join("manifest.json");
     let manifest =
         serde_json::from_str::<CollectionManifestProbe>(&std::fs::read_to_string(&manifest_path)?)?;
@@ -2474,6 +2543,8 @@ async fn get_quota_usage(
     Extension(ctx): Extension<RequestContext>,
 ) -> Result<Json<QuotaUsageResponse>, ApiError> {
     authorize(&ctx, &state.auth, "read", &tenant, &database, None)?;
+    validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
+    validate_path_component(&database, "database", ctx.request_id.clone())?;
 
     let collection_names =
         TurboQuantEngine::list_collections_scoped(&state.storage.local_root, &tenant, &database)
@@ -2595,6 +2666,42 @@ fn enforce_job_enqueue_quota(
     }
     Ok(())
 }
+fn acquire_collection_op_lock(
+    state: &AppState,
+    tenant: &str,
+    database: &str,
+    collection: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let key = format!("{}/{}/{}", tenant, database, collection);
+    let mut map = state
+        .collection_op_locks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+fn validate_path_component(
+    name: &str,
+    label: &str,
+    request_id: Option<String>,
+) -> Result<(), ApiError> {
+    if name.is_empty()
+        || name == ".."
+        || name == "."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(ApiError::invalid_argument(
+            format!("{label} contains invalid characters or path traversal sequences"),
+            request_id,
+        ));
+    }
+    Ok(())
+}
+
 fn parse_metric(
     metric: Option<&str>,
     request_id: Option<String>,
@@ -2667,6 +2774,12 @@ mod tests {
     use axum::http::Request;
     use tower::util::ServiceExt;
 
+    fn mk_test_metrics_handle() -> PrometheusHandle {
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle()
+    }
+
     fn mk_state_with_jobs(max_concurrent_jobs: Option<usize>, jobs: Vec<JobRecord>) -> AppState {
         let mut tenant_quotas = HashMap::new();
         tenant_quotas.insert(
@@ -2707,6 +2820,10 @@ mod tests {
                 job_store_path: "".to_string(),
             },
             job_worker_concurrency: 1,
+            metrics_handle: mk_test_metrics_handle(),
+            last_gauge_collect: Arc::new(Mutex::new(None)),
+            collection_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            collection_op_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -2869,7 +2986,7 @@ mod tests {
                 next_id: 2,
             })),
             storage: StorageConfig {
-                uri: ".".to_string(),
+                uri: local_root.to_string(),
                 local_root: local_root.to_string(),
                 auth_store_path: PathBuf::from(local_root)
                     .join("auth_store.json")
@@ -2885,6 +3002,10 @@ mod tests {
                     .to_string(),
             },
             job_worker_concurrency: 1,
+            metrics_handle: mk_test_metrics_handle(),
+            last_gauge_collect: Arc::new(Mutex::new(None)),
+            collection_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            collection_op_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -2940,7 +3061,7 @@ mod tests {
 
     fn seed_collection_for_http(local_root: &str, collection: &str) {
         TurboQuantEngine::create_collection_scoped_with_uri(
-            ".", local_root, "dev", "db", collection,
+            local_root, local_root, "dev", "db", collection,
         )
         .expect("create scoped collection");
 
@@ -2948,7 +3069,7 @@ mod tests {
         let mut engine_opt = None;
         for _ in 0..10 {
             match TurboQuantEngine::open_collection_scoped(
-                ".",
+                local_root,
                 local_root,
                 "dev",
                 "db",
@@ -3030,7 +3151,7 @@ mod tests {
         assert_eq!(payload["deleted"], 1);
 
         let mut engine = TurboQuantEngine::open_collection_scoped(
-            ".",
+            &root,
             &root,
             "dev",
             "db",
