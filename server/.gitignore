@@ -1,2 +1,6 @@
 target/
 *.bak
+*.bin
+graph_ids.json
+manifest.json
+tenants/

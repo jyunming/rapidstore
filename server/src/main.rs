@@ -2168,8 +2168,10 @@ fn open_scoped_engine_from_manifest(
         metric: DistanceMetric,
     }
 
-    let collection_dir =
-        scoped_collection_dir(&state.storage.local_root, tenant, database, collection);
+    let collection_dir = PathBuf::from(&state.storage.local_root)
+        .join(tenant)
+        .join(database)
+        .join(collection);
     let manifest_path = collection_dir.join("manifest.json");
     let manifest =
         serde_json::from_str::<CollectionManifestProbe>(&std::fs::read_to_string(&manifest_path)?)?;
@@ -2877,7 +2879,7 @@ mod tests {
                 next_id: 2,
             })),
             storage: StorageConfig {
-                uri: ".".to_string(),
+                uri: local_root.to_string(),
                 local_root: local_root.to_string(),
                 auth_store_path: PathBuf::from(local_root)
                     .join("auth_store.json")
@@ -2950,7 +2952,7 @@ mod tests {
 
     fn seed_collection_for_http(local_root: &str, collection: &str) {
         TurboQuantEngine::create_collection_scoped_with_uri(
-            ".", local_root, "dev", "db", collection,
+            local_root, local_root, "dev", "db", collection,
         )
         .expect("create scoped collection");
 
@@ -2958,7 +2960,7 @@ mod tests {
         let mut engine_opt = None;
         for _ in 0..10 {
             match TurboQuantEngine::open_collection_scoped(
-                ".",
+                local_root,
                 local_root,
                 "dev",
                 "db",
@@ -3040,7 +3042,7 @@ mod tests {
         assert_eq!(payload["deleted"], 1);
 
         let mut engine = TurboQuantEngine::open_collection_scoped(
-            ".",
+            &root,
             &root,
             "dev",
             "db",
