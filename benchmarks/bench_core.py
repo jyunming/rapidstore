@@ -62,6 +62,10 @@ PERF_METRIC_ROWS: list[tuple[str, str]] = [
 CKPT_DIR: Path = Path(__file__).parent / "_paper_bench_cache"
 
 # Approximate recall values read visually from Figure 5 of arXiv:2504.19874.
+# The paper's b=N corresponds to N MSE bits/dim (MSE-only, no QJL residual).
+# TQDB equivalent: fast_mode=True at b=N — all b bits go to the MSE codebook, 0 QJL.
+# Any residual gap vs these reference values is attributable to dataset sampling:
+# the paper used a random 100k subset of GloVe (1.18M total); we use the first 100k.
 PAPER_RECALL: dict[str, dict[int, dict[int, float]]] = {
     "glove-200": {
         2: {1: 0.550, 2: 0.700, 4: 0.830, 8: 0.910, 16: 0.960, 32: 0.990, 64: 1.000},

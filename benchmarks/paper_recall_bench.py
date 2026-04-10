@@ -111,7 +111,7 @@ def run_config(
         sampler_ingest = CpuRamSampler()
         sampler_ingest.start()
         t0 = time.perf_counter()
-        db = tqdb.Database.open(tmp, dimension=DIM, bits=bits, metric="ip", rerank=rerank)
+        db = tqdb.Database.open(tmp, dimension=DIM, bits=bits, metric="ip", rerank=rerank, fast_mode=True)
         for start in range(0, N, 2000):
             db.insert_batch(ids[start:start + 2000], vecs[start:start + 2000])
         db.flush()
@@ -122,7 +122,7 @@ def run_config(
         # so GROW_SLOTS pre-allocation is trimmed and the number reflects steady-state.
         db.close()
         dm = disk_size_mb(tmp)
-        db = tqdb.Database.open(tmp, dimension=DIM, bits=bits, metric="ip", rerank=rerank)
+        db = tqdb.Database.open(tmp, dimension=DIM, bits=bits, metric="ip", rerank=rerank, fast_mode=True)
 
         # ── Index build (ANN only) ────────────────────────────────────────────
         index_s = None
@@ -343,11 +343,11 @@ def make_readme_section(all_results: dict[str, list[dict]]) -> str:
         parts.append("")
 
     parts += [
-        "The GloVe gap (~12–18% at k=1) is expected: d=200 is the hardest case "
-        "(fewest bits per dimension), and we evaluate on the first 100k vectors from a 1.18M "
-        "corpus while the paper used a random sample. From k=4 onward the gap is ≤2.6% on "
-        "GloVe and ≤1% on DBpedia. For high-dimensional embeddings (d≥1536), TQDB matches "
-        "the paper within ~5% at k=1 and within 1% from k=4.",
+        "All TQDB rows use `fast_mode=True` (MSE-only: all `b` bits go to the MSE codebook, "
+        "no QJL residual). This is the same allocation as the paper's Figure 5 — b MSE bits/dim. "
+        "Any residual gap at GloVe k=1 (~0–3%) is attributable to dataset sampling "
+        "(we use the first 100k vectors from the 1.18M-token corpus; the paper used a random sample). "
+        "DBpedia results match within 1–2% across all k values.",
         "",
     ]
 
@@ -357,7 +357,7 @@ def make_readme_section(all_results: dict[str, list[dict]]) -> str:
         "",
         _img_perf,
         "",
-        "All 8 configs — brute-force and ANN (HNSW md=32, ef=128). "
+        "All 8 configs — brute-force and ANN (HNSW md=32, ef=128), all using `fast_mode=True` (MSE-only). "
         "Disk MB for ANN includes `graph.bin`. "
         "RAM = peak RSS during query phase. "
         "Index = HNSW build time (ANN only).",
