@@ -17,7 +17,7 @@ Two deployment modes:
 
 - **Zero training** — No `train()` step. Vectors are quantized and stored immediately on insert.
 - **5–10× compression** — b=4 reduces 1536-dim float32 embeddings from 586 MB to 108 MB (5.4×); b=2 reaches 59 MB (9.9×) at 100k vectors.
-- **Two quantizer modes** — default `dense` (Haar-uniform QR, best recall); optional `srht` for streaming/frequent-ingest workloads at high d. See [docs/QUANTIZER_MODES.md](docs/QUANTIZER_MODES.md) for a full CPU/RAM/disk/recall breakdown.
+- **Two quantizer modes** — default `dense` (Haar-uniform QR, best recall); optional `srht` for streaming/frequent-ingest workloads at high d. See [docs/QUANTIZER_MODES.md](https://github.com/jyunming/TurboQuantDB/blob/main/docs/QUANTIZER_MODES.md) for a full CPU/RAM/disk/recall breakdown.
 - **Optional ANN index** — Build an HNSW graph after loading data for fast approximate search.
 - **Metadata filtering** — MongoDB-style filter operators on any metadata field.
 - **Crash recovery** — Write-ahead log (WAL) ensures durability without explicit flushing.
@@ -44,7 +44,7 @@ If you do not set `quantizer_type`, you get the default `"dense"` mode.
 pip install tqdb
 ```
 
-Building from source (Rust toolchain required): see [`DEVELOPMENT.md`](DEVELOPMENT.md).
+Building from source (Rust toolchain required): see [`DEVELOPMENT.md`](https://github.com/jyunming/TurboQuantDB/blob/main/DEVELOPMENT.md).
 
 ---
 
