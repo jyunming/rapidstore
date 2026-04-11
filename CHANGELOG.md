@@ -6,6 +6,22 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
+## [0.5.1] — 2026-04-11
+
+### Added
+
+- **`rerank_factor` at search time** — `db.search()` and `db.query()` now accept a `rerank_factor` parameter (integer multiplier). Controls how many over-sampled candidates are re-scored when `rerank=True`. Defaults: 10× for brute-force, 20× for ANN. Follows the industry pattern of Qdrant's `oversampling` and LanceDB's `refine_factor`.
+- **`rerank_precision` defaults to `"f16"`** — When `rerank=True` and no explicit `rerank_precision` is provided, raw vectors are now stored as float16 (half of float32 disk usage) for exact re-scoring. Previously defaulted to dequantization-only, which produced zero recall improvement for the inner-product metric.
+- **`docs/CONFIGURATION.md`** — new comprehensive configuration guide covering all parameter dimensions (`bits`, `fast_mode`, `rerank`, `rerank_factor`, `quantizer_type`, ANN vs brute-force), recommended presets for 6 common scenarios, storage estimation formulas, and a decision flowchart.
+- **`benchmarks/full_config_bench.py`** — exhaustive 32-config × 4-dataset benchmark script. Runs all combinations of bits × rerank × ann × fast_mode × quantizer_type across GloVe-200, arXiv-768, DBpedia-1536, and DBpedia-3072. Generates recall curves, trade-off scatter plots, and a data-driven guidance report (`benchmarks/_full_config_report.md`, gitignored).
+
+### Fixed
+
+- **Rerank no-op bug** — `rerank=True` with `rerank_precision=None` previously resolved to `Disabled` (dequantization-only). For the IP metric, dequantized scores are mathematically identical to the LUT scores, so rerank had zero effect. Now defaults to `F16` exact re-scoring, giving +5–25 pp R@1 depending on dataset and bits.
+- **`release.yml` update-docs job** — replaced branch+PR dance with a direct `git push origin HEAD:main`. GitHub Actions cannot create pull requests in this repository (`Allow GitHub Actions to create and approve pull requests` is off), causing the previous job to fail on every release.
+
+---
+
 ## [0.5.0] — 2026-04-10
 
 ### Added

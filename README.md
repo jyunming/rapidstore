@@ -37,28 +37,34 @@ Building from source (Rust toolchain required): see [`DEVELOPMENT.md`](https://g
 
 ## Recommended Setup
 
-Default config: `fast_mode=False, rerank=True` — QJL residual stored and used during reranking for best recall **at d ≥ 1536**.
-
-> **Note:** At d < 512, QJL projections are too noisy and `fast_mode=False` reduces recall below the MSE-only baseline. Use `fast_mode=True, rerank=False` for d < 512.
+`rerank=True` (default) stores raw float16 vectors alongside compressed codes for exact second-pass rescoring. `fast_mode=True` (default) uses MSE-only quantization — optimal for d < 1536.
 
 ```python
 from tqdb import Database
 
-# High-d (d ≥ 1536) — default config, QJL reranking enabled
+# Best recall, any dimension — brute-force (default)
+db = Database.open(path, dimension=DIM, bits=4)           # rerank=True, f16 storage by default
+results = db.search(query, top_k=10)
+# GloVe-200:  R@1 ≈ 1.00  |  54 MB disk
+# arXiv-768:  R@1 ≈ 0.99  |  200 MB disk
+# DBpedia-1536: R@1 ≈ 0.95  |  396 MB disk
+
+# Best recall, high-d (d ≥ 1536) — also enable QJL residuals
+db = Database.open(path, dimension=1536, bits=4, fast_mode=False)
+
+# Minimum disk — compressed codes only
+db = Database.open(path, dimension=DIM, bits=4, rerank=False)
+
+# Low latency at N ≥ 100k — HNSW index
 db = Database.open(path, dimension=DIM, bits=4)
-results = db.search(query, top_k=10)
-# 92.2% Recall@1, 99.9% Recall@4 at 100k×1536  |  108 MB disk
-
-# Low-d (d < 512) — MSE-only for best recall at low dimensions
-db = Database.open(path, dimension=DIM, bits=4, fast_mode=True, rerank=False)
-results = db.search(query, top_k=10)
-
-# Optional: build an HNSW index after bulk load for sub-10ms queries
 db.create_index()
-results = db.search(query, top_k=10, _use_ann=True)
+results = db.search(query, top_k=10, _use_ann=True)       # p50 < 10ms
+
+# Tune rerank oversampling at query time (default 10×)
+results = db.search(query, top_k=10, rerank_factor=20)    # higher recall, higher latency
 ```
 
-Full parameter reference: [`docs/PYTHON_API.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md)
+Full configuration guide: [`docs/CONFIGURATION.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/CONFIGURATION.md) | Python API: [`docs/PYTHON_API.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md)
 
 ---
 
@@ -90,8 +96,8 @@ db = Database.open(path, dimension, bits=4, seed=42, metric="ip",
                    rerank=True, fast_mode=False, rerank_precision=None,
                    collection=None, wal_flush_threshold=None,
                    quantizer_type=None)  # None/"dense" = default (Haar QR + Gaussian); "srht" = fast O(d log d) ingest
-# NOTE: rerank=True only improves recall when fast_mode=False (the default).
-#       With fast_mode=True, rerank=True adds latency but no recall gain.
+# NOTE: rerank=True stores raw f16 vectors for exact second-pass rescoring.
+#       rerank_factor (default 10× brute / 20× ANN) controls oversampling.
 
 # Write
 db.insert(id, vector, metadata=None, document=None)

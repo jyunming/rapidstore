@@ -43,9 +43,11 @@ impl Database {
     ///                to match paper Figure 5 recall curves (MSE-only bit allocation) or for
     ///                ~30% faster ingest when recall is not critical. Default ``False``.
     ///     rerank_precision: Raw-vector reranking precision:
-    ///         - ``None`` (default): dequantization reranking — no extra disk/RAM.
+    ///         - ``None`` (default): ``"f32"`` when ``rerank=True``, disabled otherwise.
     ///         - ``"f16"``: store raw vectors as float16 (+n×d×2 bytes), exact reranking.
     ///         - ``"f32"``: store raw vectors as float32 (+n×d×4 bytes), maximum precision.
+    ///         - ``"disabled"`` / ``"dequant"``: no extra storage; reranking uses dequantization
+    ///           (mathematically equivalent to no rerank for IP metric — use only to save disk).
     ///     wal_flush_threshold: Number of buffered vectors before flushing WAL to a segment file.
     ///         Higher values give faster bulk ingest (fewer flush cycles) at the cost of more
     ///         data at risk if the process crashes before flush. Default ``5000``.
@@ -151,15 +153,25 @@ impl Database {
         };
 
         let precision = match rerank_precision.map(|s| s.to_lowercase()) {
-            None => RerankPrecision::Disabled,
-            Some(ref s) if s == "none" || s == "disabled" || s == "dequant" => {
-                RerankPrecision::Disabled
+            // Default: INT8 per-vector-scaled when rerank=True.
+            // INT8 gives near-identical recall to F16 at ~50% less disk for any d.
+            // Dequantization reranking is mathematically equivalent to the quantized LUT score
+            // for IP metric, so it produces no recall improvement without raw vector storage.
+            None => {
+                if rerank {
+                    RerankPrecision::Int8 // ~50% less disk than f16, same recall
+                } else {
+                    RerankPrecision::Disabled
+                }
             }
+            Some(ref s) if s == "disabled" || s == "dequant" => RerankPrecision::Disabled,
+            Some(ref s) if s == "int8" || s == "i8" => RerankPrecision::Int8,
+            Some(ref s) if s == "int4" || s == "i4" => RerankPrecision::Int4,
             Some(ref s) if s == "f16" || s == "half" => RerankPrecision::F16,
             Some(ref s) if s == "f32" || s == "float" || s == "full" => RerankPrecision::F32,
             Some(ref s) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid rerank_precision: '{}'. Use 'f16', 'f32', or None (dequant reranking).",
+                    "Invalid rerank_precision: '{}'. Use 'int8' (default), 'int4', 'f16', 'f32', or None.",
                     s
                 )));
             }
@@ -528,12 +540,18 @@ impl Database {
     ///     filter: Optional metadata filter dict.
     ///     ann_search_list_size: HNSW ef_search override (larger = more recall, slower).
     ///         Only relevant when ``_use_ann=True`` and an index exists.
+    ///     rerank_factor: Oversampling multiplier for the rerank candidate pool.
+    ///         When ``rerank=True``, the engine scores ``top_k * rerank_factor`` candidates
+    ///         with the quantized scorer then re-scores with exact raw vectors.
+    ///         Higher values improve recall at the cost of latency. Default ``None`` uses
+    ///         built-in defaults (10× brute-force, 20× ANN). Range: 1–100.
+    ///         Ignored when ``rerank=False``.
     ///     include: Subset of fields to return — ``["id", "score", "metadata", "document"]``.
     ///              Defaults to all four.
     ///
     /// Returns:
     ///     List of dicts, each with keys ``id``, ``score``, ``metadata``, ``document``.
-    #[pyo3(signature = (query, top_k, filter=None, _use_ann=None, ann_search_list_size=None, include=None))]
+    #[pyo3(signature = (query, top_k, filter=None, _use_ann=None, ann_search_list_size=None, include=None, rerank_factor=None))]
     fn search(
         &self,
         py: Python<'_>,
@@ -543,6 +561,7 @@ impl Database {
         _use_ann: Option<bool>,
         ann_search_list_size: Option<usize>,
         include: Option<Vec<String>>,
+        rerank_factor: Option<usize>,
     ) -> PyResult<PyObject> {
         if top_k <= 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -584,7 +603,14 @@ impl Database {
             }
             let use_ann = _use_ann.unwrap_or_else(|| engine.auto_use_ann());
             engine
-                .search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size, use_ann)
+                .search_with_filter_and_ann(
+                    &q,
+                    top_k,
+                    filter_ref,
+                    ann_search_list_size,
+                    use_ann,
+                    rerank_factor,
+                )
                 .map_err(to_py_runtime)
         })?;
 
@@ -767,6 +793,8 @@ impl Database {
     ///     where_filter: Optional metadata filter (same syntax as :meth:`search`).
     ///     ann_search_list_size: HNSW ef_search override (larger = more recall, slower).
     ///         Only relevant when ``_use_ann=True`` and an index exists.
+    ///     rerank_factor: Oversampling multiplier for the rerank candidate pool (see
+    ///         :meth:`search` for full description). Default ``None``.
     ///
     /// Note:
     ///     Pass ``_use_ann=True`` to engage the HNSW index (must be built first via
@@ -781,7 +809,7 @@ impl Database {
     ///         query_embeddings=np.stack([q1, q2, q3]),
     ///         n_results=5,
     ///     )
-    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=None, ann_search_list_size=None))]
+    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=None, ann_search_list_size=None, rerank_factor=None))]
     fn query(
         &self,
         py: Python<'_>,
@@ -790,6 +818,7 @@ impl Database {
         where_filter: Option<&Bound<'_, PyDict>>,
         _use_ann: Option<bool>,
         ann_search_list_size: Option<usize>,
+        rerank_factor: Option<usize>,
     ) -> PyResult<PyObject> {
         if n_results <= 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -856,6 +885,7 @@ impl Database {
                     filter_ref,
                     ann_search_list_size,
                     _use_ann,
+                    rerank_factor,
                 )
                 .map_err(to_py_runtime)
         })?;

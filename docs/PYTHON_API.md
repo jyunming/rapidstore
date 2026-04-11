@@ -33,9 +33,12 @@ db = Database.open(
                              #        during reranking for best recall (+9–15 pp R@1 vs True).
                              #        Set True for MSE-only mode (paper Figure 5 allocation,
                              #        ~30% faster ingest, no recall benefit from rerank=True).
-    rerank_precision=None,   # str|None — None = dequant reranking (no extra storage)
+    rerank_precision=None,   # str|None — None → "int8" (default when rerank=True)
+                             #            "int8"/"i8" = INT8 per-vector-scaled (+n×(d+4) bytes)
+                             #            "int4"/"i4" = INT4 nibble-packed (+n×(⌈d/2⌉+4) bytes)
                              #            "f16" = float16 exact reranking (+n×d×2 bytes)
                              #            "f32" = float32 exact reranking (+n×d×4 bytes)
+                             #            "disabled"/"dequant" = no extra storage (legacy)
     collection=None,         # str|None — subdirectory name for the collection; if given,
                              #            the DB is stored at path/collection/ instead of path/
     normalize=False,         # bool — L2-normalize every inserted vector and every query at
@@ -77,61 +80,66 @@ TurboQuantDB exposes the same two-stage MSE + residual-QJL layout through two qu
 
 These two parameters work together and must be understood as a pair:
 
-| `fast_mode` | `rerank` | What happens | Recall impact |
-|-------------|----------|--------------|---------------|
-| `False` (default) | `True` (default) | QJL residual stored; dequantize() uses MSE + QJL to rerank top candidates | **Best at d ≥ 1536** — recommended |
-| `False` | `False` | QJL residual stored; initial scoring includes QJL contribution but no rerank step | Modest gain over fast_mode=True at d ≥ 1536 |
-| `True` | `False` | No QJL stored; MSE-only scoring | Paper Figure 5 baseline; ~30% faster ingest; best at d < 1536 |
-| `True` | `True` | No QJL stored; rerank is a no-op (dequantize returns MSE-only) | Same as above — adds latency for no gain |
+| `fast_mode` | `rerank` | Storage | Recall impact |
+|-------------|----------|---------|---------------|
+| `True` (default) | `True` (default) | MSE codes + INT8 raw vectors | **Best at d < 1536** — recommended default |
+| `False` | `True` | MSE+QJL codes + INT8 raw vectors | **Best at d ≥ 1536** — QJL adds +3–8 pp vs fast_mode=True |
+| `True` | `False` | MSE codes only | Paper Figure 5 baseline; minimum disk |
+| `False` | `False` | MSE+QJL codes only | Modest recall gain over fast_mode=True at d ≥ 1536 |
 
-**Rule:** `rerank=True` only improves recall when `fast_mode=False`. With `fast_mode=True`, `rerank=True` adds latency but provides no recall benefit — set `rerank=False` in that case.
+**`rerank=True`** stores per-vector-scaled INT8 vectors by default for exact second-pass rescoring. The quantized pass pre-selects `rerank_factor × top_k` candidates; exact dot products on the dequantized INT8 vectors then re-rank to the final `top_k`. This consistently improves R@1 by +5–25 pp depending on dimension and bits, at ~2× lower disk cost than F16.
 
-**Dimensional note:** `fast_mode=False` stores 1-bit QJL projections and incorporates them into scoring. At high dimensionality (d ≥ 1536), enough projection bits accumulate to provide a strong signal; recall equals or slightly exceeds `fast_mode=True`. At lower dimensionality (d < 512), the 1-bit projections are too noisy and **reduce** recall below the MSE-only baseline. For d < 512, use `fast_mode=True, rerank=False` to get the best recall.
+**`fast_mode=False`** adds 1-bit QJL residual codes on top of MSE codes. At d < 512, the projections are too noisy and reduce recall. At d ≥ 1536, enough bits accumulate to add meaningful signal — gains +5–10 pp R@1 when `rerank=False`. When `rerank=True`, the QJL residuals provide secondary benefit since f16 re-scoring dominates.
 
 ---
 
 ## Recommended Presets
 
-Unless stated otherwise, the presets below use the default `fast_mode=False, rerank=True` (QJL reranking enabled — best recall) and `quantizer_type=None/"dense"` path.
+See [`docs/CONFIGURATION.md`](CONFIGURATION.md) for a full decision guide with storage estimates and scenario presets.
 
-### High Quality — float16 rerank, highest recall
+### Default — best recall (recommended)
 
 ```python
-db = Database.open(path, dimension=DIM, bits=4, rerank=True, rerank_precision="f16")
-db.create_index(max_degree=32, ef_construction=200, n_refinements=8)
-results = db.search(query, top_k=10, ann_search_list_size=200)
-# Note: rerank_precision="f16" stores raw float16 vectors (+n×d×2 bytes).
-# Disk and recall figures for this config are not currently tracked in the benchmark suite.
+db = Database.open(path, dimension=DIM, bits=4)
+# rerank=True → INT8 raw vectors stored (default); fast_mode=True (MSE-only)
+results = db.search(query, top_k=10)
+# GloVe-200 (d=200):     R@1 ≈ 1.00  |  ~20 MB disk
+# arXiv-768 (d=768):     R@1 ≈ 0.99  |  ~74 MB disk
+# DBpedia-1536 (d=1536): R@1 ≈ 0.95  |  ~149 MB disk
 ```
 
-### Balanced — default recommendation
+### Best recall, high-d (d ≥ 1536)
 
 ```python
-db = Database.open(path, dimension=DIM, bits=4, rerank=True)
-db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
-results = db.search(query, top_k=10, ann_search_list_size=200)
-# 96.2% Recall@1, 100% Recall@4 at 100k×1536  |  108 MB disk  |  ~14ms p50 (ANN) / ~48ms (brute+dequant)
-```
-
-### Paper-faithful dense mode — research / comparison
-
-```python
-db = Database.open(path, dimension=DIM, bits=4, rerank=True, quantizer_type="dense")
+db = Database.open(path, dimension=1536, bits=4, fast_mode=False)
+# QJL residuals provide +3–8 pp R@1 vs fast_mode=True at d≥1536
 results = db.search(query, top_k=10)
 ```
 
-`quantizer_type="dense"` is the default. Use `quantizer_type="srht"` if you need faster O(d log d) ingest at high d and can accept a small recall trade-off.
-
-### Fast Build — ingest speed is priority
+### Minimum disk — compressed codes only
 
 ```python
-db = Database.open(path, dimension=DIM, bits=4, fast_mode=True, rerank=False)
-db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
-results = db.search(query, top_k=10, ann_search_list_size=200)
-# ~96% Recall@10 at 100k×1536  |  108 MB disk  |  8ms p50
+db = Database.open(path, dimension=DIM, bits=4, rerank=False)
+# No raw vectors stored; ~4–7× less disk than rerank=True
 ```
 
-*Benchmarked at 100,000 vectors, dim=1536, DBpedia OpenAI3 embeddings, brute-force ground truth. Default mode is `quantizer_type="dense"` (Haar-uniform QR). Use `quantizer_type="srht"` for streaming/frequent-ingest workloads.*
+### Low latency at scale — HNSW index
+
+```python
+db = Database.open(path, dimension=DIM, bits=4)
+db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
+results = db.search(query, top_k=10, _use_ann=True, rerank_factor=20)
+# p50 < 10ms at N=100k; R@1 ~2–5 pp below brute-force
+```
+
+### Fast ingest, high-dimensional
+
+```python
+db = Database.open(path, dimension=1536, bits=4, rerank=False, quantizer_type="srht")
+# 4,000–7,000 vps vs 2,000 vps for dense; O(d log d) rotation
+```
+
+*Full benchmark data for all 32 config × 4 dataset combinations: run `python benchmarks/full_config_bench.py --full` — results appear in `benchmarks/_full_config_report.md`.*
 
 ---
 
@@ -236,6 +244,9 @@ results = db.search(
     ann_search_list_size=None,   # int | None — HNSW ef_search (default: max_degree × 2)
     include=None,                # list[str] | None — fields to return; default all
                                  #   valid values: "id", "score", "metadata", "document"
+    rerank_factor=None,          # int | None — rerank oversampling multiplier (requires rerank=True)
+                                 #   default: 10 (brute-force), 20 (ANN)
+                                 #   top (rerank_factor × top_k) candidates are re-scored exactly
 )
 # Returns list of dicts: {"id": str, "score": float, "metadata": dict, "document": str | None}
 ```
@@ -243,6 +254,8 @@ results = db.search(
 With `_use_ann=None` (default), the planner auto-selects: ANN if an index exists, N ≥ 10k, and delta < 20% of N; otherwise brute-force. Pass `_use_ann=True` to force ANN (requires `create_index()` first) or `_use_ann=False` to force brute-force.
 
 `ann_search_list_size` trades recall for latency — higher values find better results but take longer. Values between 64 and 256 cover the practical range.
+
+`rerank_factor` follows the industry convention (Qdrant `oversampling`, LanceDB `refine_factor`). Higher values improve recall at the cost of exact re-score latency. Useful when `top_k` is small (1–10) and precision is critical.
 
 ### Batch query
 
@@ -255,6 +268,7 @@ all_results = db.query(
     where_filter=None,           # dict | None
     _use_ann=None,               # None=auto, True=force ANN, False=force brute-force (same semantics as search())
     ann_search_list_size=None,
+    rerank_factor=None,          # int | None — same semantics as search(); default 10 (brute) / 20 (ANN)
 )
 # Returns list[list[dict]] — one inner list per query vector
 ```
@@ -372,7 +386,7 @@ retriever = TurboQuantRetriever(
     bits=4,                 # int — quantization bits (any int >= 2; common: 2, 4, 8)
     seed=42,                # int — RNG seed
     metric="ip",            # str — "ip", "cosine", or "l2"
-    rerank_precision=None,  # str|None — None (dequant), "f16", or "f32"
+    rerank_precision=None,  # str|None — None (→ "int8"), "int8", "int4", "f16", "f32", "disabled"
 )
 ```
 
@@ -478,7 +492,7 @@ tbl.optimize()   # no-op; tqdb handles compaction automatically
 ├── manifest.json        — DB config (dimension, bits, seed, metric)
 ├── quantizer.bin        — Serialized quantizer state
 ├── live_codes.bin       — Memory-mapped quantized vectors (hot path)
-├── live_vectors.bin     — Raw vectors for exact reranking (only if rerank_precision="f16" or "f32")
+├── live_vectors.bin     — Raw vectors for exact reranking (only if rerank=True; precision set by rerank_precision)
 ├── wal.log              — Write-ahead log (crash recovery)
 ├── metadata.bin         — Per-vector metadata and documents
 ├── live_ids.bin         — ID → slot index
