@@ -6,19 +6,45 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
-## [0.5.1] — 2026-04-11
+## [0.5.1] — 2026-04-12
 
 ### Added
 
+- **INT8/INT4 quantized rerank** — `rerank=True` now stores compressed INT8 (default) or INT4 raw vectors for exact second-pass rescoring. INT8 uses per-vector scale factors (~75% less disk than f32); INT4 packs two values per byte (~87% less disk). Select via `rerank_precision="int8"` (default) or `"int4"`. For exact rescoring without quantization use `rerank_precision="f16"`.
 - **`rerank_factor` at search time** — `db.search()` and `db.query()` now accept a `rerank_factor` parameter (integer multiplier). Controls how many over-sampled candidates are re-scored when `rerank=True`. Defaults: 10× for brute-force, 20× for ANN. Follows the industry pattern of Qdrant's `oversampling` and LanceDB's `refine_factor`.
-- **`rerank_precision` defaults to `"int8"`** — When `rerank=True` and no explicit `rerank_precision` is provided, raw vectors are stored as per-vector-scaled INT8 (~75% less disk than f32, same R@1 as f16 for inner-product search). Previously defaulted to dequantization-only, which produced zero recall improvement for the inner-product metric. Use `rerank_precision="f16"` for exact rescoring without quantization.
+- **`rerank_precision` defaults to `"int8"`** — When `rerank=True` and no explicit `rerank_precision` is provided, raw vectors are stored as per-vector-scaled INT8 (~75% less disk than f32, same R@1 as f16 for inner-product search). Use `rerank_precision="f16"` for exact rescoring without quantization.
+- **Config Advisor** — interactive web tool at [jyunming.github.io/TurboQuantDB/advisor.html](https://jyunming.github.io/TurboQuantDB/advisor.html). Selects the best `bits` / `rerank` / `fast_mode` / ANN combination for a given embedding dimension and use case (RAG, search-at-scale, edge deployment, etc.). Scored against real benchmark data with adjustable priority weights for recall, compression, and speed.
+- **`tqdb-server` bundled in wheel** — `pip install tqdb` now ships the pre-built server binary at `tqdb/_bin/tqdb-server[.exe]`. The `tqdb-server` console script launches it directly. CI builds and embeds the binary for Linux x86_64, Windows x86_64, and macOS (x86_64 + arm64).
 - **`docs/CONFIGURATION.md`** — new comprehensive configuration guide covering all parameter dimensions (`bits`, `fast_mode`, `rerank`, `rerank_factor`, `quantizer_type`, ANN vs brute-force), recommended presets for 6 common scenarios, storage estimation formulas, and a decision flowchart.
-- **`benchmarks/full_config_bench.py`** — exhaustive 32-config × 4-dataset benchmark script. Runs all combinations of bits × rerank × ann × fast_mode × quantizer_type across GloVe-200, arXiv-768, DBpedia-1536, and DBpedia-3072. Generates recall curves, trade-off scatter plots, and a data-driven guidance report (`benchmarks/_full_config_report.md`, gitignored).
+- **`benchmarks/full_config_bench.py`** — exhaustive 32-config × 4-dataset benchmark script. Runs all combinations of bits × rerank × ann × fast_mode × quantizer_type across GloVe-200, arXiv-768, DBpedia-1536, and DBpedia-3072. Generates recall curves, trade-off scatter plots, and a data-driven guidance report.
+- **ChromaDB compat — embeddings retrieval** — `collection.get(include=["embeddings"])` and `collection.query(include=["embeddings"])` now return the original float32 vectors, stored in a thread-safe side-car `.npz` file alongside the tqdb database.
+- **ChromaDB compat — `collection.id` / `collection.metadata`** — `CompatCollection` now exposes a stable UUID5 `id` property and a `metadata` property loaded from `_chroma_meta.json`.
+- **ChromaDB compat — `client.heartbeat()`** — returns current time in nanoseconds, matching `chromadb.PersistentClient.heartbeat()`.
+- **ChromaDB compat — `list_collections()` returns objects** — now returns `CollectionInfo` objects with `.name`, `.id`, and `.metadata` attributes instead of plain strings.
+- **LanceDB compat — `__len__`, `schema`, `head(n)`, `to_list()`** — `CompatTable` now supports `len(tbl)`, `.schema` (PyArrow schema inferred from stored data), `.head(n)` (first n rows as Arrow Table), and `.to_list()`.
+- **LanceDB compat — `search(None)` full-table scan** — `tbl.search(None).to_list()` performs a full-table scan, matching real LanceDB behaviour.
+- **LanceDB compat — `update(where, values)`** — updates metadata/vector/document for rows matching a SQL WHERE clause. Handles `id = 'x'` as a direct primary-key lookup.
+- **LanceDB compat — `merge_insert()`** — fluent builder supporting `when_matched_update_all()` / `when_not_matched_insert_all()` / `execute(data)`.
+- **LanceDB compat — vector column in `to_pandas()` / `to_arrow()`** — original float32 vectors are now included via thread-safe `_VecStore` side-car.
+- **LangChain RAG — full interface** — `TurboQuantRetriever` now implements: `get_relevant_documents()` (legacy BaseRetriever), `invoke()` (LCEL Runnable), `similarity_search_with_score()`, `filter=` kwarg on `similarity_search()`, `from_texts()` classmethod (accepts callable or pre-computed vectors), `delete(ids)`, `as_retriever()`, and `add_documents(List[Document])`.
+- **LangChain RAG — `Document` return type** — `similarity_search()` now returns `List[Document]` with `.page_content` and `.metadata` attributes. `Document` is imported from `langchain_core` / `langchain` when available, or defined inline as a stub.
 
 ### Fixed
 
 - **Rerank no-op bug** — `rerank=True` with `rerank_precision=None` previously resolved to `Disabled` (dequantization-only). For the IP metric, dequantized scores are mathematically identical to the LUT scores, so rerank had zero effect. Now defaults to `INT8` exact re-scoring, giving +5–25 pp R@1 depending on dataset and bits.
-- **`release.yml` update-docs job** — replaced branch+PR dance with a direct `git push origin HEAD:main`. GitHub Actions cannot create pull requests in this repository (`Allow GitHub Actions to create and approve pull requests` is off), causing the previous job to fail on every release.
+- **Server: `scoped_collection_dir` wrong path** — the server was prepending `tenants/.../databases/.../collections/` to collection paths; actual storage is flat under `{root}/{tenant}/{database}/{collection}`. Fixed to use the correct path, resolving 404/500 errors in multi-tenant collection operations.
+- **Server: L2 score sign at API boundary** — L2 distances were returned as positive values; now negated at the response boundary so lower-is-better semantics are preserved in the JSON response.
+- **ChromaDB compat — BUG-C7** — `collection.get(ids=[])` now returns empty (explicit empty list = no results). Previously, an empty list was falsy and triggered a full-table scan.
+- **ChromaDB compat — BUG-C8** — `collection.modify(name=...)` now physically renames the collection directory, making the new name visible to `list_collections()`. Previously only updated `self._name` in memory.
+- **`release.yml` update-docs job** — replaced branch+PR dance with a direct `git push origin HEAD:main`. GitHub Actions cannot create pull requests in this repository, causing the previous job to fail on every release.
+- **Docs: stale defaults** — CHANGELOG v0.5.0 incorrectly stated `fast_mode=False` as the default; v0.5.1 incorrectly stated `rerank_precision` defaults to `"f16"`. Both corrected to match the actual code defaults (`fast_mode=True`, `rerank_precision="int8"`). `src/python/mod.rs` docstring updated to reflect `int8` (was `f32`).
+- **README: benchmark section** — "Default config" label replaced with "Benchmark config" and `fast_mode` corrected to `True`, matching `docs/BENCHMARKS.md` and the actual bench runner.
+
+### Documentation
+
+- **README: Config Advisor** — new section with badge linking to the interactive Config Advisor.
+- **README: benchmark tables** — added bit-sweep table ("Rerank unlocks recall at any bit depth") and dimension-scaling table (R@1 ≥ 0.87 across d=65–3072).
+- **README: Recommended Setup** — updated disk estimates to reflect INT8 rerank storage (~30/116/231 MB for GloVe-200/arXiv-768/DBpedia-1536).
 
 ---
 
