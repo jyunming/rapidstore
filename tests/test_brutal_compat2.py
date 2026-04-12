@@ -111,14 +111,14 @@ class TestChromaAPIGaps:
         assert len(r["embeddings"][0]) == 1
         assert abs(r["embeddings"][0][0][0] - emb[0]) < 1e-4
 
-    def test_list_collections_returns_collection_objects(self, tmp_path):
+    def test_list_collections_returns_sorted_strings(self, tmp_path):
         c = _chroma_client(tmp_path)
         c.get_or_create_collection("alpha")
         c.get_or_create_collection("beta")
         cols = c.list_collections()
-        # real ChromaDB: each element has .name, .id, .metadata
-        assert hasattr(cols[0], "name")
-        assert hasattr(cols[0], "id")
+        # chromadb ≥ 1.5: list_collections() returns sorted list of name strings
+        assert cols == ["alpha", "beta"]
+        assert all(isinstance(n, str) for n in cols)
 
 
 # ===========================================================================
@@ -166,7 +166,7 @@ class TestChromaEdgeCases:
         col = c.get_or_create_collection("old_name")
         col.modify(name="new_name")
         cols = c.list_collections()
-        col_names = [ci.name for ci in cols]
+        col_names = list(cols)
         assert "new_name" in col_names
         assert "old_name" not in col_names
 

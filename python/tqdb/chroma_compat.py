@@ -543,6 +543,8 @@ class CompatCollection:
                     "Delete and recreate the collection."
                 )
         if name is not None and name != self._name:
+            # Validate before computing new path to prevent path traversal.
+            _validate_collection_name(name)
             # BUG-C8: rename the underlying directory so the change is durable
             self._db = None  # release open handles before rename
             parent = os.path.dirname(self._path)
@@ -643,9 +645,9 @@ class CompatClient:
             raise ValueError(f"Collection '{name}' not found.")
         shutil.rmtree(self._collection_dir(name))
 
-    def list_collections(self) -> List[CollectionInfo]:
-        """Return a list of :class:`CollectionInfo` objects (one per collection)."""
-        infos = []
+    def list_collections(self) -> List[str]:
+        """Return a sorted list of collection names (mirrors chromadb ≥ 1.5 API)."""
+        names = []
         for entry in sorted(os.scandir(self._path), key=lambda e: e.name):
             if not entry.is_dir():
                 continue
@@ -657,11 +659,8 @@ class CompatClient:
                     info = json.load(f)
             except Exception:
                 info = {}
-            col_name = info.get("name", entry.name)
-            col_metadata = info.get("metadata")
-            col_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "tqdb:" + os.path.abspath(entry.path)))
-            infos.append(CollectionInfo(name=col_name, id=col_id, metadata=col_metadata))
-        return infos
+            names.append(info.get("name", entry.name))
+        return names
 
     def count_collections(self) -> int:
         return len(self.list_collections())
@@ -673,10 +672,13 @@ class CompatClient:
 
     def reset(self) -> None:
         """Delete all collections under this path."""
-        for info in self.list_collections():
-            col_dir = self._collection_dir(info.name)
-            if os.path.exists(col_dir):
-                shutil.rmtree(col_dir)
+        # Iterate directory entries directly (not metadata-provided names) so
+        # reset() is robust against metadata corruption or name divergence.
+        if not os.path.isdir(self._path):
+            return
+        for entry in os.scandir(self._path):
+            if entry.is_dir():
+                shutil.rmtree(entry.path, ignore_errors=True)
 
 
 def PersistentClient(path: str, **_kwargs) -> CompatClient:
