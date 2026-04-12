@@ -28,7 +28,7 @@ cargo build --release
 
 ### Health
 - `GET /healthz`
-- `GET /metrics` — Prometheus text metrics (no auth required)
+- `GET /metrics` — Prometheus text metrics (requires `Authorization: ApiKey <key>`)
 - `GET/POST /v1/tenants/:tenant/databases/:database/collections`
 - `DELETE /v1/tenants/:tenant/databases/:database/collections/:collection`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/add`

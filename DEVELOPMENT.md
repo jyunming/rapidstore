@@ -67,7 +67,7 @@ python benchmarks/compare_quantizers_paper.py
 ## Sprint / PR workflow
 
 One PR per sprint. All issues for a sprint go onto a single branch (e.g. `feat/v0.5-sprint`)
-and are merged via one PR. See `CLAUDE.md` for the full workflow.
+and are merged via one PR. See `CONTRIBUTING.md` for the full workflow.
 
 ## Git identity
 
