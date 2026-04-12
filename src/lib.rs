@@ -37,13 +37,16 @@
 //! - **Embedded** (`tqdb` Python package) — runs in-process, no server needed.
 //! - **Server** (`server/` workspace) — Axum HTTP service with multi-tenancy, RBAC, quotas.
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 pub mod linalg;
+#[cfg(feature = "python")]
 pub mod python;
 pub mod quantizer;
 pub mod storage;
 
+#[cfg(feature = "python")]
 #[pymodule]
 fn tqdb(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     python::register(py, m)?;
