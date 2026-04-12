@@ -575,13 +575,24 @@ impl Database {
             )));
         }
         if let Some(rf) = rerank_factor {
-            if rf == 0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "rerank_factor must be >= 1",
-                ));
+            if !(1..=100).contains(&rf) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "rerank_factor must be between 1 and 100, got {}",
+                    rf
+                )));
             }
         }
-        let top_k = top_k as usize;
+        let top_k = usize::try_from(top_k).map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "top_k is too large to represent on this platform: {}",
+                top_k
+            ))
+        })?;
+        if let Some(rf) = rerank_factor {
+            top_k.checked_mul(rf).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("top_k * rerank_factor is too large")
+            })?;
+        }
         let q = extract_vec1d(py, &query)?;
         check_finite(&q.view(), "query vector")?;
         let parsed_filter = parse_pydict(filter)?;

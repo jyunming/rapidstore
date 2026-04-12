@@ -20,10 +20,20 @@ def main() -> None:
     for path in candidates:
         if os.path.isfile(path):
             os.execv(path, [path] + sys.argv[1:])
+
+    import platform
+    arch = platform.machine().lower()
+    extra = ""
+    if arch in ("aarch64", "arm64") and sys.platform.startswith("linux"):
+        extra = (
+            "\n\nNote: tqdb-server is not bundled for Linux aarch64 wheels.\n"
+            "Build it from source with:\n  cd server && cargo build --release"
+        )
     print(
         f"tqdb-server binary not found in expected locations:\n"
         + "\n".join(f"  {c}" for c in candidates)
-        + "\n\nBuild it with:\n  cd server && cargo build --release",
+        + "\n\nBuild it with:\n  cd server && cargo build --release"
+        + extra,
         file=sys.stderr,
     )
     sys.exit(1)

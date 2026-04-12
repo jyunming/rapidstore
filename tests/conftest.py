@@ -25,10 +25,12 @@ def pytest_configure(config):
     the system-temp permission issue without requiring --basetemp on every run.
     """
     if sys.platform == "win32":
-        repo_root = Path(__file__).parent.parent
-        basetemp = repo_root / "tmp_pytest"
-        basetemp.mkdir(exist_ok=True)
-        config.option.basetemp = str(basetemp)
+        # Only override basetemp when the user hasn't explicitly set it via --basetemp.
+        if not config.option.basetemp:
+            repo_root = Path(__file__).parent.parent
+            basetemp = repo_root / "tmp_pytest"
+            basetemp.mkdir(exist_ok=True)
+            config.option.basetemp = str(basetemp)
 
 
 @pytest.fixture(autouse=True)

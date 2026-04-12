@@ -149,14 +149,14 @@ class _VecStore:
         """Returns (ids: list[str], vecs: ndarray[float32] | None). Caller holds lock."""
         if not os.path.exists(self._path):
             return [], None
-        data = np.load(self._path, allow_pickle=True)
-        ids = data["ids"].tolist()
-        vecs = data["vecs"]
+        with np.load(self._path, allow_pickle=False) as data:
+            ids = data["ids"].tolist()
+            vecs = data["vecs"]
         return ids, vecs
 
     def _save(self, ids: list, vecs: np.ndarray) -> None:
         """Caller holds lock."""
-        np.savez(self._path, ids=np.array(ids, dtype=object), vecs=vecs.astype(np.float32))
+        np.savez(self._path, ids=np.asarray(ids, dtype=str), vecs=vecs.astype(np.float32))
 
     def add(self, new_ids: List[str], new_vecs: np.ndarray) -> None:
         """Upsert vectors — existing entries with the same IDs are replaced."""
@@ -645,9 +645,9 @@ class CompatClient:
             raise ValueError(f"Collection '{name}' not found.")
         shutil.rmtree(self._collection_dir(name))
 
-    def list_collections(self) -> List[str]:
-        """Return a sorted list of collection names (mirrors chromadb ≥ 1.5 API)."""
-        names = []
+    def list_collections(self) -> List["CollectionInfo"]:
+        """Return a sorted list of CollectionInfo objects (mirrors chromadb ≥ 0.4 API)."""
+        results = []
         for entry in sorted(os.scandir(self._path), key=lambda e: e.name):
             if not entry.is_dir():
                 continue
@@ -659,8 +659,11 @@ class CompatClient:
                     info = json.load(f)
             except Exception:
                 info = {}
-            names.append(info.get("name", entry.name))
-        return names
+            name = info.get("name", entry.name)
+            cid = info.get("id") or str(uuid.uuid5(uuid.NAMESPACE_URL, "tqdb:" + entry.path))
+            metadata = info.get("metadata")
+            results.append(CollectionInfo(name=name, id=cid, metadata=metadata))
+        return results
 
     def count_collections(self) -> int:
         return len(self.list_collections())

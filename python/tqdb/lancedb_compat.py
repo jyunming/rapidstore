@@ -169,12 +169,12 @@ class _VecStore:
         """Caller holds lock."""
         if not os.path.exists(self._path):
             return [], None
-        data = np.load(self._path, allow_pickle=True)
-        return data["ids"].tolist(), data["vecs"]
+        with np.load(self._path, allow_pickle=False) as data:
+            return data["ids"].tolist(), data["vecs"]
 
     def _save(self, ids: list, vecs: np.ndarray) -> None:
         """Caller holds lock."""
-        np.savez(self._path, ids=np.array(ids, dtype=object), vecs=vecs.astype(np.float32))
+        np.savez(self._path, ids=np.asarray(ids, dtype=str), vecs=vecs.astype(np.float32))
 
     def add(self, new_ids: List[str], new_vecs: np.ndarray) -> None:
         """Upsert: existing entries with same IDs are replaced."""

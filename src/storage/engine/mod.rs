@@ -674,6 +674,7 @@ impl TurboQuantEngine {
             }
             out.push(None);
         }
+        slots.sort_unstable(); // needed for dedup to catch non-adjacent duplicates
         slots.dedup(); // unique slots for metadata fetch
 
         if !slots.is_empty() {
