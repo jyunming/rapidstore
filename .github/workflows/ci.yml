@@ -29,6 +29,9 @@ jobs:
           RUSTFLAGS: "-D warnings"
         run: cargo check -q
 
+      - name: cargo check server (no Python features)
+        run: cargo check -q --manifest-path server/Cargo.toml
+
   python-smoke:
     name: Python smoke test
     runs-on: ubuntu-latest

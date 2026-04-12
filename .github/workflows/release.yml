@@ -96,11 +96,10 @@ jobs:
   # We build universal2 wheels (fat binary: x86_64 + aarch64) on macos-latest
   # so a single wheel covers both Apple Silicon and Intel Macs.
   #
-  # The server binary is compiled natively (no --target flag) to avoid a PyO3
-  # cross-compile detection bug: passing --target aarch64-apple-darwin on an
-  # aarch64 host triggers PyO3's cross-compile code path which fails to locate
-  # the Python framework, causing unresolved Python symbols at link time.
-  # The native binary is aarch64; Intel Mac users can build from source.
+  # The server binary is compiled natively (no --target flag).  PyO3 is
+  # feature-gated behind the "python" Cargo feature (default-enabled) and
+  # server/Cargo.toml uses default-features = false, so the server links
+  # without any Python C-API symbols.
   macos:
     name: macOS wheels (universal2, Python ${{ matrix.python-version }})
     runs-on: macos-latest

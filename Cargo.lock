@@ -1920,7 +1920,6 @@ dependencies = [
  "numpy",
  "object_store",
  "pyo3",
- "pyo3-build-config",
  "rand 0.8.5",
  "rand_distr",
  "rayon",
