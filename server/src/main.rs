@@ -1649,7 +1649,12 @@ async fn query_vectors(
                 .then(|| hits.iter().map(|h| h.id.clone()).collect()),
             scores: include_set
                 .contains("scores")
-                .then(|| hits.iter().map(|h| h.score).collect()),
+                .then(|| {
+                    let is_l2 = matches!(engine.metric, DistanceMetric::L2);
+                    hits.iter()
+                        .map(|h| if is_l2 { -h.score } else { h.score })
+                        .collect()
+                }),
             metadatas: include_set
                 .contains("metadatas")
                 .then(|| hits.iter().map(|h| h.metadata.clone()).collect()),
@@ -2758,12 +2763,11 @@ fn scoped_collection_dir(
     database: &str,
     collection: &str,
 ) -> PathBuf {
+    // Must match the path used by open_collection_scoped / engine storage layout:
+    // {local_root}/{tenant}/{database}/{collection}
     PathBuf::from(local_root)
-        .join("tenants")
         .join(tenant)
-        .join("databases")
         .join(database)
-        .join("collections")
         .join(collection)
 }
 
