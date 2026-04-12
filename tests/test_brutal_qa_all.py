@@ -1406,7 +1406,7 @@ class TestRAGRetriever:
         # Query with the exact embedding of doc 2
         results = r.similarity_search(embs[2], k=1)
         assert len(results) == 1
-        assert results[0]["text"] == "document_2"
+        assert results[0].page_content == "document_2"
 
     def test_nan_embedding_in_similarity_search_no_panic(self, tmp_path):
         from tqdb.rag import TurboQuantRetriever
@@ -6530,7 +6530,7 @@ class TestRagRetrieverDeep:
         r.add_texts(texts, vecs)
         results = r.similarity_search(vecs[0], k=1)
         assert len(results) == 1
-        assert results[0]["text"] == "Alpha"
+        assert results[0].page_content == "Alpha"
 
     def test_add_with_metadata(self, tmp_path):
         r = TurboQuantRetriever(str(tmp_path / "rag"), dimension=DIM, bits=4,
@@ -6539,7 +6539,7 @@ class TestRagRetrieverDeep:
                                   rand_vec(DIM, seed=1).tolist()],
                     metadatas=[{"src": "X"}, {"src": "Y"}])
         out = r.similarity_search(rand_vec(DIM, seed=0).tolist(), k=1)
-        assert out[0]["metadata"]["src"] == "X"
+        assert out[0].metadata["src"] == "X"
 
     def test_k_larger_than_corpus_returns_at_most_n(self, tmp_path):
         r = TurboQuantRetriever(str(tmp_path / "rag"), dimension=DIM, bits=4,
@@ -6555,8 +6555,7 @@ class TestRagRetrieverDeep:
         assert results == []
 
     def test_doc_store_loss_after_reopen(self, tmp_path):
-        """BUG-12 candidate: doc_store is in-memory; similarity_search returns
-        nothing after reopen even though the vector DB still has the data."""
+        """Documents are accessible after reopen: tqdb persists the document field."""
         r = TurboQuantRetriever(str(tmp_path / "rag"), dimension=DIM, bits=4,
                                 fast_mode=True)
         vecs = [rand_vec(DIM, seed=i).tolist() for i in range(3)]
@@ -6568,13 +6567,9 @@ class TestRagRetrieverDeep:
                                   fast_mode=True)
         assert len(r2.db) == 3  # Vector DB persisted
         results = r2.similarity_search(vecs[0], k=3)
-        # doc_store is empty after reopen → 0 results returned despite DB having data
+        # tqdb stores the document field persistently, so results survive reopen
         assert isinstance(results, list)
-        # Document the known gap: results will be empty
-        assert len(results) == 0, (
-            "BUG-12: similarity_search silently returns 0 results after reopen "
-            "because doc_store is not persisted to disk"
-        )
+        assert len(results) == 3
 
     def test_sequential_ids_across_add_calls(self, tmp_path):
         """Second add_texts call continues IDs from where first left off."""

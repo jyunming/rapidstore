@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import uuid
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -128,6 +129,117 @@ def _apply_filter(records: List[Dict[str, Any]], where: Dict[str, Any]) -> List[
 
 
 # ---------------------------------------------------------------------------
+# _VecStore — side-car float32 vector store
+# ---------------------------------------------------------------------------
+
+class _VecStore:
+    """
+    Persists original float32 vectors alongside the tqdb quantized store.
+    Required to implement Chroma's ``include=["embeddings"]`` API surface.
+    Stored as ``_vecs.npz`` in the collection directory.
+    Thread-safe via an internal lock.
+    """
+
+    def __init__(self, directory: str):
+        import threading
+        self._path = os.path.join(directory, "_vecs.npz")
+        self._lock = threading.Lock()
+
+    def _load(self):
+        """Returns (ids: list[str], vecs: ndarray[float32] | None). Caller holds lock."""
+        if not os.path.exists(self._path):
+            return [], None
+        data = np.load(self._path, allow_pickle=True)
+        ids = data["ids"].tolist()
+        vecs = data["vecs"]
+        return ids, vecs
+
+    def _save(self, ids: list, vecs: np.ndarray) -> None:
+        """Caller holds lock."""
+        np.savez(self._path, ids=np.array(ids, dtype=object), vecs=vecs.astype(np.float32))
+
+    def add(self, new_ids: List[str], new_vecs: np.ndarray) -> None:
+        """Upsert vectors — existing entries with the same IDs are replaced."""
+        with self._lock:
+            ids, vecs = self._load()
+            if ids:
+                new_id_set = set(new_ids)
+                keep_idx = [i for i, id_ in enumerate(ids) if id_ not in new_id_set]
+                ids = [ids[i] for i in keep_idx]
+                vecs = vecs[keep_idx] if (vecs is not None and len(keep_idx) > 0) else np.empty((0, new_vecs.shape[1]), dtype=np.float32)
+            else:
+                vecs = np.empty((0, new_vecs.shape[1]), dtype=np.float32)
+            all_ids = ids + list(new_ids)
+            all_vecs = np.concatenate([vecs, new_vecs.astype(np.float32)], axis=0)
+            self._save(all_ids, all_vecs)
+
+    def remove(self, del_ids: List[str]) -> None:
+        """Remove entries by ID."""
+        with self._lock:
+            ids, vecs = self._load()
+            if not ids or vecs is None:
+                return
+            del_set = set(del_ids)
+            keep_idx = [i for i, id_ in enumerate(ids) if id_ not in del_set]
+            if not keep_idx:
+                if os.path.exists(self._path):
+                    os.remove(self._path)
+                return
+            kept_ids = [ids[i] for i in keep_idx]
+            kept_vecs = vecs[keep_idx]
+            self._save(kept_ids, kept_vecs)
+
+    def get_by_ids(self, query_ids: List[str]) -> Dict[str, List[float]]:
+        """Return {id: vector_as_list} for each requested ID that exists."""
+        with self._lock:
+            ids, vecs = self._load()
+        if not ids or vecs is None:
+            return {}
+        id_to_row = {id_: i for i, id_ in enumerate(ids)}
+        result = {}
+        for id_ in query_ids:
+            if id_ in id_to_row:
+                result[id_] = vecs[id_to_row[id_]].tolist()
+        return result
+
+    def get_all(self) -> Dict[str, List[float]]:
+        """Return all stored vectors as {id: vector_as_list}."""
+        with self._lock:
+            ids, vecs = self._load()
+        if not ids or vecs is None:
+            return {}
+        return {id_: vecs[i].tolist() for i, id_ in enumerate(ids)}
+
+    def relocate(self, new_directory: str) -> None:
+        """Update the storage path after a directory rename."""
+        with self._lock:
+            self._path = os.path.join(new_directory, "_vecs.npz")
+
+
+# ---------------------------------------------------------------------------
+# CollectionInfo — returned by list_collections()
+# ---------------------------------------------------------------------------
+
+class CollectionInfo:
+    """Minimal collection info object matching chromadb ≥ 0.4 Collection interface."""
+
+    __slots__ = ("name", "id", "metadata")
+
+    def __init__(self, name: str, id: str, metadata: Optional[Dict[str, Any]] = None):
+        self.name = name
+        self.id = id
+        self.metadata = metadata
+
+    def __repr__(self) -> str:
+        return f"Collection(name={self.name!r}, id={self.id!r})"
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, CollectionInfo):
+            return self.id == other.id
+        return NotImplemented
+
+
+# ---------------------------------------------------------------------------
 # CompatCollection
 # ---------------------------------------------------------------------------
 
@@ -152,6 +264,7 @@ class CompatCollection:
         self._embedding_function = embedding_function
         self._db: Optional[Database] = None
         self._dim: Optional[int] = None
+        self._vec_store = _VecStore(path)
         # Load dim from manifest.json if the DB already exists
         manifest = os.path.join(path, "manifest.json")
         if os.path.exists(manifest):
@@ -207,6 +320,24 @@ class CompatCollection:
     def name(self) -> str:
         return self._name
 
+    @property
+    def id(self) -> str:
+        """Stable UUID5 derived from the collection's storage path."""
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, "tqdb:" + os.path.abspath(self._path)))
+
+    @property
+    def metadata(self) -> Optional[Dict[str, Any]]:
+        """Collection metadata as stored in ``_chroma_meta.json``."""
+        meta_path = os.path.join(self._path, "_chroma_meta.json")
+        if not os.path.exists(meta_path):
+            return None
+        try:
+            with open(meta_path) as f:
+                info = json.load(f)
+            return info.get("metadata")
+        except Exception:
+            return None
+
     def count(self) -> int:
         if not os.path.exists(os.path.join(self._path, "manifest.json")):
             return 0
@@ -233,6 +364,7 @@ class CompatCollection:
         metas = [_sanitize_metadata(m) if m else {} for m in (metadatas or [{}] * len(ids))]
         db = self._open_db(dim)
         db.insert_batch(ids, vecs, metas, documents, "insert")
+        self._vec_store.add(ids, vecs)
 
     def upsert(
         self,
@@ -254,6 +386,7 @@ class CompatCollection:
         metas = [_sanitize_metadata(m) if m else {} for m in (metadatas or [{}] * len(ids))]
         db = self._open_db(dim)
         db.insert_batch(ids, vecs, metas, documents, "upsert")
+        self._vec_store.add(ids, vecs)
 
     def update(
         self,
@@ -281,6 +414,7 @@ class CompatCollection:
         if emb_ids:
             vecs = np.asarray(emb_vecs, dtype=np.float32)
             db.insert_batch(emb_ids, vecs, emb_metas, emb_docs, "update")
+            self._vec_store.add(emb_ids, vecs)
 
     def delete(
         self,
@@ -290,6 +424,7 @@ class CompatCollection:
         db = self._open_db(None)
         if ids and not where:
             db.delete_batch(ids)
+            self._vec_store.remove(ids)
             return
         # Filter path: use list_ids for efficient Rust-side filtering
         if where:
@@ -299,6 +434,7 @@ class CompatCollection:
                 filter_ids = [fid for fid in filter_ids if fid in id_set]
             if filter_ids:
                 db.delete_batch(filter_ids)
+                self._vec_store.remove(filter_ids)
 
     def get(
         self,
@@ -313,11 +449,15 @@ class CompatCollection:
             if unknown:
                 raise ValueError(f"Unknown include fields: {unknown}. Valid: {_VALID_GET_INCLUDE}")
         if not os.path.exists(os.path.join(self._path, "manifest.json")):
-            return {"ids": [], "metadatas": [], "documents": []}
+            return {"ids": [], "metadatas": [], "documents": [], "embeddings": None}
         include_set = set(include or ["metadatas", "documents"])
         db = self._open_db(None)
 
-        if ids:
+        # BUG-C7: an explicitly-passed empty list means "return nothing";
+        # only fall back to full scan when ids is None (not provided at all).
+        if ids is not None and len(ids) == 0:
+            records = []
+        elif ids is not None and len(ids) > 0:
             records = [r for r in db.get_many(ids) if r is not None]
             if where:
                 records = _apply_filter(records, where)
@@ -331,10 +471,18 @@ class CompatCollection:
         if limit is not None:
             records = records[:limit]
 
+        result_ids = [r["id"] for r in records]
+
+        embeddings_out = None
+        if "embeddings" in include_set:
+            vec_map = self._vec_store.get_by_ids(result_ids)
+            embeddings_out = [vec_map.get(id_) for id_ in result_ids]
+
         return {
-            "ids": [r["id"] for r in records],
+            "ids": result_ids,
             "metadatas": [r.get("metadata") for r in records] if "metadatas" in include_set else None,
             "documents": [r.get("document") for r in records] if "documents" in include_set else None,
+            "embeddings": embeddings_out,
         }
 
     def query(
@@ -356,20 +504,25 @@ class CompatCollection:
         include_set = set(include or ["metadatas", "documents", "distances"])
         db = self._open_db(None)
 
-        all_ids, all_distances, all_metas, all_docs = [], [], [], []
+        all_ids, all_distances, all_metas, all_docs, all_embeddings = [], [], [], [], []
         for qvec in query_embeddings:
             q = np.asarray(qvec, dtype=np.float32)
             results = db.search(q, n_results, filter=where)
-            all_ids.append([r["id"] for r in results])
+            row_ids = [r["id"] for r in results]
+            all_ids.append(row_ids)
             all_distances.append([r["score"] for r in results])
             all_metas.append([r.get("metadata") for r in results])
             all_docs.append([r.get("document") for r in results])
+            if "embeddings" in include_set:
+                vec_map = self._vec_store.get_by_ids(row_ids)
+                all_embeddings.append([vec_map.get(id_) for id_ in row_ids])
 
         return {
             "ids": all_ids,
             "distances": all_distances if "distances" in include_set else None,
             "metadatas": all_metas if "metadatas" in include_set else None,
             "documents": all_docs if "documents" in include_set else None,
+            "embeddings": all_embeddings if "embeddings" in include_set else None,
         }
 
     def peek(self, limit: int = 10) -> Dict[str, Any]:
@@ -381,9 +534,6 @@ class CompatCollection:
         if os.path.exists(meta_path):
             with open(meta_path) as f:
                 info = json.load(f)
-        if name is not None:
-            info["name"] = name
-            self._name = name
         if metadata is not None:
             info["metadata"] = metadata
             new_metric = _parse_metric(metadata)
@@ -392,6 +542,20 @@ class CompatCollection:
                     "Cannot change metric after collection is created. "
                     "Delete and recreate the collection."
                 )
+        if name is not None and name != self._name:
+            # BUG-C8: rename the underlying directory so the change is durable
+            self._db = None  # release open handles before rename
+            parent = os.path.dirname(self._path)
+            new_path = os.path.join(parent, name)
+            os.rename(self._path, new_path)
+            self._path = new_path
+            self._name = name
+            self._vec_store.relocate(new_path)
+            info["name"] = name
+            meta_path = os.path.join(new_path, "_chroma_meta.json")
+        else:
+            if name is not None:
+                info["name"] = name
         with open(meta_path, "w") as f:
             json.dump(info, f)
 
@@ -479,20 +643,40 @@ class CompatClient:
             raise ValueError(f"Collection '{name}' not found.")
         shutil.rmtree(self._collection_dir(name))
 
-    def list_collections(self) -> List[str]:
-        return sorted(
-            entry.name
-            for entry in os.scandir(self._path)
-            if entry.is_dir() and os.path.exists(os.path.join(entry.path, "_chroma_meta.json"))
-        )
+    def list_collections(self) -> List[CollectionInfo]:
+        """Return a list of :class:`CollectionInfo` objects (one per collection)."""
+        infos = []
+        for entry in sorted(os.scandir(self._path), key=lambda e: e.name):
+            if not entry.is_dir():
+                continue
+            meta_file = os.path.join(entry.path, "_chroma_meta.json")
+            if not os.path.exists(meta_file):
+                continue
+            try:
+                with open(meta_file) as f:
+                    info = json.load(f)
+            except Exception:
+                info = {}
+            col_name = info.get("name", entry.name)
+            col_metadata = info.get("metadata")
+            col_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "tqdb:" + os.path.abspath(entry.path)))
+            infos.append(CollectionInfo(name=col_name, id=col_id, metadata=col_metadata))
+        return infos
 
     def count_collections(self) -> int:
         return len(self.list_collections())
 
+    def heartbeat(self) -> int:
+        """Return current time in nanoseconds (mirrors chromadb.Client.heartbeat())."""
+        import time
+        return int(time.time() * 1e9)
+
     def reset(self) -> None:
         """Delete all collections under this path."""
-        for name in self.list_collections():
-            shutil.rmtree(self._collection_dir(name))
+        for info in self.list_collections():
+            col_dir = self._collection_dir(info.name)
+            if os.path.exists(col_dir):
+                shutil.rmtree(col_dir)
 
 
 def PersistentClient(path: str, **_kwargs) -> CompatClient:
