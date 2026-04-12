@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Config Advisor — TurboQuantDB</title>
+    <meta name="description" content="Interactive tool to find the optimal TurboQuantDB configuration for your embedding dimension, top-k, and priorities.">
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        /* ── Advisor-specific styles ─────────────────────────────────── */
+        .advisor-hero { text-align: center; padding: 7rem 2rem 3rem; }
+        .advisor-hero h1 { font-size: clamp(2rem, 5vw, 3.2rem); font-weight: 800; margin-bottom: 1rem; }
+        .advisor-hero p  { color: var(--text-secondary); max-width: 600px; margin: 0 auto 2.5rem; font-size: 1.1rem; }
+
+        .advisor-grid {
+            display: grid;
+            grid-template-columns: 380px 1fr;
+            gap: 2rem;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 2rem 4rem;
+            align-items: start;
+        }
+        @media (max-width: 900px) { .advisor-grid { grid-template-columns: 1fr; } }
+
+        /* ── Controls panel ──────────────────────────────────────────── */
+        .controls-panel { display: flex; flex-direction: column; gap: 1.5rem; }
+
+        .control-card {
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 16px;
+            padding: 1.5rem;
+        }
+        .control-card h3 {
+            font-size: 0.8rem;
+            font-weight: 600;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--accent-primary);
+            margin-bottom: 1.2rem;
+        }
+
+        .dim-presets { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; }
+        .preset-btn {
+            padding: 0.3rem 0.75rem;
+            border-radius: 20px;
+            border: 1px solid rgba(255,255,255,0.15);
+            background: transparent;
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-family: var(--font-mono, 'JetBrains Mono', monospace);
+        }
+        .preset-btn:hover, .preset-btn.active {
+            border-color: var(--accent-primary);
+            color: var(--accent-primary);
+            background: rgba(99,102,241,0.1);
+        }
+
+        .dim-input-row { display: flex; align-items: center; gap: 0.75rem; }
+        .dim-input {
+            flex: 1;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 10px;
+            padding: 0.6rem 1rem;
+            color: var(--text-primary);
+            font-size: 1rem;
+            font-family: 'JetBrains Mono', monospace;
+            width: 100%;
+        }
+        .dim-input:focus { outline: none; border-color: var(--accent-primary); }
+        .dim-match { font-size: 0.78rem; color: var(--text-secondary); margin-top: 0.5rem; }
+        .dim-match span { color: var(--accent-primary); font-weight: 600; }
+
+        .topk-row { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+        .topk-btn {
+            flex: 1; min-width: 55px;
+            padding: 0.5rem;
+            border-radius: 10px;
+            border: 1px solid rgba(255,255,255,0.12);
+            background: transparent;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-align: center;
+        }
+        .topk-btn:hover, .topk-btn.active {
+            border-color: var(--accent-primary);
+            background: rgba(99,102,241,0.15);
+            color: var(--text-primary);
+        }
+        .topk-btn .topk-label { font-size: 0.7rem; color: var(--text-secondary); display: block; }
+
+        .priority-sliders { display: flex; flex-direction: column; gap: 1rem; }
+        .priority-row { display: flex; flex-direction: column; gap: 0.4rem; }
+        .priority-header { display: flex; justify-content: space-between; align-items: center; }
+        .priority-name { font-size: 0.9rem; font-weight: 600; }
+        .priority-pct {
+            font-size: 0.85rem;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--accent-primary);
+            min-width: 38px;
+            text-align: right;
+        }
+        .priority-desc { font-size: 0.75rem; color: var(--text-secondary); }
+        input[type=range].priority-slider {
+            width: 100%; accent-color: var(--accent-primary);
+            height: 4px; cursor: pointer;
+        }
+        .priority-total {
+            text-align: center; font-size: 0.78rem;
+            color: var(--text-secondary); margin-top: 0.5rem;
+        }
+        .priority-total.warn { color: #f59e0b; }
+
+        /* ── Results panel ───────────────────────────────────────────── */
+        .results-panel { display: flex; flex-direction: column; gap: 1.5rem; }
+
+        .result-header { display: flex; align-items: baseline; gap: 1rem; margin-bottom: 0.5rem; }
+        .result-rank-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-secondary); }
+
+        .result-card {
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 16px;
+            padding: 1.5rem;
+            transition: border-color 0.2s;
+        }
+        .result-card.top {
+            border-color: rgba(99,102,241,0.5);
+            background: rgba(99,102,241,0.06);
+        }
+
+        .result-config {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.05rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin-bottom: 0.3rem;
+        }
+        .result-config .tag {
+            display: inline-block;
+            background: rgba(99,102,241,0.2);
+            border-radius: 6px;
+            padding: 0.15rem 0.5rem;
+            font-size: 0.75rem;
+            margin-left: 0.5rem;
+            vertical-align: middle;
+            color: var(--accent-primary);
+        }
+        .result-dataset { font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 1rem; }
+
+        .result-metrics {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 0.75rem;
+        }
+        @media (max-width: 600px) { .result-metrics { grid-template-columns: repeat(2, 1fr); } }
+
+        .metric-box {
+            background: rgba(255,255,255,0.04);
+            border-radius: 10px;
+            padding: 0.75rem;
+            text-align: center;
+        }
+        .metric-value {
+            font-size: 1.3rem;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            line-height: 1.2;
+        }
+        .metric-value.good  { color: #4ade80; }
+        .metric-value.ok    { color: #facc15; }
+        .metric-value.warn  { color: #f87171; }
+        .metric-label { font-size: 0.7rem; color: var(--text-secondary); margin-top: 0.3rem; text-transform: uppercase; letter-spacing: 0.08em; }
+
+        .result-pip-row { display: flex; gap: 0.5rem; margin-top: 1rem; flex-wrap: wrap; }
+        .pip {
+            display: inline-flex; align-items: center; gap: 0.3rem;
+            background: rgba(255,255,255,0.06);
+            border-radius: 20px; padding: 0.25rem 0.75rem;
+            font-size: 0.75rem; color: var(--text-secondary);
+        }
+        .pip .dot { width: 6px; height: 6px; border-radius: 50%; }
+
+        /* ── Scatter plot ─────────────────────────────────────────────── */
+        .scatter-card {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.07);
+            border-radius: 16px;
+            padding: 1.25rem 1.25rem 0.75rem;
+        }
+        .scatter-card h3 {
+            font-size: 0.8rem; font-weight: 600; letter-spacing: 0.1em;
+            text-transform: uppercase; color: var(--text-secondary);
+            margin-bottom: 1rem;
+        }
+        #scatter-svg { width: 100%; display: block; }
+
+        .loading-state {
+            display: flex; align-items: center; justify-content: center;
+            min-height: 200px; color: var(--text-secondary); font-size: 0.9rem;
+        }
+
+        .no-data { color: var(--text-secondary); text-align: center; padding: 3rem 1rem; }
+
+        /* ── Scenario picker ─────────────────────────────────────── */
+        .scenario-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.5rem;
+        }
+        .scenario-btn {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 0.2rem;
+            padding: 0.7rem 0.85rem;
+            border-radius: 10px;
+            border: 1px solid rgba(255,255,255,0.12);
+            background: rgba(255,255,255,0.06);
+            cursor: pointer;
+            text-align: left;
+            transition: all 0.18s;
+        }
+        .scenario-btn:hover {
+            border-color: rgba(99,102,241,0.55);
+            background: rgba(99,102,241,0.14);
+        }
+        .scenario-btn.active {
+            border-color: var(--accent-primary);
+            background: rgba(0,240,255,0.11);
+            box-shadow: 0 0 0 1px rgba(0,240,255,0.15);
+        }
+        .scenario-header {
+            display: flex;
+            align-items: center;
+            gap: 0.45rem;
+            margin-bottom: 0.2rem;
+        }
+        .scenario-icon { font-size: 1rem; line-height: 1; flex-shrink: 0; }
+        .scenario-name {
+            font-size: 0.82rem;
+            font-weight: 600;
+            color: #f1f5f9;
+        }
+        .scenario-desc {
+            font-size: 0.71rem;
+            color: #94a3b8;
+            line-height: 1.35;
+        }
+
+        /* ── Compact scatter (at top of results) ─────────────────── */
+        .scatter-card-compact {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.07);
+            border-radius: 14px;
+            padding: 1rem 1.1rem 0.6rem;
+        }
+        .scatter-card-compact h3 {
+            font-size: 0.72rem; font-weight: 600; letter-spacing: 0.1em;
+            text-transform: uppercase; color: var(--text-secondary);
+            margin-bottom: 0.6rem;
+        }
+        #scatter-svg { width: 100%; display: block; }
+    </style>
+</head>
+<body>
+    <div class="bg-glow bg-glow-1"></div>
+    <div class="bg-glow bg-glow-2"></div>
+
+    <nav class="navbar glass-panel">
+        <div class="nav-brand">
+            <a href="index.html" style="text-decoration:none;display:flex;align-items:center;gap:0.5rem;color:inherit">
+                <img src="favicon.svg" class="nav-logo" alt="TurboQuantDB logo">
+                <span class="logo-text">TurboQuant<span class="accent">DB</span></span>
+            </a>
+        </div>
+        <div class="nav-links">
+            <a href="index.html#features">Features</a>
+            <a href="index.html#quickstart">Quick Start</a>
+            <a href="index.html#ecosystem">Ecosystem</a>
+            <a href="advisor.html" style="color: var(--accent-primary)">Config Advisor</a>
+            <a href="https://github.com/jyunming/TurboQuantDB" class="btn btn-outline" target="_blank">GitHub</a>
+        </div>
+    </nav>
+
+    <section class="advisor-hero">
+        <div class="fade-in-up">
+            <div class="badge">Powered by real benchmark data</div>
+            <h1 class="hero-title">Find Your Optimal Config</h1>
+            <p>Tell us your embedding dimension, retrieval window, and what you care about most — we'll recommend the best TurboQuantDB configuration from our benchmark data.</p>
+        </div>
+    </section>
+
+    <div class="advisor-grid">
+        <!-- ── Controls ────────────────────────────────────────── -->
+        <div class="controls-panel fade-in-up">
+
+            <!-- Step 0: Scenario -->
+            <div class="control-card">
+                <h3>Quick Pick — Your Use Case</h3>
+                <p style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:1rem">Pick one and we'll set the priorities for you. Or skip to tune manually below.</p>
+                <div class="scenario-grid" id="scenario-grid">
+                    <button class="scenario-btn" data-scenario="rag">
+                        <div class="scenario-header"><span class="scenario-icon">🦜</span><span class="scenario-name">RAG / Chatbot</span></div>
+                        <span class="scenario-desc">Q&amp;A over docs, moderate dataset</span>
+                    </button>
+                    <button class="scenario-btn" data-scenario="search">
+                        <div class="scenario-header"><span class="scenario-icon">🔍</span><span class="scenario-name">Search at Scale</span></div>
+                        <span class="scenario-desc">1M+ vectors, need speed</span>
+                    </button>
+                    <button class="scenario-btn" data-scenario="laptop">
+                        <div class="scenario-header"><span class="scenario-icon">💻</span><span class="scenario-name">Laptop / Edge</span></div>
+                        <span class="scenario-desc">Limited RAM, storage matters</span>
+                    </button>
+                    <button class="scenario-btn" data-scenario="accuracy">
+                        <div class="scenario-header"><span class="scenario-icon">🎯</span><span class="scenario-name">Max Accuracy</span></div>
+                        <span class="scenario-desc">Research or high-precision retrieval</span>
+                    </button>
+                    <button class="scenario-btn" data-scenario="balanced">
+                        <div class="scenario-header"><span class="scenario-icon">⚖️</span><span class="scenario-name">Balanced</span></div>
+                        <span class="scenario-desc">General production use</span>
+                    </button>
+                    <button class="scenario-btn" data-scenario="ingest">
+                        <div class="scenario-header"><span class="scenario-icon">⚡</span><span class="scenario-name">Fast Ingest</span></div>
+                        <span class="scenario-desc">High write throughput first</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Step 1: Dimension -->
+            <div class="control-card">
+                <h3>Step 1 — Embedding Dimension</h3>
+                <div class="dim-presets" id="dim-presets">
+                    <button class="preset-btn" data-dim="96">96</button>
+                    <button class="preset-btn" data-dim="200">200</button>
+                    <button class="preset-btn" data-dim="256">256</button>
+                    <button class="preset-btn" data-dim="768">768</button>
+                    <button class="preset-btn" data-dim="1536">1536</button>
+                    <button class="preset-btn" data-dim="3072">3072</button>
+                </div>
+                <div class="dim-input-row">
+                    <input class="dim-input" id="dim-input" type="number" min="1" max="8192" value="768" placeholder="e.g. 1536">
+                </div>
+                <p class="dim-match" id="dim-match">Nearest benchmark dataset: <span>arxiv-768 (d=768)</span></p>
+            </div>
+
+            <!-- Step 2: Top-K -->
+            <div class="control-card">
+                <h3>Step 2 — Retrieval Window (top-k)</h3>
+                <div class="topk-row" id="topk-row">
+                    <button class="topk-btn" data-k="1" data-rk="1">top-1<span class="topk-label">exact NN</span></button>
+                    <button class="topk-btn" data-k="5" data-rk="4">top-5<span class="topk-label">R@4</span></button>
+                    <button class="topk-btn active" data-k="10" data-rk="8">top-10<span class="topk-label">R@8 ← RAG</span></button>
+                    <button class="topk-btn" data-k="20" data-rk="16">top-20<span class="topk-label">R@16</span></button>
+                    <button class="topk-btn" data-k="50" data-rk="32">top-50<span class="topk-label">R@32</span></button>
+                </div>
+            </div>
+
+            <!-- Step 3: Priorities -->
+            <div class="control-card">
+                <h3>Step 3 — What Matters Most</h3>
+                <div class="priority-sliders">
+                    <div class="priority-row">
+                        <div class="priority-header">
+                            <span class="priority-name">🎯 Recall</span>
+                            <span class="priority-pct" id="pct-recall">50%</span>
+                        </div>
+                        <p class="priority-desc">Higher recall = correct answer reliably in the retrieval window</p>
+                        <input type="range" class="priority-slider" id="slider-recall" min="0" max="100" value="50">
+                    </div>
+                    <div class="priority-row">
+                        <div class="priority-header">
+                            <span class="priority-name">💾 Compression</span>
+                            <span class="priority-pct" id="pct-compr">35%</span>
+                        </div>
+                        <p class="priority-desc">Higher compression = less disk at scale (100M vectors)</p>
+                        <input type="range" class="priority-slider" id="slider-compr" min="0" max="100" value="35">
+                    </div>
+                    <div class="priority-row">
+                        <div class="priority-header">
+                            <span class="priority-name">⚡ Speed</span>
+                            <span class="priority-pct" id="pct-speed">15%</span>
+                        </div>
+                        <p class="priority-desc">Higher speed = lower query latency (p50 ms)</p>
+                        <input type="range" class="priority-slider" id="slider-speed" min="0" max="100" value="15">
+                    </div>
+                </div>
+                <p class="priority-total" id="priority-total">Weights auto-normalized to 100%</p>
+            </div>
+        </div>
+
+        <!-- ── Results ─────────────────────────────────────────── -->
+        <div class="results-panel fade-in-up" id="results-panel">
+            <div class="loading-state" id="loading">Loading benchmark data…</div>
+        </div>
+    </div>
+
+    <script src="advisor.js"></script>
+</body>
+</html>

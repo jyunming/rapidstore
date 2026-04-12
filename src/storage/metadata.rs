@@ -31,8 +31,10 @@ fn value_to_index_key(v: &serde_json::Value) -> Option<String> {
 /// The encoding:
 /// - Positive numbers: flip the sign bit → u64 values that sort ascending.
 /// - Negative numbers: flip all bits → u64 values that sort ascending (most-negative first).
-/// - NaN maps to the same key as positive infinity; callers should treat NaN fields as
-///   non-indexed and let the scalar filter handle them.
+///
+/// Callers must pre-filter non-finite values (`is_finite()`) before calling this
+/// function; NaN produces different keys for different bit patterns and must never
+/// reach the range index.
 pub(crate) fn f64_to_ord(v: f64) -> u64 {
     let bits = v.to_bits();
     if bits >> 63 == 0 {
@@ -194,7 +196,9 @@ impl MetadataStore {
         let mut slots: Vec<u32> = iter.flat_map(|(_, v)| v.iter().copied()).collect();
         slots.sort_unstable();
         slots.dedup();
-        if slots.is_empty() { None } else { Some(slots) }
+        // Return Some even when empty: lets callers short-circuit to zero results
+        // without falling back to an O(n) full scan.
+        Some(slots)
     }
 
     pub fn clear(&mut self) {

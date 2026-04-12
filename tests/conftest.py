@@ -12,8 +12,23 @@ that Rust-side ``Drop`` impls release the mmap handles before cleanup.
 
 import gc
 import sys
+from pathlib import Path
 
 import pytest
+
+
+def pytest_configure(config):
+    """Redirect tmp_path basetemp to repo-local dir on Windows.
+
+    C:\\Users\\...\\AppData\\Local\\Temp\\pytest-of-<user> can become inaccessible
+    (WinError 5 – Access Denied) across sessions.  Using a repo-local dir avoids
+    the system-temp permission issue without requiring --basetemp on every run.
+    """
+    if sys.platform == "win32":
+        repo_root = Path(__file__).parent.parent
+        basetemp = repo_root / "tmp_pytest"
+        basetemp.mkdir(exist_ok=True)
+        config.option.basetemp = str(basetemp)
 
 
 @pytest.fixture(autouse=True)

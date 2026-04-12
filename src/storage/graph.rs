@@ -746,29 +746,26 @@ impl GraphManager {
                 }
             }
 
-            // Backlink: for each existing node that a new node linked to, add the new
+            // Backlink: for each node that a new node linked to, add the new
             // node as a neighbor (trimmed to degree_cap) so the graph remains bidirectional.
+            // This applies to both existing and new nodes so no one-way edges are left.
             for &new_node in &new_level_nodes {
                 for &nb in &adjacency[new_node as usize][l as usize].clone() {
-                    if (nb as usize) < existing_count {
-                        let nb_neighbors = &mut adjacency[nb as usize][l as usize];
-                        if !nb_neighbors.contains(&new_node) {
-                            nb_neighbors.push(new_node);
+                    let nb_neighbors = &mut adjacency[nb as usize][l as usize];
+                    if !nb_neighbors.contains(&new_node) {
+                        nb_neighbors.push(new_node);
+                        nb_neighbors.sort_unstable();
+                        if nb_neighbors.len() > degree_cap {
+                            // Score all neighbors and keep best degree_cap.
+                            let all: Vec<u32> = nb_neighbors.drain(..).collect();
+                            let mut scored = build_scorer(nb, &all);
+                            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+                            *nb_neighbors = scored
+                                .into_iter()
+                                .take(degree_cap)
+                                .map(|(id, _)| id)
+                                .collect();
                             nb_neighbors.sort_unstable();
-                            if nb_neighbors.len() > degree_cap {
-                                // Score all neighbors and keep best degree_cap.
-                                let all: Vec<u32> = nb_neighbors.drain(..).collect();
-                                let mut scored = build_scorer(nb, &all);
-                                scored.sort_by(|a, b| {
-                                    b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
-                                });
-                                *nb_neighbors = scored
-                                    .into_iter()
-                                    .take(degree_cap)
-                                    .map(|(id, _)| id)
-                                    .collect();
-                                nb_neighbors.sort_unstable();
-                            }
                         }
                     }
                 }

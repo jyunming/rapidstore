@@ -1,4 +1,4 @@
-# TurboQuantDB
+# <img src="https://raw.githubusercontent.com/jyunming/TurboQuantDB/main/website/favicon.svg" width="32" height="32" alt="" style="vertical-align:middle;margin-right:6px"> TurboQuantDB
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/jyunming/TurboQuantDB/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/tqdb)](https://pypi.org/project/tqdb/)
@@ -35,30 +35,44 @@ Building from source (Rust toolchain required): see [`DEVELOPMENT.md`](https://g
 
 ---
 
+## Config Advisor
+
+The **[interactive Config Advisor](https://jyunming.github.io/TurboQuantDB/advisor.html)** selects the best configuration for your embedding dimension and use case (RAG, search-at-scale, edge deployment, etc.), scored against real benchmark data with adjustable priority weights for recall, compression, and speed.
+
+[![Config Advisor](https://img.shields.io/badge/Config%20Advisor-Try%20it-4f46e5)](https://jyunming.github.io/TurboQuantDB/advisor.html)
+
+---
+
 ## Recommended Setup
 
-Default config: `fast_mode=False, rerank=True` — QJL residual stored and used during reranking for best recall **at d ≥ 1536**.
-
-> **Note:** At d < 512, QJL projections are too noisy and `fast_mode=False` reduces recall below the MSE-only baseline. Use `fast_mode=True, rerank=False` for d < 512.
+`rerank=True` stores raw INT8 vectors alongside compressed codes for exact second-pass rescoring. `fast_mode=True` (default) uses MSE-only quantization — optimal for d < 1536.
 
 ```python
 from tqdb import Database
 
-# High-d (d ≥ 1536) — default config, QJL reranking enabled
+# Best recall, any dimension — brute-force
+db = Database.open(path, dimension=DIM, bits=4, rerank=True)   # INT8 rerank storage
+results = db.search(query, top_k=10)
+# GloVe-200 (d=200):     R@1 ≈ 1.00  |  ~30 MB disk
+# arXiv-768 (d=768):     R@1 ≈ 0.98  |  ~116 MB disk
+# DBpedia-1536 (d=1536): R@1 ≈ 0.95  |  ~231 MB disk
+
+# Best recall, high-d (d ≥ 1536) — also enable QJL residuals
+db = Database.open(path, dimension=1536, bits=4, rerank=True, fast_mode=False)
+
+# Minimum disk — MSE codes only (library default, no extra vector storage)
 db = Database.open(path, dimension=DIM, bits=4)
-results = db.search(query, top_k=10)
-# 92.2% Recall@1, 99.9% Recall@4 at 100k×1536  |  108 MB disk
 
-# Low-d (d < 512) — MSE-only for best recall at low dimensions
-db = Database.open(path, dimension=DIM, bits=4, fast_mode=True, rerank=False)
-results = db.search(query, top_k=10)
-
-# Optional: build an HNSW index after bulk load for sub-10ms queries
+# Low latency at N ≥ 100k — HNSW index
+db = Database.open(path, dimension=DIM, bits=4, rerank=True)
 db.create_index()
-results = db.search(query, top_k=10, _use_ann=True)
+results = db.search(query, top_k=10, _use_ann=True)       # p50 < 10ms
+
+# Tune rerank oversampling at query time (default 10×)
+results = db.search(query, top_k=10, rerank_factor=20)    # higher recall, higher latency
 ```
 
-Full parameter reference: [`docs/PYTHON_API.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md)
+Full configuration guide: [`docs/CONFIGURATION.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/CONFIGURATION.md) | Python API: [`docs/PYTHON_API.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md)
 
 ---
 
@@ -90,8 +104,8 @@ db = Database.open(path, dimension, bits=4, seed=42, metric="ip",
                    rerank=True, fast_mode=False, rerank_precision=None,
                    collection=None, wal_flush_threshold=None,
                    quantizer_type=None)  # None/"dense" = default (Haar QR + Gaussian); "srht" = fast O(d log d) ingest
-# NOTE: rerank=True only improves recall when fast_mode=False (the default).
-#       With fast_mode=True, rerank=True adds latency but no recall gain.
+# NOTE: rerank=True stores raw f16 vectors for exact second-pass rescoring.
+#       rerank_factor (default 10× brute / 20× ANN) controls oversampling.
 
 # Write
 db.insert(id, vector, metadata=None, document=None)
@@ -134,7 +148,7 @@ db.search(query, top_k=5, filter={"$and": [{"topic": "ml"}, {"year": {"$gte": 20
 
 ## Benchmarks
 
-Three datasets, 100k vectors each, matching [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) Figure 5. Default config: `quantizer_type=None` (dense), `fast_mode=False, rerank=True` (QJL reranking enabled — best recall).
+Three datasets, 100k vectors each, matching [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) Figure 5. Benchmark config: `quantizer_type=None` (dense), `fast_mode=True, rerank=True` (MSE-only, matching paper Figure 5 bit allocation).
 
 ![Benchmark recall curves — TQDB vs paper](https://raw.githubusercontent.com/jyunming/TurboQuantDB/main/benchmarks/benchmark_plots.png)
 
@@ -148,6 +162,32 @@ Key results at 100k × d=1536 (DBpedia), brute-force, b=4, rerank=True:
 | p50 latency | ~51ms |
 
 Full tables (all 8 configs × 3 datasets), ANN guidance, and reproduction steps: **[docs/BENCHMARKS.md](https://github.com/jyunming/TurboQuantDB/blob/main/docs/BENCHMARKS.md)**
+
+### Rerank unlocks recall at any bit depth
+
+`bits=2, rerank=True` matches `bits=4, rerank=True` recall while using ~10% less disk, and outperforms `bits=4, rerank=False` at lower disk cost. (bit_sweep, n=10k, brute-force, fast_mode=True)
+
+| Dataset | b=2, no rerank | b=4, no rerank | b=2 + rerank | b=4 + rerank |
+|---------|---------------|---------------|-------------|-------------|
+| GloVe-200 (d=200) | 0.528 (1.8 MB) | 0.822 (2.3 MB) | **0.992** (3.8 MB) | **0.992** (4.2 MB) |
+| arXiv-768 (d=768) | 0.426 (7.4 MB) | 0.696 (9.2 MB) | **0.978** (14.7 MB) | **0.978** (16.6 MB) |
+| GIST-960 (d=960)  | 0.294 (10.4 MB) | 0.566 (12.7 MB) | **0.974** (19.6 MB) | **0.974** (21.9 MB) |
+
+### Coverage across d=65–3072
+
+R@1 ≥ 0.87 across all 9 benchmark datasets at b=4, rerank=True, brute-force, fast_mode=True, n=10k:
+
+| Dataset | d | R@1 | Disk | p50 |
+|---------|---|-----|------|-----|
+| lastfm-64 | 65 | 0.874 | 2.0 MB | 1.1 ms |
+| deep-96 | 96 | 0.980 | 2.5 MB | 1.2 ms |
+| glove-100 | 100 | 0.990 | 2.6 MB | 1.4 ms |
+| glove-200 | 200 | 0.992 | 4.2 MB | 1.7 ms |
+| nytimes-256 | 256 | 0.992 | 5.2 MB | 2.0 ms |
+| arXiv-768 | 768 | 0.978 | 16.6 MB | 7.6 ms |
+| GIST-960 | 960 | 0.974 | 21.9 MB | 7.3 ms |
+| DBpedia-1536 | 1536 | 0.998 | 41.1 MB | 10.3 ms |
+| DBpedia-3072 | 3072 | 1.000 | 117.0 MB | 46.8 ms |
 
 ---
 

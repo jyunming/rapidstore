@@ -367,7 +367,7 @@ class TestRerankPrecision:
     def test_f16_creates_correct_file_size(self, tmp_path):
         path = str(tmp_path / "db")
         n, d = 20, 64
-        db = Database.open(path, d, bits=4, rerank_precision="f16")
+        db = Database.open(path, d, bits=4, rerank=True, rerank_precision="f16")
         db.insert_batch([str(i) for i in range(n)], random_unit_vecs(n, d))
         size = os.path.getsize(os.path.join(path, "live_vectors.bin"))
         # mmap pre-allocates in GROW_SLOTS=16384 chunks; file is always a multiple of stride
@@ -376,7 +376,7 @@ class TestRerankPrecision:
     def test_f32_creates_correct_file_size(self, tmp_path):
         path = str(tmp_path / "db")
         n, d = 20, 64
-        db = Database.open(path, d, bits=4, rerank_precision="f32")
+        db = Database.open(path, d, bits=4, rerank=True, rerank_precision="f32")
         db.insert_batch([str(i) for i in range(n)], random_unit_vecs(n, d))
         size = os.path.getsize(os.path.join(path, "live_vectors.bin"))
         # mmap pre-allocates in GROW_SLOTS=16384 chunks; file is always a multiple of stride
@@ -410,7 +410,7 @@ class TestRerankPrecision:
 
     def test_invalid_precision_raises(self, tmp_path):
         with pytest.raises(Exception):
-            Database.open(str(tmp_path / "db"), 16, rerank_precision="int8")
+            Database.open(str(tmp_path / "db"), 16, rerank_precision="bf16")
 
 
 # ---------------------------------------------------------------------------
@@ -711,9 +711,8 @@ class TestTurboQuantRetrieverOps:
         assert isinstance(results, list)
         assert len(results) <= 3
         for r in results:
-            assert "text" in r, f"missing 'text' key in result: {r}"
-            assert "metadata" in r, f"missing 'metadata' key in result: {r}"
-            assert "score" in r, f"missing 'score' key in result: {r}"
+            assert hasattr(r, "page_content"), f"result is not a Document: {r}"
+            assert hasattr(r, "metadata"), f"result missing metadata: {r}"
 
     def test_similarity_search_result_text_is_original(self, tmp_path):
         """similarity_search results contain the original inserted text."""
@@ -730,7 +729,7 @@ class TestTurboQuantRetrieverOps:
         results = retriever.similarity_search(query, k=1)
 
         assert len(results) == 1
-        assert results[0]["text"] in texts
+        assert results[0].page_content in texts
 
     def test_similarity_search_empty_db_returns_empty(self, tmp_path):
         """similarity_search on an empty database returns an empty list."""
@@ -772,7 +771,7 @@ class TestTurboQuantRetrieverOps:
         query = embeddings[0]
         results = retriever.similarity_search(query, k=1)
         assert len(results) == 1
-        assert results[0]["metadata"].get("tag") == "important"
+        assert results[0].metadata.get("tag") == "important"
 
 class TestNewFilterOps:
     def test_in_operator(self, tmp_path):
@@ -1017,9 +1016,8 @@ class TestTurboQuantRetriever:
 
         assert len(results) == 3
         for r in results:
-            assert "text" in r
-            assert "metadata" in r
-            assert "score" in r
+            assert hasattr(r, "page_content"), f"result is not a Document: {r}"
+            assert hasattr(r, "metadata"), f"result missing metadata: {r}"
 
     def test_add_texts_with_metadata(self, tmp_path):
         from tqdb.rag import TurboQuantRetriever
@@ -1035,8 +1033,8 @@ class TestTurboQuantRetriever:
         retriever.add_texts(texts, embeddings, metadatas=metadatas)
 
         results = retriever.similarity_search(embeddings[1], k=1)
-        assert results[0]["text"] == "beta"
-        assert results[0]["metadata"]["tag"] == "b"
+        assert results[0].page_content == "beta"
+        assert results[0].metadata["tag"] == "b"
 
     def test_add_texts_without_metadata_defaults_empty(self, tmp_path):
         from tqdb.rag import TurboQuantRetriever
@@ -1050,7 +1048,7 @@ class TestTurboQuantRetriever:
         retriever.add_texts(texts, embeddings)  # no metadatas arg
 
         results = retriever.similarity_search(embeddings[0], k=1)
-        assert results[0]["metadata"] == {}
+        assert results[0].metadata == {}
 
     def test_multiple_add_texts_accumulates(self, tmp_path):
         from tqdb.rag import TurboQuantRetriever
@@ -1162,7 +1160,7 @@ class TestRecallQualityGate:
         """Default config (fast_mode=False, rerank=True) should match MSE-only recall.
 
         At d=64 with bits=4 the QJL residual has low precision; the default
-        config's recall should still be ≥70% (same gate as the bits=4 test).
+        config's recall should still be ≥55% (same gate as the bits=4 test).
         The gate is intentionally lenient — correctness, not peak quality.
         """
         rng = np.random.default_rng(7)

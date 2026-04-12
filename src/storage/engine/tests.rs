@@ -141,7 +141,7 @@ fn cosine_exhaustive_search_returns_ordered_results() {
 
     let query = Array1::from_vec(v_same);
     let results = e
-        .search_with_filter_and_ann(&query, 2, None, None, true)
+        .search_with_filter_and_ann(&query, 2, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
     // The "same" vector should score higher than "ortho"
@@ -160,7 +160,7 @@ fn cosine_zero_norm_vector_scores_zero() {
         .unwrap();
     let query = make_vec(d, 1.0);
     let results = e
-        .search_with_filter_and_ann(&query, 5, None, None, true)
+        .search_with_filter_and_ann(&query, 5, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
     assert_eq!(results[0].score, 0.0);
@@ -189,7 +189,7 @@ fn l2_exhaustive_search_returns_ordered_results() {
 
     let query = Array1::from_vec(v_close);
     let results = e
-        .search_with_filter_and_ann(&query, 2, None, None, true)
+        .search_with_filter_and_ann(&query, 2, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
     // L2 scores are negative distances; "close" should have a higher (less negative) score
@@ -214,7 +214,7 @@ fn ann_cosine_search_with_index_returns_results() {
     let mut q = vec![0.0f64; d];
     q[0] = 1.0;
     let results = e
-        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
+        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
     assert!(results.len() <= 5);
@@ -235,7 +235,7 @@ fn ann_l2_search_with_index_returns_results() {
     e.create_index_with_params(8, 32, 32, 1.2, 2).unwrap();
     let q = vec![0.0f64; d];
     let results = e
-        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
+        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
     assert!(results.len() <= 5);
@@ -250,7 +250,7 @@ fn search_top_k_zero_returns_empty() {
     let mut e = open_default(p, 8);
     e.insert("a".into(), &make_vec(8, 0.5), no_meta()).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(8, 0.5), 0, None, None, true)
+        .search_with_filter_and_ann(&make_vec(8, 0.5), 0, None, None, true, None)
         .unwrap();
     assert!(results.is_empty());
 }
@@ -261,7 +261,7 @@ fn search_empty_db_returns_empty() {
     let p = dir.path().to_str().unwrap();
     let e = open_default(p, 8);
     let results = e
-        .search_with_filter_and_ann(&make_vec(8, 0.5), 5, None, None, true)
+        .search_with_filter_and_ann(&make_vec(8, 0.5), 5, None, None, true, None)
         .unwrap();
     assert!(results.is_empty());
 }
@@ -277,7 +277,7 @@ fn search_filter_no_match_returns_empty() {
     let mut filter = no_meta();
     filter.insert("tag".into(), json!("b"));
     let results = e
-        .search_with_filter_and_ann(&make_vec(8, 0.5), 5, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(8, 0.5), 5, Some(&filter), None, true, None)
         .unwrap();
     assert!(results.is_empty());
 }
@@ -310,7 +310,7 @@ fn f16_rerank_precision_stores_and_retrieves_vectors() {
     e.insert("v1".into(), &Array1::from_vec(v.clone()), no_meta())
         .unwrap();
     let results = e
-        .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None, true)
+        .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None, true, None)
         .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, "v1");
@@ -344,7 +344,7 @@ fn f16_roundtrip_within_half_precision_tolerance() {
     e.insert("v1".into(), &Array1::from_vec(v.clone()), no_meta())
         .unwrap();
     let results = e
-        .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None, true)
+        .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None, true, None)
         .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, "v1");
@@ -357,6 +357,162 @@ fn f16_roundtrip_within_half_precision_tolerance() {
         results[0].score,
         expected
     );
+}
+
+#[test]
+fn int8_rerank_stores_and_retrieves_vectors() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 16;
+    let mut e = TurboQuantEngine::open_with_options(
+        p,
+        p,
+        d,
+        4,
+        42,
+        DistanceMetric::Ip,
+        true,
+        false,
+        RerankPrecision::Int8,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    let v: Vec<f64> = (1..=d).map(|i| i as f64 * 0.1).collect();
+    let expected: f64 = v.iter().map(|x| x * x).sum();
+    e.insert("v1".into(), &Array1::from_vec(v.clone()), no_meta())
+        .unwrap();
+    let results = e
+        .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None, true, None)
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, "v1");
+    // INT8 tolerance: relative error < 3% (127 levels; worst case for non-unit vectors)
+    let rel_err = (results[0].score - expected).abs() / expected;
+    assert!(
+        rel_err < 0.03,
+        "INT8 relative error {:.4} exceeds 0.03; score={:.4}, expected={:.4}",
+        rel_err,
+        results[0].score,
+        expected
+    );
+}
+
+#[test]
+fn int8_rerank_returns_correct_nearest_neighbour() {
+    // With INT8 rerank, the top-1 result should be the true NN despite quantization noise.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 32;
+    let mut e = TurboQuantEngine::open_with_options(
+        p,
+        p,
+        d,
+        4,
+        42,
+        DistanceMetric::Ip,
+        true,
+        true, // fast_mode — MSE only, INT8 rerank
+        RerankPrecision::Int8,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    let target: Vec<f64> = (0..d).map(|i| if i == 0 { 1.0 } else { 0.0 }).collect();
+    let other: Vec<f64> = (0..d).map(|i| if i == 1 { 1.0 } else { 0.0 }).collect();
+    let noise: Vec<f64> = (0..d).map(|i| if i == 2 { 1.0 } else { 0.0 }).collect();
+    e.insert(
+        "target".into(),
+        &Array1::from_vec(target.clone()),
+        no_meta(),
+    )
+    .unwrap();
+    e.insert("other".into(), &Array1::from_vec(other), no_meta())
+        .unwrap();
+    e.insert("noise".into(), &Array1::from_vec(noise), no_meta())
+        .unwrap();
+    let results = e
+        .search_with_filter_and_ann(&Array1::from_vec(target), 1, None, None, false, None)
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].id, "target",
+        "INT8 rerank should return exact match as top-1"
+    );
+}
+
+#[test]
+fn int4_rerank_stores_and_retrieves_vectors() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 16;
+    let mut e = TurboQuantEngine::open_with_options(
+        p,
+        p,
+        d,
+        4,
+        42,
+        DistanceMetric::Ip,
+        true,
+        false,
+        RerankPrecision::Int4,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    let v: Vec<f64> = (1..=d).map(|i| i as f64 * 0.1).collect();
+    let expected: f64 = v.iter().map(|x| x * x).sum();
+    e.insert("v1".into(), &Array1::from_vec(v.clone()), no_meta())
+        .unwrap();
+    let results = e
+        .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None, true, None)
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, "v1");
+    // INT4 tolerance: relative error < 20% (16 levels; coarser quantization)
+    let rel_err = (results[0].score - expected).abs() / expected;
+    assert!(
+        rel_err < 0.20,
+        "INT4 relative error {:.4} exceeds 0.20; score={:.4}, expected={:.4}",
+        rel_err,
+        results[0].score,
+        expected
+    );
+}
+
+#[test]
+fn int4_rerank_odd_dimension_packing() {
+    // Verify correct nibble packing/unpacking for odd dimension counts.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 9; // odd — last byte has only one valid nibble
+    let mut e = TurboQuantEngine::open_with_options(
+        p,
+        p,
+        d,
+        2,
+        42,
+        DistanceMetric::Ip,
+        true,
+        true,
+        RerankPrecision::Int4,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    let v: Vec<f64> = vec![0.5, -0.3, 0.8, -0.1, 0.6, -0.4, 0.2, -0.7, 0.9];
+    e.insert("v1".into(), &Array1::from_vec(v.clone()), no_meta())
+        .unwrap();
+    // Should not panic; search must return exactly 1 result.
+    let results = e
+        .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None, false, None)
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, "v1");
 }
 
 // ── Stats and disk bytes ───────────────────────────────────────────────
@@ -515,6 +671,7 @@ fn ann_search_returns_delta_vectors() {
             None,
             None,
             true,
+            None,
         )
         .unwrap();
     assert_eq!(results.len(), 1);
@@ -553,7 +710,7 @@ fn fast_mode_engine_creates_and_searches() {
         .unwrap();
     }
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 3, None, None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 3, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
     assert!(e.manifest.fast_mode);
@@ -620,7 +777,7 @@ fn disabled_rerank_search_returns_results() {
         e.insert(format!("v{i}"), &v, no_meta()).unwrap();
     }
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 3, None, None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 3, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
     assert!(!e.rerank_enabled);
@@ -763,7 +920,7 @@ fn l2_index_without_rerank_uses_dequantized_path() {
     assert!(e.stats().has_index);
     let q = vec![0.0f64; d];
     let results = e
-        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
+        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
 }
@@ -789,7 +946,7 @@ fn ann_search_with_metadata_filter() {
     filter.insert("cat".into(), json!("even"));
     let q = make_vec(d, 0.5);
     let results = e
-        .search_with_filter_and_ann(&q, 10, Some(&filter), None, true)
+        .search_with_filter_and_ann(&q, 10, Some(&filter), None, true, None)
         .unwrap();
     // All results should have cat=even
     for r in &results {
@@ -815,7 +972,7 @@ fn ann_search_filter_no_match_returns_empty() {
     let mut filter = no_meta();
     filter.insert("cat".into(), json!("z"));
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true, None)
         .unwrap();
     assert!(results.is_empty());
 }
@@ -871,7 +1028,7 @@ fn metadata_filter_comparison_operators() {
     let mut filter = no_meta();
     filter.insert("score".into(), json!({"$gte": 3}));
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true, None)
         .unwrap();
     assert!(!results.is_empty());
     for r in &results {
@@ -895,7 +1052,7 @@ fn metadata_filter_or_operator() {
     let filter: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"$or": [{"tag": {"$eq": "a"}}, {"tag": {"$eq": "b"}}]}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true, None)
         .unwrap();
     assert_eq!(results.len(), 2);
 }
@@ -998,7 +1155,7 @@ fn delete_triggers_wal_flush_at_threshold() {
     e.delete("v0".to_string()).unwrap();
     // Engine must remain functional after the flush
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None, true, None)
         .unwrap();
     assert!(results.len() <= 5);
 }
@@ -1018,7 +1175,7 @@ fn create_index_with_refinements() {
     // n_refinements = 2 exercises the refinement loop in graph.rs
     e.create_index_with_params(4, 16, 16, 1.2, 2).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
 }
@@ -1059,7 +1216,7 @@ fn f16_rerank_cosine_ann_index_covers_f16_build_scorer_paths() {
     let mut q = vec![0.0f64; d];
     q[0] = 1.0;
     let results = e
-        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
+        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
 }
@@ -1095,7 +1252,7 @@ fn f16_rerank_ip_ann_index_covers_f16_ip_build_scorer_path() {
     let mut q = vec![0.0f64; d];
     q[0] = 1.0;
     let results = e
-        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
+        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
 }
@@ -1133,7 +1290,7 @@ fn l2_ann_index_without_raw_vectors_uses_precomputed_l2_path() {
     e.create_index_with_params(8, 32, 32, 1.2, 1).unwrap();
     let q = Array1::from_vec(vec![0.0f64; d]);
     let results = e
-        .search_with_filter_and_ann(&q, 5, None, None, true)
+        .search_with_filter_and_ann(&q, 5, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
     // L2 scores are negative distances
@@ -1182,7 +1339,7 @@ fn l2_exhaustive_search_with_raw_f32_vectors_reranks_correctly() {
     // Exhaustive search (no ANN index) → exercises L2 dequant path + raw rerank
     let q = Array1::from_vec(vec![0.0f64; d]);
     let results = e
-        .search_with_filter_and_ann(&q, 2, None, None, true)
+        .search_with_filter_and_ann(&q, 2, None, None, true, None)
         .unwrap();
     assert_eq!(results.len(), 2);
     // "origin" should score 0 (no distance), "far" should score -10 (negative distance)
@@ -1256,7 +1413,7 @@ fn l2_exhaustive_rerank_without_raw_vectors_uses_dequant_path() {
         .unwrap();
     let q = Array1::from_vec(vec![0.0f64; d]);
     let results = e
-        .search_with_filter_and_ann(&q, 2, None, None, true)
+        .search_with_filter_and_ann(&q, 2, None, None, true, None)
         .unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].id, "a");
@@ -1278,7 +1435,7 @@ fn filter_and_value_not_array_returns_no_results() {
     let filter: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"$and": "not-an-array"}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true, None)
         .unwrap();
     assert!(results.is_empty(), "non-array $and should match nothing");
 }
@@ -1296,7 +1453,7 @@ fn filter_and_condition_not_object_returns_no_results() {
     let filter: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"$and": [42]}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true, None)
         .unwrap();
     assert!(
         results.is_empty(),
@@ -1317,7 +1474,7 @@ fn filter_or_value_not_array_returns_no_results() {
     let filter: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"$or": "not-an-array"}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true, None)
         .unwrap();
     assert!(results.is_empty(), "non-array $or should match nothing");
 }
@@ -1335,7 +1492,7 @@ fn filter_or_condition_not_object_returns_no_results() {
     let filter: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"$or": ["not-an-object"]}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true, None)
         .unwrap();
     assert!(
         results.is_empty(),
@@ -1359,7 +1516,7 @@ fn filter_nested_dotted_path_non_object_returns_no_results() {
     e.insert("v1".into(), &make_vec(d, 0.5), meta).unwrap();
     let filter: HashMap<String, serde_json::Value> = serde_json::from_str(r#"{"a.b": 1}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true, None)
         .unwrap();
     assert!(
         results.is_empty(),
@@ -1381,7 +1538,7 @@ fn filter_deeply_nested_non_object_returns_no_results() {
     let filter: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"a.b.c": 1}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true, None)
         .unwrap();
     assert!(
         results.is_empty(),
@@ -1412,7 +1569,7 @@ fn filter_string_comparison_operators_work() {
     let filter_gt: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"name": {"$gt": "alpha"}}"#).unwrap();
     let r_gt = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_gt), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_gt), None, true, None)
         .unwrap();
     assert_eq!(r_gt.len(), 2, "$gt string: expected 2 matches");
 
@@ -1420,7 +1577,7 @@ fn filter_string_comparison_operators_work() {
     let filter_gte: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"name": {"$gte": "beta"}}"#).unwrap();
     let r_gte = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_gte), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_gte), None, true, None)
         .unwrap();
     assert_eq!(r_gte.len(), 2, "$gte string: expected 2 matches");
 
@@ -1428,7 +1585,7 @@ fn filter_string_comparison_operators_work() {
     let filter_lt: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"name": {"$lt": "beta"}}"#).unwrap();
     let r_lt = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_lt), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_lt), None, true, None)
         .unwrap();
     assert_eq!(r_lt.len(), 1, "$lt string: expected 1 match");
 
@@ -1436,7 +1593,7 @@ fn filter_string_comparison_operators_work() {
     let filter_lte: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"name": {"$lte": "alpha"}}"#).unwrap();
     let r_lte = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_lte), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter_lte), None, true, None)
         .unwrap();
     assert_eq!(r_lte.len(), 1, "$lte string: expected 1 match");
 }
@@ -1533,7 +1690,7 @@ fn ann_ip_no_rerank_build_uses_from_codes_path() {
     let mut q = vec![0.0f64; d];
     q[0] = 1.0;
     let results = e
-        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
+        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
 }
@@ -1567,7 +1724,7 @@ fn ann_ip_fast_mode_build_covers_empty_qjl_slice() {
     let mut q = vec![0.0f64; d];
     q[0] = 1.0;
     let results = e
-        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
+        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
 }
@@ -1591,7 +1748,7 @@ fn ann_search_filter_no_matches_returns_empty() {
     let filter: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"tag": "no"}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true, None)
         .unwrap();
     assert!(
         results.is_empty(),
@@ -1627,7 +1784,7 @@ fn cosine_ann_search_exercises_else_ann_branch() {
     let mut q = vec![0.0f64; d];
     q[0] = 1.0;
     let results = e
-        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
+        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
 }
@@ -1653,7 +1810,7 @@ fn large_multilevel_ann_search_exercises_graph_beam() {
     let mut q = vec![0.0f64; d];
     q[0] = 1.0;
     let results = e
-        .search_with_filter_and_ann(&Array1::from_vec(q), 10, None, None, true)
+        .search_with_filter_and_ann(&Array1::from_vec(q), 10, None, None, true, None)
         .unwrap();
     assert!(
         !results.is_empty(),
@@ -1689,7 +1846,7 @@ fn l2_ann_with_rerank_raw_vecs_build_scorer_path() {
     e.create_index_with_params(8, 32, 32, 1.2, 0).unwrap();
     let q = Array1::from_vec(vec![0.0f64; d]);
     let results = e
-        .search_with_filter_and_ann(&q, 5, None, None, true)
+        .search_with_filter_and_ann(&q, 5, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
 }
@@ -1709,7 +1866,7 @@ fn exhaustive_search_filter_no_results_covers_empty_candidates() {
     let filter: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"tag": "absent"}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true, None)
         .unwrap();
     assert!(
         results.is_empty(),
@@ -1750,7 +1907,7 @@ fn cosine_ann_rerank_without_raw_vecs_uses_deq_path() {
     let mut q = vec![0.0f64; d];
     q[0] = 1.0;
     let results = e
-        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true)
+        .search_with_filter_and_ann(&Array1::from_vec(q), 5, None, None, true, None)
         .unwrap();
     assert!(!results.is_empty());
 }
@@ -1948,7 +2105,7 @@ fn delete_at_wal_buffer_threshold_triggers_flush() {
     // This delete brings buffer to 100 → flush (line 568)
     e.delete("w0".to_string()).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, None, None, true, None)
         .unwrap();
     assert!(results.len() <= 5);
 }
@@ -2122,7 +2279,7 @@ fn cosine_ann_fast_mode_empty_qjl_and_zero_norm_and_zero_query() {
     // Search with zero query → query_norm=0 → line 1072
     let zero_q = Array1::<f64>::zeros(d);
     let _results = e
-        .search_with_filter_and_ann(&zero_q, 5, None, None, true)
+        .search_with_filter_and_ann(&zero_q, 5, None, None, true, None)
         .unwrap();
 }
 
@@ -2145,7 +2302,7 @@ fn and_filter_with_object_conditions_matches() {
     let filter: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"$and": [{"score": {"$gte": 2}}, {"tag": "good"}]}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true, None)
         .unwrap();
     assert!(!results.is_empty());
 }
@@ -2167,7 +2324,7 @@ fn ne_filter_matches_different_values() {
     let mut filter = no_meta();
     filter.insert("tag".into(), json!({"$ne": "a"}));
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true, None)
         .unwrap();
     assert_eq!(results.len(), 2);
 }
@@ -2190,7 +2347,7 @@ fn lt_lte_numeric_filters_covered() {
     let mut f1 = no_meta();
     f1.insert("n".into(), json!({"$lt": 3}));
     let r1 = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&f1), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&f1), None, true, None)
         .unwrap();
     assert_eq!(r1.len(), 3); // n=0,1,2
 
@@ -2198,7 +2355,7 @@ fn lt_lte_numeric_filters_covered() {
     let mut f2 = no_meta();
     f2.insert("n".into(), json!({"$lte": 2}));
     let r2 = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&f2), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&f2), None, true, None)
         .unwrap();
     assert_eq!(r2.len(), 3); // n=0,1,2
 }
@@ -2218,7 +2375,7 @@ fn comparison_type_mismatch_returns_no_results() {
     let mut filter = no_meta();
     filter.insert("name".into(), json!({"$gte": 5}));
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true, None)
         .unwrap();
     assert!(results.is_empty());
 }
@@ -2238,7 +2395,7 @@ fn unknown_operator_returns_no_results() {
     let mut filter = no_meta();
     filter.insert("x".into(), json!({"$bogus": 1}));
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true, None)
         .unwrap();
     assert!(results.is_empty());
 }
@@ -2260,7 +2417,7 @@ fn nested_dotted_path_three_levels_covers_recursive_and_leaf() {
     let mut filter = no_meta();
     filter.insert("a.b.c".into(), json!(42));
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 5, Some(&filter), None, true, None)
         .unwrap();
     assert_eq!(results.len(), 1);
 }
@@ -2317,7 +2474,7 @@ fn filter_in_operator_matches_element_in_array() {
     let filter: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"tag": {"$in": ["ml", "cv"]}}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true, None)
         .unwrap();
     let ids: Vec<_> = results.iter().map(|r| r.id.as_str()).collect();
     assert!(ids.contains(&"a"), "$in: expected 'a'");
@@ -2336,7 +2493,7 @@ fn filter_in_operator_missing_field_does_not_match() {
     let filter: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"tag": {"$in": ["ml"]}}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true, None)
         .unwrap();
     assert!(results.is_empty(), "$in on missing field should not match");
 }
@@ -2359,7 +2516,7 @@ fn filter_nin_operator_excludes_matching_elements() {
     let filter: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"tag": {"$nin": ["ml", "cv"]}}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true, None)
         .unwrap();
     let ids: Vec<_> = results.iter().map(|r| r.id.as_str()).collect();
     assert!(!ids.contains(&"a"), "$nin: 'a' should be excluded");
@@ -2378,7 +2535,7 @@ fn filter_nin_missing_field_matches() {
     let filter: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"tag": {"$nin": ["ml"]}}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true, None)
         .unwrap();
     assert_eq!(results.len(), 1, "$nin on missing field should match");
 }
@@ -2398,7 +2555,7 @@ fn filter_exists_true_matches_present_field_only() {
     let filter_true: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"tag": {"$exists": true}}"#).unwrap();
     let r = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter_true), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter_true), None, true, None)
         .unwrap();
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].id, "has");
@@ -2406,7 +2563,7 @@ fn filter_exists_true_matches_present_field_only() {
     let filter_false: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"tag": {"$exists": false}}"#).unwrap();
     let r2 = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter_false), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter_false), None, true, None)
         .unwrap();
     assert_eq!(r2.len(), 1);
     assert_eq!(r2[0].id, "missing");
@@ -2433,7 +2590,7 @@ fn filter_contains_operator_matches_substring() {
     let filter: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"title": {"$contains": "GPU"}}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true, None)
         .unwrap();
     let ids: Vec<_> = results.iter().map(|r| r.id.as_str()).collect();
     assert!(ids.contains(&"a"), "$contains: expected 'a'");
@@ -2453,7 +2610,7 @@ fn filter_contains_non_string_field_does_not_match() {
     let filter: HashMap<String, serde_json::Value> =
         serde_json::from_str(r#"{"score": {"$contains": "4"}}"#).unwrap();
     let results = e
-        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true)
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, true, None)
         .unwrap();
     assert!(
         results.is_empty(),
@@ -2612,7 +2769,7 @@ fn search_batch_returns_one_result_set_per_query() {
     let q1 = make_vec(d, 0.1);
     let q2 = make_vec(d, 0.9);
     let results = e
-        .search_batch(&[q1, q2], 2, None, None, Some(true))
+        .search_batch(&[q1, q2], 2, None, None, Some(true), None)
         .unwrap();
     assert_eq!(results.len(), 2, "one result set per query");
     assert_eq!(results[0].len(), 2, "top_k=2 for first query");
@@ -2625,7 +2782,9 @@ fn search_batch_empty_queries_returns_empty() {
     let p = dir.path().to_str().unwrap();
     let d = 8;
     let e = open_default(p, d);
-    let results = e.search_batch(&[], 5, None, None, Some(true)).unwrap();
+    let results = e
+        .search_batch(&[], 5, None, None, Some(true), None)
+        .unwrap();
     assert!(results.is_empty());
 }
 
@@ -2666,7 +2825,7 @@ fn hybrid_search_finds_post_index_vectors() {
     let mut q = vec![0.0f64; d];
     q[0] = 1.0;
     let results = e
-        .search_with_filter_and_ann(&Array1::from_vec(q), 30, None, None, true)
+        .search_with_filter_and_ann(&Array1::from_vec(q), 30, None, None, true, None)
         .unwrap();
 
     let result_ids: std::collections::HashSet<&str> =
@@ -2780,7 +2939,7 @@ fn compact_then_search_returns_correct_results() {
     // Search must succeed (falls back to exhaustive) and must not return deleted IDs.
     let q = make_vec(d, 0.5);
     let results = e
-        .search_with_filter_and_ann(&q, 10, None, None, true)
+        .search_with_filter_and_ann(&q, 10, None, None, true, None)
         .unwrap();
     assert!(
         !results.is_empty(),

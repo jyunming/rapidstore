@@ -79,6 +79,7 @@ convert_pdf.py
 # but commit the perf gate scripts
 /benchmarks/__pycache__/
 /benchmarks/_paper_bench_cache/
+/benchmarks/_dim_sweep_results/
 /benchmarks/artifacts*/
 /benchmarks/store_compare_work*/
 /benchmarks/tmp_*/
@@ -122,3 +123,7 @@ benchmarks/paper_score_compare.py
 benchmarks/_delta_assess.py
 benchmarks/_*_log.txt
 benchmarks/_private_plots_perf.png
+
+# Server binary bundled into wheel (built by CI, not committed)
+python/tqdb/_bin/tqdb-server
+python/tqdb/_bin/tqdb-server.exe

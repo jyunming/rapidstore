@@ -631,8 +631,10 @@ impl ProdQuantizer {
         if bits_per_idx == 4 {
             // Each byte holds 2 nibbles: lo=index[2i], hi=index[2i+1].
             // Process 16 packed bytes → 32 u16 output values per iteration.
+            // Bound by out.len() so we never write past the caller's buffer.
+            let n = out.len().min(self.n);
             let mask_lo = _mm_set1_epi8(0x0F_u8 as i8);
-            let n_full = (self.n / 32) * 32; // full 32-index chunks
+            let n_full = (n / 32) * 32; // full 32-index chunks
             let mut out_i = 0usize;
             let mut byte_i = 0usize;
 
@@ -654,7 +656,7 @@ impl ProdQuantizer {
                 byte_i += 16;
             }
             // Scalar tail for any remainder.
-            if out_i < self.n {
+            if out_i < n {
                 self.unpack_mse_indices_scalar(&packed[byte_i..], &mut out[out_i..]);
             }
             return;

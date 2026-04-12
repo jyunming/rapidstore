@@ -44,23 +44,37 @@ const AUTO_ANN_THRESHOLD: usize = 10_000;
 const AUTO_ANN_MAX_DELTA_NUM: usize = 1;
 const AUTO_ANN_MAX_DELTA_DEN: usize = 5; // 20%
 
-/// Controls whether `live_vectors.bin` is written for raw-vector reranking.
+/// Controls the precision used to store raw vectors in `live_vectors.bin` for reranking.
 ///
-/// - `Disabled` (default): no file written; reranking uses dequantization (low RAM/disk).
-/// - `F32`: write raw f32 vectors; exact reranking, highest precision, +n×d×4 bytes.
-/// - `F16`: write raw f16 vectors; exact reranking, half of f32 RAM/disk.
+/// All options except `Disabled` enable exact second-pass rescoring: after the quantized pass
+/// selects `rerank_factor × top_k` candidates, the stored vectors are used for precise scoring.
+///
+/// | Variant  | Bytes/vector | 100k×d=768 | Notes |
+/// |----------|-------------|------------|-------|
+/// | `Int8`   | d + 4       | 77 MB      | Default. Per-vector scaled INT8. Same recall as F16. |
+/// | `Int4`   | ⌈d/2⌉ + 4   | 39 MB      | 2× smaller than Int8; slight recall cost at low d. |
+/// | `F16`    | d × 2       | 154 MB     | Available for maximum precision. |
+/// | `F32`    | d × 4       | 307 MB     | Legacy/backward-compat. |
+/// | `Disabled` | 0         | 0 MB       | Dequantization only; zero recall gain for IP metric. |
 ///
 /// Old databases without this field in manifest.json → serde default = `Disabled`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RerankPrecision {
-    /// No live_vectors.bin; reranking uses dequantization (low RAM/disk, current default).
+    /// No live_vectors.bin; reranking uses dequantization. Zero disk overhead but also zero
+    /// recall improvement for the IP metric (dequantized ≡ LUT score).
     #[default]
     Disabled,
-    /// Write raw f32 vectors to live_vectors.bin (legacy/backward-compat option).
-    F32,
-    /// Write raw f16 vectors (~50% RAM/disk vs f32, <0.05% inner-product error at any dim).
+    /// INT8 per-vector-scaled storage. Stride = d + 4 bytes (d × i8 + f32 scale).
+    /// Default when `rerank=True`. Near-identical recall to F16 at half the disk.
+    Int8,
+    /// INT4 nibble-packed per-vector-scaled storage. Stride = ⌈d/2⌉ + 4 bytes.
+    /// ~4× smaller than F16. Slight recall cost at d < 256.
+    Int4,
+    /// Raw f16 vectors. Stride = d × 2 bytes. Maximum precision for non-normalized vectors.
     F16,
+    /// Raw f32 vectors. Stride = d × 4 bytes. Legacy/backward-compat option.
+    F32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -74,6 +88,16 @@ pub enum DistanceMetric {
 impl Default for DistanceMetric {
     fn default() -> Self {
         Self::Ip
+    }
+}
+
+impl std::fmt::Display for DistanceMetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ip => write!(f, "ip"),
+            Self::Cosine => write!(f, "cosine"),
+            Self::L2 => write!(f, "l2"),
+        }
     }
 }
 
@@ -192,6 +216,7 @@ pub struct DbStats {
     pub buffered_vectors: usize,
     pub d: usize,
     pub b: usize,
+    pub metric: String,
     pub total_disk_bytes: u64,
     pub has_index: bool,
     pub index_nodes: usize,
@@ -416,10 +441,7 @@ impl TurboQuantEngine {
             backend.write("manifest.json", &serde_json::to_vec_pretty(&m)?)?;
             // Create an empty live_vectors.bin so that insert_batch can write raw vectors
             // immediately. Only when the user explicitly opts into exact reranking.
-            if matches!(
-                rerank_precision,
-                RerankPrecision::F16 | RerankPrecision::F32
-            ) {
+            if !matches!(rerank_precision, RerankPrecision::Disabled) {
                 let vraw_path = Path::new(local_dir).join("live_vectors.bin");
                 if !vraw_path.exists() {
                     std::fs::File::create(&vraw_path)?;
@@ -453,8 +475,11 @@ impl TurboQuantEngine {
             && !matches!(manifest.rerank_precision, RerankPrecision::Disabled)
         {
             let vstride = match manifest.rerank_precision {
+                RerankPrecision::F32 => manifest.d * 4,
                 RerankPrecision::F16 => manifest.d * 2,
-                _ => manifest.d * 4,
+                RerankPrecision::Int8 => manifest.d + 4,
+                RerankPrecision::Int4 => (manifest.d + 1) / 2 + 4,
+                RerankPrecision::Disabled => manifest.d * 4, // unreachable, but must be valid
             };
             let vraw = LiveCodesFile::open(live_vraw_path, vstride)?;
             // Random-access pattern (ANN rerank reads scattered slots); hint to OS.
@@ -639,25 +664,29 @@ impl TurboQuantEngine {
     ) -> Result<Vec<Option<GetResult>>, Box<dyn std::error::Error + Send + Sync>> {
         let mut out = Vec::with_capacity(ids.len());
         let mut slots = Vec::new();
-        let mut id_to_idx = HashMap::new();
+        // Map slot → list of output positions (handles duplicate IDs).
+        let mut slot_to_indices: HashMap<u32, Vec<usize>> = HashMap::new();
 
         for (i, id) in ids.iter().enumerate() {
             if let Some(slot) = self.id_pool.get_slot(id) {
+                slot_to_indices.entry(slot).or_default().push(i);
                 slots.push(slot);
-                id_to_idx.insert(slot, i);
             }
             out.push(None);
         }
+        slots.dedup(); // unique slots for metadata fetch
 
         if !slots.is_empty() {
             let meta_map = self.metadata.get_many(&slots)?;
             for (slot, meta) in meta_map {
-                if let Some(&idx) = id_to_idx.get(&slot) {
-                    out[idx] = Some(GetResult {
-                        id: ids[idx].clone(),
-                        metadata: meta.properties,
-                        document: meta.document,
-                    });
+                if let Some(indices) = slot_to_indices.get(&slot) {
+                    for &idx in indices {
+                        out[idx] = Some(GetResult {
+                            id: ids[idx].clone(),
+                            metadata: meta.properties.clone(),
+                            document: meta.document.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -792,6 +821,7 @@ impl TurboQuantEngine {
         filter: Option<&HashMap<String, JsonValue>>,
         ann_search_list_size: Option<usize>,
         use_ann_opt: Option<bool>,
+        rerank_factor: Option<usize>,
     ) -> Result<Vec<Vec<SearchResult>>, Box<dyn std::error::Error + Send + Sync>> {
         let use_ann = use_ann_opt.unwrap_or_else(|| self.auto_use_ann());
         // Always parallelise across queries. Rayon's work-stealing handles nested
@@ -801,7 +831,14 @@ impl TurboQuantEngine {
         queries
             .par_iter()
             .map(|q| {
-                self.search_with_filter_and_ann(q, top_k, filter, ann_search_list_size, use_ann)
+                self.search_with_filter_and_ann(
+                    q,
+                    top_k,
+                    filter,
+                    ann_search_list_size,
+                    use_ann,
+                    rerank_factor,
+                )
             })
             .collect()
     }
@@ -1013,19 +1050,41 @@ impl TurboQuantEngine {
                         .expect("invariant: has_vraw=true implies live_vraw is Some")
                         .get_slot(from_slot);
                     let mut out = Array1::<f64>::zeros(d);
-                    if matches!(vraw_precision, RerankPrecision::F16) {
-                        for i in 0..d {
-                            let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2]
-                                .try_into()
-                                .expect("vraw f16 record has 2 bytes per element");
-                            out[i] = half::f16::from_le_bytes(bytes).to_f64();
+                    match vraw_precision {
+                        RerankPrecision::Int8 => {
+                            let scale = f32::from_le_bytes(rec[..4].try_into().unwrap()) as f64;
+                            for i in 0..d {
+                                out[i] = (rec[4 + i] as i8) as f64 * scale / 127.0;
+                            }
                         }
-                    } else {
-                        for i in 0..d {
-                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4]
-                                .try_into()
-                                .expect("vraw f32 record has 4 bytes per element");
-                            out[i] = f32::from_le_bytes(bytes) as f64;
+                        RerankPrecision::Int4 => {
+                            let scale = f32::from_le_bytes(rec[..4].try_into().unwrap()) as f64;
+                            for i in 0..d {
+                                let byte = rec[4 + i / 2];
+                                let nibble = if i % 2 == 0 {
+                                    byte & 0x0F
+                                } else {
+                                    (byte >> 4) & 0x0F
+                                };
+                                let signed = if nibble > 7 {
+                                    nibble as i8 - 16
+                                } else {
+                                    nibble as i8
+                                };
+                                out[i] = signed as f64 * scale / 7.0;
+                            }
+                        }
+                        RerankPrecision::F16 => {
+                            for i in 0..d {
+                                let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2].try_into().unwrap();
+                                out[i] = half::f16::from_le_bytes(bytes).to_f64();
+                            }
+                        }
+                        _ => {
+                            for i in 0..d {
+                                let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                                out[i] = f32::from_le_bytes(bytes) as f64;
+                            }
                         }
                     }
                     let prep = quantizer.prepare_ip_query_lite(&out);
@@ -1097,19 +1156,41 @@ impl TurboQuantEngine {
                         .expect("invariant: has_vraw=true implies live_vraw is Some")
                         .get_slot(from_slot);
                     let mut out = Array1::<f64>::zeros(d);
-                    if matches!(vraw_precision, RerankPrecision::F16) {
-                        for i in 0..d {
-                            let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2]
-                                .try_into()
-                                .expect("vraw f16 record has 2 bytes per element");
-                            out[i] = half::f16::from_le_bytes(bytes).to_f64();
+                    match vraw_precision {
+                        RerankPrecision::Int8 => {
+                            let scale = f32::from_le_bytes(rec[..4].try_into().unwrap()) as f64;
+                            for i in 0..d {
+                                out[i] = (rec[4 + i] as i8) as f64 * scale / 127.0;
+                            }
                         }
-                    } else {
-                        for i in 0..d {
-                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4]
-                                .try_into()
-                                .expect("vraw f32 record has 4 bytes per element");
-                            out[i] = f32::from_le_bytes(bytes) as f64;
+                        RerankPrecision::Int4 => {
+                            let scale = f32::from_le_bytes(rec[..4].try_into().unwrap()) as f64;
+                            for i in 0..d {
+                                let byte = rec[4 + i / 2];
+                                let nibble = if i % 2 == 0 {
+                                    byte & 0x0F
+                                } else {
+                                    (byte >> 4) & 0x0F
+                                };
+                                let signed = if nibble > 7 {
+                                    nibble as i8 - 16
+                                } else {
+                                    nibble as i8
+                                };
+                                out[i] = signed as f64 * scale / 7.0;
+                            }
+                        }
+                        RerankPrecision::F16 => {
+                            for i in 0..d {
+                                let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2].try_into().unwrap();
+                                out[i] = half::f16::from_le_bytes(bytes).to_f64();
+                            }
+                        }
+                        _ => {
+                            for i in 0..d {
+                                let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                                out[i] = f32::from_le_bytes(bytes) as f64;
+                            }
                         }
                     }
                     let from_norm = out.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -1236,7 +1317,7 @@ impl TurboQuantEngine {
         query: &Array1<f64>,
         top_k: usize,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
-        self.search_with_filter_and_ann(query, top_k, None, None, true)
+        self.search_with_filter_and_ann(query, top_k, None, None, true, None)
     }
 
     pub fn search_with_filter(
@@ -1245,7 +1326,7 @@ impl TurboQuantEngine {
         top_k: usize,
         filter: Option<&HashMap<String, JsonValue>>,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
-        self.search_with_filter_and_ann(query, top_k, filter, None, true)
+        self.search_with_filter_and_ann(query, top_k, filter, None, true, None)
     }
 
     pub fn search_with_filter_and_ann(
@@ -1255,6 +1336,7 @@ impl TurboQuantEngine {
         filter: Option<&HashMap<String, JsonValue>>,
         ann_search_list_size: Option<usize>,
         use_ann: bool,
+        rerank_factor: Option<usize>,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
         if self.id_pool.active_count() == 0 || top_k == 0 {
             return Ok(Vec::new());
@@ -1341,7 +1423,13 @@ impl TurboQuantEngine {
 
                 // Query planner: if very selective, brute-force beats HNSW.
                 if matches.len() < active_n / PLANNER_SELECTIVE_THRESHOLD {
-                    return self.exhaustive_search_simd(query, top_k, filter, Some(matches));
+                    return self.exhaustive_search_simd(
+                        query,
+                        top_k,
+                        filter,
+                        Some(matches),
+                        rerank_factor,
+                    );
                 }
                 Some(matches)
             } else {
@@ -1352,7 +1440,8 @@ impl TurboQuantEngine {
             // beam search has a sufficient buffer to recover from approximate navigation.
             // Without reranking, internal_k=top_k leaves no buffer → recall collapses.
             let internal_k = if self.rerank_enabled {
-                top_k * 20
+                let factor = rerank_factor.unwrap_or(20);
+                (top_k * factor).max(top_k + 1)
             } else {
                 // Fetch sls candidates, re-score by full LUT, return top_k.
                 sls.max(top_k)
@@ -1506,7 +1595,7 @@ impl TurboQuantEngine {
                 .collect();
             if !delta.is_empty() {
                 let mut delta_results =
-                    self.exhaustive_search_simd(query, top_k, filter, Some(delta))?;
+                    self.exhaustive_search_simd(query, top_k, filter, Some(delta), rerank_factor)?;
                 out.append(&mut delta_results);
                 out.sort_by(|a, b| {
                     b.score
@@ -1520,7 +1609,7 @@ impl TurboQuantEngine {
         }
 
         // Exhaustive search path (SIMD Optimized)
-        self.exhaustive_search_simd(query, top_k, filter, None)
+        self.exhaustive_search_simd(query, top_k, filter, None, rerank_factor)
     }
 
     /// Try to resolve filter candidates using the eq_index or range_index.
@@ -1595,9 +1684,11 @@ impl TurboQuantEngine {
         top_k: usize,
         filter: Option<&HashMap<String, JsonValue>>,
         forced_slots: Option<Vec<u32>>,
+        rerank_factor: Option<usize>,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
         let internal_k = if self.rerank_enabled {
-            top_k * 10
+            let factor = rerank_factor.unwrap_or(10);
+            (top_k * factor).max(top_k + 1)
         } else {
             top_k
         };
@@ -2344,10 +2435,13 @@ impl TurboQuantEngine {
         self.delta_slots.clear();
         self.delta_slots_dirty = true;
 
-        if let Some(state) = self.manifest.index_state.as_mut() {
-            state.indexed_nodes = self.index_ids.len();
-            state.search_list_size = search_list_size;
-        }
+        self.manifest.index_state = Some(IndexState {
+            max_degree,
+            ef_construction,
+            search_list_size,
+            alpha,
+            indexed_nodes: self.index_ids.len(),
+        });
         self.maybe_persist_state(true)?;
         Ok(())
     }
@@ -2384,6 +2478,7 @@ impl TurboQuantEngine {
             buffered_vectors: self.wal_buffer.len(),
             d: self.d,
             b: self.b,
+            metric: self.metric.to_string(),
             total_disk_bytes: self.total_disk_bytes(),
             has_index: self.can_use_ann_index(),
             index_nodes: self.index_ids.len(),
@@ -2420,8 +2515,11 @@ impl TurboQuantEngine {
     /// Bytes per slot in live_vectors.bin (raw rerank buffer).
     fn live_vraw_stride(&self) -> usize {
         match self.manifest.rerank_precision {
+            RerankPrecision::F32 => self.d * 4,
             RerankPrecision::F16 => self.d * 2,
-            RerankPrecision::Disabled | RerankPrecision::F32 => self.d * 4,
+            RerankPrecision::Int8 => self.d + 4,
+            RerankPrecision::Int4 => (self.d + 1) / 2 + 4,
+            RerankPrecision::Disabled => self.d * 4, // unreachable; file not created
         }
     }
     fn live_active_count(&self) -> usize {
@@ -2456,6 +2554,29 @@ impl TurboQuantEngine {
         let rec = vraw.get_slot(slot);
         let mut out = Array1::zeros(self.d);
         match self.manifest.rerank_precision {
+            RerankPrecision::Int8 => {
+                let scale = f32::from_le_bytes(rec[..4].try_into().unwrap()) as f64;
+                for i in 0..self.d {
+                    out[i] = (rec[4 + i] as i8) as f64 * scale / 127.0;
+                }
+            }
+            RerankPrecision::Int4 => {
+                let scale = f32::from_le_bytes(rec[..4].try_into().unwrap()) as f64;
+                for i in 0..self.d {
+                    let byte = rec[4 + i / 2];
+                    let nibble = if i % 2 == 0 {
+                        byte & 0x0F
+                    } else {
+                        (byte >> 4) & 0x0F
+                    };
+                    let signed = if nibble > 7 {
+                        nibble as i8 - 16
+                    } else {
+                        nibble as i8
+                    };
+                    out[i] = signed as f64 * scale / 7.0;
+                }
+            }
             RerankPrecision::F16 => {
                 for i in 0..self.d {
                     let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2]
@@ -2482,6 +2603,37 @@ impl TurboQuantEngine {
         };
         let rec = vraw.get_slot_mut(slot as usize);
         match self.manifest.rerank_precision {
+            RerankPrecision::Int8 => {
+                let scale = vector
+                    .iter()
+                    .map(|v| v.abs())
+                    .fold(0.0_f32, f32::max)
+                    .max(1e-9);
+                rec[..4].copy_from_slice(&scale.to_le_bytes());
+                for (i, &v) in vector.iter().enumerate() {
+                    let q = (v / scale * 127.0).round().clamp(-127.0, 127.0) as i8;
+                    rec[4 + i] = q as u8;
+                }
+            }
+            RerankPrecision::Int4 => {
+                let scale = vector
+                    .iter()
+                    .map(|v| v.abs())
+                    .fold(0.0_f32, f32::max)
+                    .max(1e-9);
+                rec[..4].copy_from_slice(&scale.to_le_bytes());
+                let n = vector.len();
+                for i in (0..n).step_by(2) {
+                    let q0 = (vector[i] / scale * 7.0).round().clamp(-8.0, 7.0) as i8;
+                    let q1 = if i + 1 < n {
+                        (vector[i + 1] / scale * 7.0).round().clamp(-8.0, 7.0) as i8
+                    } else {
+                        0_i8
+                    };
+                    // lower nibble = dim i (even), upper nibble = dim i+1 (odd)
+                    rec[4 + i / 2] = (q0 as u8 & 0x0F) | ((q1 as u8 & 0x0F) << 4);
+                }
+            }
             RerankPrecision::F16 => {
                 for (i, &val) in vector.iter().enumerate() {
                     let h = half::f16::from_f32(val);
@@ -2782,6 +2934,9 @@ impl TurboQuantEngine {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let vec_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
         let norm = vec_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if self.normalize && norm <= 1e-10 {
+            return Err("Cannot normalize a zero vector: L2 norm is zero".into());
+        }
         let vec_unit: Vec<f32> = if norm > 1e-10 {
             vec_f32.iter().map(|&x| x / norm).collect()
         } else {

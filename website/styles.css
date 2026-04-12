@@ -16,6 +16,11 @@
     box-sizing: border-box;
 }
 
+html {
+    scroll-snap-type: y proximity;
+    scroll-behavior: smooth;
+}
+
 body {
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     background-color: var(--bg-dark);
@@ -110,6 +115,21 @@ code, pre {
     color: var(--accent-primary);
 }
 
+.btn-ghost {
+    background: transparent;
+    color: var(--text-muted);
+    border: none;
+    padding: 12px 18px;
+}
+.btn-ghost:hover {
+    color: var(--text-main);
+}
+
+.btn-lg {
+    padding: 14px 32px;
+    font-size: 1.05rem;
+}
+
 /* Navbar */
 .navbar {
     position: fixed;
@@ -124,6 +144,27 @@ code, pre {
     border-top: none;
     border-left: none;
     border-right: none;
+}
+
+.nav-brand {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.nav-logo {
+    width: 28px;
+    height: 28px;
+    border-radius: 7px;
+    flex-shrink: 0;
+}
+
+.hero-logo {
+    width: 72px;
+    height: 72px;
+    border-radius: 18px;
+    margin-bottom: 1.5rem;
+    box-shadow: 0 0 32px rgba(0, 240, 255, 0.25);
 }
 
 .logo-text {
@@ -147,25 +188,35 @@ code, pre {
     color: var(--text-main);
 }
 
-/* Sections */
+/* Snap wrapper — full-viewport section that content centers within */
+.snap-section {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    scroll-snap-align: start;
+}
+
+/* Inner content container — constrains width and provides padding */
 .section {
-    padding: 8rem 5%;
+    padding: 5rem 5%;
     max-width: 1200px;
     margin: 0 auto;
+    width: 100%;
 }
 
 .section-header {
     text-align: center;
-    margin-bottom: 4rem;
+    margin-bottom: 2.5rem;
 }
 .section-header h2 {
-    font-size: 2.5rem;
-    margin-bottom: 1rem;
+    font-size: 2rem;
+    margin-bottom: 0.6rem;
     font-weight: 800;
 }
 .section-header p {
     color: var(--text-muted);
-    font-size: 1.2rem;
+    font-size: 1.05rem;
 }
 
 /* Hero Section */
@@ -255,40 +306,51 @@ code, pre {
 /* Features Grid */
 .features-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-    gap: 2rem;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1rem;
 }
 
 .feature-card {
-    padding: 2.5rem;
-    transition: transform 0.3s ease, border-color 0.3s;
+    padding: 1.4rem 1.6rem;
+    transition: transform 0.2s ease, border-color 0.2s;
 }
 .feature-card:hover {
-    transform: translateY(-5px);
-    border-color: rgba(0, 240, 255, 0.3);
+    transform: translateY(-3px);
+    border-color: rgba(0, 240, 255, 0.25);
+}
+
+.feature-card-header {
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+    margin-bottom: 0.5rem;
 }
 
 .feature-icon {
-    font-size: 2.5rem;
-    margin-bottom: 1.5rem;
+    font-size: 1.3rem;
+    line-height: 1;
+    flex-shrink: 0;
 }
 
 .feature-card h3 {
-    font-size: 1.25rem;
-    margin-bottom: 1rem;
+    font-size: 1rem;
+    font-weight: 600;
+    margin: 0;
 }
 
 .feature-card p {
     color: var(--text-muted);
-    font-size: 0.95rem;
+    font-size: 0.88rem;
+    line-height: 1.55;
+    margin: 0;
 }
 
 /* Quick Start Section */
 .quickstart-container {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 4rem;
-    align-items: center;
+    grid-template-columns: 1fr 1.4fr;
+    gap: 3rem;
+    align-items: start;
 }
 
 .quickstart-text h2 {
@@ -567,46 +629,166 @@ code, pre {
 
 /* Ecosystem Grid */
 .ecosystem-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+}
+
+.eco-featured {
+    background: linear-gradient(135deg, rgba(0,240,255,0.07) 0%, rgba(176,38,255,0.05) 100%);
+    border: 1px solid rgba(0,240,255,0.18);
+    border-radius: 20px;
+    padding: 2.25rem 2.5rem;
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-    gap: 2rem;
+    grid-template-columns: 1fr 1fr;
+    gap: 2.5rem;
+    align-items: center;
+    transition: border-color 0.2s;
+}
+.eco-featured:hover {
+    border-color: rgba(0,240,255,0.35);
+}
+
+.eco-featured-text {}
+.eco-featured-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    background: rgba(0,240,255,0.1);
+    border: 1px solid rgba(0,240,255,0.25);
+    border-radius: 20px;
+    padding: 0.25rem 0.75rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--accent-primary);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 1rem;
+}
+.eco-featured h3 {
+    font-size: 1.7rem;
+    font-weight: 800;
+    margin-bottom: 0.75rem;
+}
+.eco-featured p {
+    color: var(--text-muted);
+    font-size: 0.95rem;
+    line-height: 1.65;
+    margin-bottom: 1.25rem;
+}
+.eco-featured-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+.eco-pill {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 20px;
+    padding: 0.2rem 0.75rem;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.eco-featured-code {
+    background: rgba(0,0,0,0.4);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 14px;
+    overflow: hidden;
+}
+.eco-featured-code .code-header {
+    background: rgba(255,255,255,0.03);
+    padding: 0.6rem 1rem;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+    font-family: 'JetBrains Mono', monospace;
+}
+.eco-featured-code pre {
+    padding: 1.25rem;
+    margin: 0;
+    font-size: 0.82rem;
+    line-height: 1.65;
+    color: #e2e8f0;
+    overflow-x: auto;
+}
+
+.eco-integrations {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.25rem;
 }
 
 .eco-card {
-    padding: 2.5rem;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 16px;
+    padding: 1.75rem;
     display: flex;
     flex-direction: column;
+    transition: border-color 0.2s, transform 0.2s;
+}
+.eco-card:hover {
+    border-color: rgba(255,255,255,0.18);
+    transform: translateY(-3px);
 }
 
-.eco-icon {
-    font-size: 2.5rem;
-    margin-bottom: 1.5rem;
+.eco-icon-wrap {
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.4rem;
+    margin-bottom: 1rem;
+    flex-shrink: 0;
 }
+.eco-icon-wrap.green  { background: rgba(52,211,153,0.12); }
+.eco-icon-wrap.blue   { background: rgba(96,165,250,0.12); }
+.eco-icon-wrap.purple { background: rgba(167,139,250,0.12); }
 
 .eco-card h3 {
-    font-size: 1.5rem;
-    margin-bottom: 1rem;
+    font-size: 1.05rem;
+    font-weight: 700;
+    margin-bottom: 0.5rem;
 }
 
 .eco-card p {
     color: var(--text-muted);
-    font-size: 1rem;
-    margin-bottom: 2rem;
+    font-size: 0.85rem;
+    line-height: 1.6;
     flex-grow: 1;
+    margin-bottom: 1.25rem;
+}
+
+.eco-import {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    background: rgba(0,0,0,0.3);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 8px;
+    padding: 0.5rem 0.75rem;
+    color: var(--accent-primary);
+    margin-bottom: 1rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .eco-link {
-    color: var(--accent-primary);
+    color: var(--text-muted);
     text-decoration: none;
-    font-weight: 600;
-    font-size: 0.9rem;
+    font-weight: 500;
+    font-size: 0.82rem;
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: 4px;
+    transition: color 0.2s;
 }
-
 .eco-link:hover {
-    text-decoration: underline;
+    color: var(--accent-primary);
 }
 
 /* Footer */
@@ -647,15 +829,72 @@ code, pre {
     font-size: 0.9rem;
 }
 
-/* Animations */
+/* Hero is also a snap section */
+.hero.snap-section {
+    scroll-snap-align: start;
+}
+
+/* Animations — spring ease-out for a polished feel */
 .fade-in-up {
     opacity: 0;
-    transform: translateY(30px);
-    transition: opacity 0.8s ease-out, transform 0.8s ease-out;
+    transform: translateY(28px);
+    transition: opacity 0.65s cubic-bezier(0.22, 1, 0.36, 1),
+                transform 0.65s cubic-bezier(0.22, 1, 0.36, 1);
+    will-change: opacity, transform;
 }
 .fade-in-up.visible {
     opacity: 1;
     transform: translateY(0);
+}
+
+.fade-in-left {
+    opacity: 0;
+    transform: translateX(-32px);
+    transition: opacity 0.65s cubic-bezier(0.22, 1, 0.36, 1),
+                transform 0.65s cubic-bezier(0.22, 1, 0.36, 1);
+    will-change: opacity, transform;
+}
+.fade-in-left.visible {
+    opacity: 1;
+    transform: translateX(0);
+}
+
+.fade-in-right {
+    opacity: 0;
+    transform: translateX(32px);
+    transition: opacity 0.65s cubic-bezier(0.22, 1, 0.36, 1),
+                transform 0.65s cubic-bezier(0.22, 1, 0.36, 1);
+    will-change: opacity, transform;
+}
+.fade-in-right.visible {
+    opacity: 1;
+    transform: translateX(0);
+}
+
+/* ── Config Advisor Banner (now inside .section, no outer padding needed) ── */
+.advisor-banner {
+    background: linear-gradient(135deg, rgba(99,102,241,0.12) 0%, rgba(0,240,255,0.06) 100%);
+    border: 1px solid rgba(99,102,241,0.2);
+    border-radius: 12px;
+    padding: 2rem 2.5rem;
+    margin-bottom: 3rem;
+}
+.advisor-banner-inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 2rem;
+    flex-wrap: wrap;
+}
+.advisor-banner-text h3 {
+    font-size: 1.4rem;
+    font-weight: 700;
+    margin-bottom: 0.5rem;
+}
+.advisor-banner-text p {
+    color: var(--text-muted);
+    max-width: 520px;
+    line-height: 1.6;
 }
 
 /* Responsive */
@@ -666,9 +905,17 @@ code, pre {
     .hero-title {
         font-size: 3rem;
     }
-    .benchmark-grid {
-        grid-template-columns: 1fr;
-    }
+    .benchmark-grid { grid-template-columns: 1fr; }
+    .features-grid { grid-template-columns: repeat(2, 1fr); }
+    .eco-featured { grid-template-columns: 1fr; }
+    .eco-integrations { grid-template-columns: repeat(2, 1fr); }
+    .advisor-banner-inner { flex-direction: column; text-align: center; }
+    .advisor-banner-text p { max-width: 100%; }
+}
+@media (max-width: 600px) {
+    .features-grid { grid-template-columns: 1fr; }
+    .eco-integrations { grid-template-columns: 1fr; }
+    .quickstart-container { grid-template-columns: 1fr; }
 }
 @media (max-width: 768px) {
     .nav-links {

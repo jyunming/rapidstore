@@ -1,7 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -35,17 +35,20 @@ impl Database {
     ///     seed: Random seed for the quantizer. Must match on reopen. Default ``42``.
     ///     metric: Distance metric — ``"ip"`` (inner product), ``"cosine"``,
     ///             or ``"l2"`` (Euclidean). Fixed at creation. Default ``"ip"``.
-    ///     rerank: Enable reranking of HNSW candidates. Default ``True``.
-    ///     fast_mode: When ``True``, all ``bits`` go to the MSE codebook and the QJL
-    ///                residual is not stored. When ``False`` (default), the QJL residual
-    ///                is stored and used during dequantization reranking, giving significantly
-    ///                higher recall (e.g. +9–15 pp R@1 on GloVe-200 b=4). Set ``True`` only
-    ///                to match paper Figure 5 recall curves (MSE-only bit allocation) or for
-    ///                ~30% faster ingest when recall is not critical. Default ``False``.
+    ///     rerank: Enable raw-vector reranking. Default ``False``.
+    ///     fast_mode: When ``True`` (default), all ``bits`` go to the MSE codebook; the QJL
+    ///                residual is not stored (minimum disk, fastest ingest). When ``False``,
+    ///                the QJL residual is stored and used during reranking, giving +5–15 pp
+    ///                R@1 at d ≥ 1536. For d < 512, QJL projections are too noisy and reduce
+    ///                recall, so keep ``fast_mode=True`` for low-dimensional workloads.
     ///     rerank_precision: Raw-vector reranking precision:
-    ///         - ``None`` (default): dequantization reranking — no extra disk/RAM.
+    ///         - ``None`` (default): ``"int8"`` when ``rerank=True``, disabled otherwise.
+    ///         - ``"int8"``: store raw vectors as per-vector-scaled INT8 (~75% less disk than f32).
+    ///         - ``"int4"``: store raw vectors as INT4 (~87.5% less disk than f32, minor recall drop).
     ///         - ``"f16"``: store raw vectors as float16 (+n×d×2 bytes), exact reranking.
     ///         - ``"f32"``: store raw vectors as float32 (+n×d×4 bytes), maximum precision.
+    ///         - ``"disabled"`` / ``"dequant"``: no extra storage; reranking uses dequantization
+    ///           (mathematically equivalent to no rerank for IP metric — use only to save disk).
     ///     wal_flush_threshold: Number of buffered vectors before flushing WAL to a segment file.
     ///         Higher values give faster bulk ingest (fewer flush cycles) at the cost of more
     ///         data at risk if the process crashes before flush. Default ``5000``.
@@ -75,7 +78,7 @@ impl Database {
     ///     # Equivalent cosine-via-IP with auto-normalization:
     ///     db = Database.open("mydb", dimension=1536, bits=4, metric="ip", normalize=True)
     #[staticmethod]
-    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false, quantizer_type=None))]
+    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=false, fast_mode=true, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false, quantizer_type=None))]
     fn open(
         path: String,
         dimension: Option<usize>,
@@ -151,30 +154,65 @@ impl Database {
         };
 
         let precision = match rerank_precision.map(|s| s.to_lowercase()) {
-            None => RerankPrecision::Disabled,
-            Some(ref s) if s == "none" || s == "disabled" || s == "dequant" => {
-                RerankPrecision::Disabled
+            // Default: INT8 per-vector-scaled when rerank=True.
+            // INT8 gives near-identical recall to F16 at ~50% less disk for any d.
+            // Dequantization reranking is mathematically equivalent to the quantized LUT score
+            // for IP metric, so it produces no recall improvement without raw vector storage.
+            None => {
+                if rerank {
+                    RerankPrecision::Int8 // ~50% less disk than f16, same recall
+                } else {
+                    RerankPrecision::Disabled
+                }
             }
+            Some(ref s) if s == "disabled" || s == "dequant" => RerankPrecision::Disabled,
+            Some(ref s) if s == "int8" || s == "i8" => RerankPrecision::Int8,
+            Some(ref s) if s == "int4" || s == "i4" => RerankPrecision::Int4,
             Some(ref s) if s == "f16" || s == "half" => RerankPrecision::F16,
             Some(ref s) if s == "f32" || s == "float" || s == "full" => RerankPrecision::F32,
             Some(ref s) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid rerank_precision: '{}'. Use 'f16', 'f32', or None (dequant reranking).",
+                    "Invalid rerank_precision: '{}'. Use 'int8' (default), 'int4', 'f16', 'f32', or None.",
                     s
                 )));
             }
         };
 
-        if bits < 2 {
+        if bits == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("bits must be >= 1"));
+        }
+        if bits < 2 && !fast_mode {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "bits must be >= 2, got {}",
+                "bits must be >= 2 when fast_mode=False (1 bit is reserved for QJL residual); got bits={}",
                 bits
             )));
+        }
+        if bits > 8 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "bits must be <= 8; got {} (values above 8 cause exponential codebook-generation slowdown)",
+                bits
+            )));
+        }
+        if let Some(qt) = quantizer_type.as_deref() {
+            let qt_lower = qt.to_ascii_lowercase();
+            if qt_lower != "dense" && qt_lower != "exact" && qt_lower != "srht" {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid quantizer_type: '{}'. Valid values: 'dense', 'exact', 'srht'.",
+                    qt
+                )));
+            }
         }
         if dimension == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "dimension must be > 0",
             ));
+        }
+        if let Some(wft) = wal_flush_threshold {
+            if wft == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "wal_flush_threshold must be >= 1",
+                ));
+            }
         }
         let engine = TurboQuantEngine::open_with_options(
             &engine_path,
@@ -206,14 +244,7 @@ impl Database {
         metadata: Option<&Bound<'_, PyDict>>,
         document: Option<String>,
     ) -> PyResult<()> {
-        let vec = if let Ok(v) = vector.extract::<PyReadonlyArray1<f32>>(py) {
-            v.as_array().mapv(|x| x as f64)
-        } else {
-            vector
-                .extract::<PyReadonlyArray1<f64>>(py)?
-                .as_array()
-                .to_owned()
-        };
+        let vec = extract_vec1d(py, &vector)?;
         check_finite(&vec.view(), "vector")?;
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
@@ -353,14 +384,7 @@ impl Database {
         metadata: Option<&Bound<'_, PyDict>>,
         document: Option<String>,
     ) -> PyResult<()> {
-        let vec = if let Ok(v) = vector.extract::<PyReadonlyArray1<f32>>(py) {
-            v.as_array().mapv(|x| x as f64)
-        } else {
-            vector
-                .extract::<PyReadonlyArray1<f64>>(py)?
-                .as_array()
-                .to_owned()
-        };
+        let vec = extract_vec1d(py, &vector)?;
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
             let mut engine = self.write_engine()?;
@@ -378,14 +402,7 @@ impl Database {
         metadata: Option<&Bound<'_, PyDict>>,
         document: Option<String>,
     ) -> PyResult<()> {
-        let vec = if let Ok(v) = vector.extract::<PyReadonlyArray1<f32>>(py) {
-            v.as_array().mapv(|x| x as f64)
-        } else {
-            vector
-                .extract::<PyReadonlyArray1<f64>>(py)?
-                .as_array()
-                .to_owned()
-        };
+        let vec = extract_vec1d(py, &vector)?;
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
             let mut engine = self.write_engine()?;
@@ -528,12 +545,18 @@ impl Database {
     ///     filter: Optional metadata filter dict.
     ///     ann_search_list_size: HNSW ef_search override (larger = more recall, slower).
     ///         Only relevant when ``_use_ann=True`` and an index exists.
+    ///     rerank_factor: Oversampling multiplier for the rerank candidate pool.
+    ///         When ``rerank=True``, the engine scores ``top_k * rerank_factor`` candidates
+    ///         with the quantized scorer then re-scores with exact raw vectors.
+    ///         Higher values improve recall at the cost of latency. Default ``None`` uses
+    ///         built-in defaults (10× brute-force, 20× ANN). Range: 1–100.
+    ///         Ignored when ``rerank=False``.
     ///     include: Subset of fields to return — ``["id", "score", "metadata", "document"]``.
     ///              Defaults to all four.
     ///
     /// Returns:
     ///     List of dicts, each with keys ``id``, ``score``, ``metadata``, ``document``.
-    #[pyo3(signature = (query, top_k, filter=None, _use_ann=None, ann_search_list_size=None, include=None))]
+    #[pyo3(signature = (query, top_k, filter=None, _use_ann=None, ann_search_list_size=None, include=None, rerank_factor=None))]
     fn search(
         &self,
         py: Python<'_>,
@@ -543,6 +566,7 @@ impl Database {
         _use_ann: Option<bool>,
         ann_search_list_size: Option<usize>,
         include: Option<Vec<String>>,
+        rerank_factor: Option<usize>,
     ) -> PyResult<PyObject> {
         if top_k <= 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -550,15 +574,15 @@ impl Database {
                 top_k
             )));
         }
+        if let Some(rf) = rerank_factor {
+            if rf == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "rerank_factor must be >= 1",
+                ));
+            }
+        }
         let top_k = top_k as usize;
-        let q = if let Ok(v) = query.extract::<PyReadonlyArray1<f32>>(py) {
-            v.as_array().mapv(|x| x as f64)
-        } else {
-            query
-                .extract::<PyReadonlyArray1<f64>>(py)?
-                .as_array()
-                .to_owned()
-        };
+        let q = extract_vec1d(py, &query)?;
         check_finite(&q.view(), "query vector")?;
         let parsed_filter = parse_pydict(filter)?;
         if !parsed_filter.is_empty() {
@@ -573,7 +597,7 @@ impl Database {
 
         let inc = parse_include_set(include, &["id", "score", "metadata", "document"])?;
 
-        let results = py.allow_threads(|| {
+        let (results, is_l2) = py.allow_threads(|| {
             let engine = self.read_engine()?;
             if q.len() != engine.d {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -582,10 +606,19 @@ impl Database {
                     q.len()
                 )));
             }
+            let is_l2 = matches!(engine.metric, crate::storage::engine::DistanceMetric::L2);
             let use_ann = _use_ann.unwrap_or_else(|| engine.auto_use_ann());
-            engine
-                .search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size, use_ann)
-                .map_err(to_py_runtime)
+            let results = engine
+                .search_with_filter_and_ann(
+                    &q,
+                    top_k,
+                    filter_ref,
+                    ann_search_list_size,
+                    use_ann,
+                    rerank_factor,
+                )
+                .map_err(to_py_runtime)?;
+            Ok((results, is_l2))
         })?;
 
         let py_list = PyList::empty_bound(py);
@@ -595,7 +628,8 @@ impl Database {
                 dict.set_item("id", &r.id)?;
             }
             if inc.contains("score") {
-                dict.set_item("score", r.score)?;
+                let user_score = if is_l2 { -r.score } else { r.score };
+                dict.set_item("score", user_score)?;
             }
             if inc.contains("metadata") {
                 let meta_dict = PyDict::new_bound(py);
@@ -678,6 +712,7 @@ impl Database {
         dict.set_item("buffered_vectors", stats.buffered_vectors)?;
         dict.set_item("dimension", stats.d)?;
         dict.set_item("bits", stats.b)?;
+        dict.set_item("metric", &stats.metric)?;
         dict.set_item("total_disk_bytes", stats.total_disk_bytes)?;
         dict.set_item("has_index", stats.has_index)?;
         dict.set_item("index_nodes", stats.index_nodes)?;
@@ -767,6 +802,8 @@ impl Database {
     ///     where_filter: Optional metadata filter (same syntax as :meth:`search`).
     ///     ann_search_list_size: HNSW ef_search override (larger = more recall, slower).
     ///         Only relevant when ``_use_ann=True`` and an index exists.
+    ///     rerank_factor: Oversampling multiplier for the rerank candidate pool (see
+    ///         :meth:`search` for full description). Default ``None``.
     ///
     /// Note:
     ///     Pass ``_use_ann=True`` to engage the HNSW index (must be built first via
@@ -781,7 +818,7 @@ impl Database {
     ///         query_embeddings=np.stack([q1, q2, q3]),
     ///         n_results=5,
     ///     )
-    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=None, ann_search_list_size=None))]
+    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=None, ann_search_list_size=None, rerank_factor=None))]
     fn query(
         &self,
         py: Python<'_>,
@@ -790,6 +827,7 @@ impl Database {
         where_filter: Option<&Bound<'_, PyDict>>,
         _use_ann: Option<bool>,
         ann_search_list_size: Option<usize>,
+        rerank_factor: Option<usize>,
     ) -> PyResult<PyObject> {
         if n_results <= 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -837,7 +875,7 @@ impl Database {
         } else {
             Some(&parsed_filter)
         };
-        let batch = py.allow_threads(|| {
+        let (batch, is_l2) = py.allow_threads(|| {
             let engine = self.read_engine()?;
             for (i, row) in queries.iter().enumerate() {
                 if row.len() != engine.d {
@@ -849,15 +887,18 @@ impl Database {
                     )));
                 }
             }
-            engine
+            let is_l2 = matches!(engine.metric, crate::storage::engine::DistanceMetric::L2);
+            let batch = engine
                 .search_batch(
                     &queries,
                     n_results,
                     filter_ref,
                     ann_search_list_size,
                     _use_ann,
+                    rerank_factor,
                 )
-                .map_err(to_py_runtime)
+                .map_err(to_py_runtime)?;
+            Ok((batch, is_l2))
         })?;
 
         let outer = PyList::empty_bound(py);
@@ -866,7 +907,7 @@ impl Database {
             for r in results {
                 let dict = PyDict::new_bound(py);
                 dict.set_item("id", r.id)?;
-                dict.set_item("score", r.score)?;
+                dict.set_item("score", if is_l2 { -r.score } else { r.score })?;
                 let meta_dict = PyDict::new_bound(py);
                 for (k, v) in r.metadata {
                     meta_dict.set_item(k, json_to_py(py, &v)?)?;
@@ -1050,6 +1091,13 @@ fn py_to_json(obj: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
             arr.push(py_to_json(&item)?);
         }
         Ok(JsonValue::Array(arr))
+    } else if let Ok(tup) = obj.downcast::<PyTuple>() {
+        // BUG-12: tuples were falling through to Null — convert same as lists
+        let mut arr = Vec::new();
+        for item in tup {
+            arr.push(py_to_json(&item)?);
+        }
+        Ok(JsonValue::Array(arr))
     } else if let Ok(dict) = obj.downcast::<PyDict>() {
         let mut map = serde_json::Map::new();
         for (k, v) in dict {
@@ -1126,6 +1174,30 @@ fn parse_document_rows(
 
 fn to_py_runtime(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+}
+
+/// Extract a 1-D f64 array from a Python object — accepts float32/float64 numpy
+/// arrays and plain Python lists of numbers (BUG-8 fix).
+fn extract_vec1d(py: Python<'_>, obj: &PyObject) -> PyResult<ndarray::Array1<f64>> {
+    if let Ok(v) = obj.extract::<PyReadonlyArray1<f32>>(py) {
+        return Ok(v.as_array().mapv(|x| x as f64));
+    }
+    if let Ok(v) = obj.extract::<PyReadonlyArray1<f64>>(py) {
+        return Ok(v.as_array().to_owned());
+    }
+    // Fall back to plain Python list of numbers.
+    let bound = obj.bind(py);
+    if let Ok(list) = bound.downcast::<PyList>() {
+        let v: Result<Vec<f64>, _> = list.iter().map(|x| x.extract::<f64>()).collect();
+        return Ok(ndarray::Array1::from(v.map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(
+                "vector list elements must be numeric (int or float)",
+            )
+        })?));
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "vector must be a numpy ndarray (float32 or float64) or a Python list of numbers",
+    ))
 }
 
 fn check_finite(vec: &ndarray::ArrayView1<f64>, label: &str) -> PyResult<()> {

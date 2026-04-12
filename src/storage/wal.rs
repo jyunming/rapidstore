@@ -84,9 +84,10 @@ impl Wal {
         }
 
         // Pre-allocate a single buffer for the whole batch (rough estimate: 512 bytes/entry).
+        // Cap at 64 MiB to avoid large spikes on huge batches where the estimate overshoots.
         // Serialising all entries first then issuing one write_all eliminates per-entry
         // syscall overhead and avoids partial BufWriter flushes mid-batch.
-        let mut buf: Vec<u8> = Vec::with_capacity(entries.len() * 512);
+        let mut buf: Vec<u8> = Vec::with_capacity((entries.len() * 512).min(64 * 1024 * 1024));
 
         for entry in entries {
             let encoded = if let Some(q) = &self.quantizer {

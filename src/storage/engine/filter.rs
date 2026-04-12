@@ -167,15 +167,24 @@ const KNOWN_COMPARISON_OPS: &[&str] = &[
 /// Recursively validate that all operator keys in `filter` are known.
 /// Returns `Err(message)` on the first unknown operator encountered.
 pub(crate) fn validate_filter_operators(filter: &HashMap<String, JsonValue>) -> Result<(), String> {
-    for (k, v) in filter {
-        match k.as_str() {
+    validate_filter_operators_obj(filter.iter().map(|(k, v)| (k.as_str(), v)))
+}
+
+/// Internal helper that accepts a `serde_json::Map` reference to avoid cloning.
+fn validate_filter_operators_inner(map: &serde_json::Map<String, JsonValue>) -> Result<(), String> {
+    validate_filter_operators_obj(map.iter().map(|(k, v)| (k.as_str(), v)))
+}
+
+fn validate_filter_operators_obj<'a>(
+    iter: impl Iterator<Item = (&'a str, &'a JsonValue)>,
+) -> Result<(), String> {
+    for (k, v) in iter {
+        match k {
             "$and" | "$or" => {
                 if let JsonValue::Array(conditions) = v {
                     for cond in conditions {
                         if let JsonValue::Object(map) = cond {
-                            let hm: HashMap<String, JsonValue> =
-                                map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                            validate_filter_operators(&hm)?;
+                            validate_filter_operators_inner(map)?;
                         }
                     }
                 }
@@ -230,10 +239,36 @@ pub(crate) fn extract_range_condition<'a>(
         let n = op_val.as_f64().filter(|v| v.is_finite())?;
         let ord = f64_to_ord(n);
         match op.as_str() {
-            "$gt" => lo = Some((ord, false)),
-            "$gte" => lo = Some((ord, true)),
-            "$lt" => hi = Some((ord, false)),
-            "$lte" => hi = Some((ord, true)),
+            "$gt" => {
+                // Tightest lower bound: highest ord wins; on tie, exclusive ($gt) > inclusive ($gte).
+                lo = Some(match lo {
+                    Some((prev_ord, _)) if prev_ord > ord => (prev_ord, lo.unwrap().1),
+                    Some((prev_ord, _)) if prev_ord == ord => (ord, false), // exclusive tighter
+                    _ => (ord, false),
+                });
+            }
+            "$gte" => {
+                lo = Some(match lo {
+                    Some((prev_ord, prev_incl)) if prev_ord > ord => (prev_ord, prev_incl),
+                    Some((prev_ord, _)) if prev_ord == ord => (ord, false), // $gt already set → exclusive wins
+                    _ => (ord, true),
+                });
+            }
+            "$lt" => {
+                // Tightest upper bound: lowest ord wins; on tie, exclusive ($lt) > inclusive ($lte).
+                hi = Some(match hi {
+                    Some((prev_ord, _)) if prev_ord < ord => (prev_ord, hi.unwrap().1),
+                    Some((prev_ord, _)) if prev_ord == ord => (ord, false),
+                    _ => (ord, false),
+                });
+            }
+            "$lte" => {
+                hi = Some(match hi {
+                    Some((prev_ord, prev_incl)) if prev_ord < ord => (prev_ord, prev_incl),
+                    Some((prev_ord, _)) if prev_ord == ord => (ord, false),
+                    _ => (ord, true),
+                });
+            }
             _ => return None, // any non-range op → can't use range index
         }
     }
