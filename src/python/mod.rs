@@ -77,7 +77,7 @@ impl Database {
     ///     # Equivalent cosine-via-IP with auto-normalization:
     ///     db = Database.open("mydb", dimension=1536, bits=4, metric="ip", normalize=True)
     #[staticmethod]
-    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false, quantizer_type=None))]
+    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=false, fast_mode=true, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false, quantizer_type=None))]
     fn open(
         path: String,
         dimension: Option<usize>,
@@ -177,9 +177,12 @@ impl Database {
             }
         };
 
-        if bits < 2 {
+        if bits == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("bits must be >= 1"));
+        }
+        if bits < 2 && !fast_mode {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "bits must be >= 2, got {}",
+                "bits must be >= 2 when fast_mode=False (1 bit is reserved for QJL residual); got bits={}",
                 bits
             )));
         }

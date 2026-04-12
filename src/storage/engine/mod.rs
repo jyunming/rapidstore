@@ -430,10 +430,7 @@ impl TurboQuantEngine {
             backend.write("manifest.json", &serde_json::to_vec_pretty(&m)?)?;
             // Create an empty live_vectors.bin so that insert_batch can write raw vectors
             // immediately. Only when the user explicitly opts into exact reranking.
-            if matches!(
-                rerank_precision,
-                RerankPrecision::F16 | RerankPrecision::F32
-            ) {
+            if !matches!(rerank_precision, RerankPrecision::Disabled) {
                 let vraw_path = Path::new(local_dir).join("live_vectors.bin");
                 if !vraw_path.exists() {
                     std::fs::File::create(&vraw_path)?;
@@ -1038,19 +1035,41 @@ impl TurboQuantEngine {
                         .expect("invariant: has_vraw=true implies live_vraw is Some")
                         .get_slot(from_slot);
                     let mut out = Array1::<f64>::zeros(d);
-                    if matches!(vraw_precision, RerankPrecision::F16) {
-                        for i in 0..d {
-                            let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2]
-                                .try_into()
-                                .expect("vraw f16 record has 2 bytes per element");
-                            out[i] = half::f16::from_le_bytes(bytes).to_f64();
+                    match vraw_precision {
+                        RerankPrecision::Int8 => {
+                            let scale = f32::from_le_bytes(rec[..4].try_into().unwrap()) as f64;
+                            for i in 0..d {
+                                out[i] = (rec[4 + i] as i8) as f64 * scale / 127.0;
+                            }
                         }
-                    } else {
-                        for i in 0..d {
-                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4]
-                                .try_into()
-                                .expect("vraw f32 record has 4 bytes per element");
-                            out[i] = f32::from_le_bytes(bytes) as f64;
+                        RerankPrecision::Int4 => {
+                            let scale = f32::from_le_bytes(rec[..4].try_into().unwrap()) as f64;
+                            for i in 0..d {
+                                let byte = rec[4 + i / 2];
+                                let nibble = if i % 2 == 0 {
+                                    byte & 0x0F
+                                } else {
+                                    (byte >> 4) & 0x0F
+                                };
+                                let signed = if nibble > 7 {
+                                    nibble as i8 - 16
+                                } else {
+                                    nibble as i8
+                                };
+                                out[i] = signed as f64 * scale / 7.0;
+                            }
+                        }
+                        RerankPrecision::F16 => {
+                            for i in 0..d {
+                                let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2].try_into().unwrap();
+                                out[i] = half::f16::from_le_bytes(bytes).to_f64();
+                            }
+                        }
+                        _ => {
+                            for i in 0..d {
+                                let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                                out[i] = f32::from_le_bytes(bytes) as f64;
+                            }
                         }
                     }
                     let prep = quantizer.prepare_ip_query_lite(&out);
@@ -1122,19 +1141,41 @@ impl TurboQuantEngine {
                         .expect("invariant: has_vraw=true implies live_vraw is Some")
                         .get_slot(from_slot);
                     let mut out = Array1::<f64>::zeros(d);
-                    if matches!(vraw_precision, RerankPrecision::F16) {
-                        for i in 0..d {
-                            let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2]
-                                .try_into()
-                                .expect("vraw f16 record has 2 bytes per element");
-                            out[i] = half::f16::from_le_bytes(bytes).to_f64();
+                    match vraw_precision {
+                        RerankPrecision::Int8 => {
+                            let scale = f32::from_le_bytes(rec[..4].try_into().unwrap()) as f64;
+                            for i in 0..d {
+                                out[i] = (rec[4 + i] as i8) as f64 * scale / 127.0;
+                            }
                         }
-                    } else {
-                        for i in 0..d {
-                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4]
-                                .try_into()
-                                .expect("vraw f32 record has 4 bytes per element");
-                            out[i] = f32::from_le_bytes(bytes) as f64;
+                        RerankPrecision::Int4 => {
+                            let scale = f32::from_le_bytes(rec[..4].try_into().unwrap()) as f64;
+                            for i in 0..d {
+                                let byte = rec[4 + i / 2];
+                                let nibble = if i % 2 == 0 {
+                                    byte & 0x0F
+                                } else {
+                                    (byte >> 4) & 0x0F
+                                };
+                                let signed = if nibble > 7 {
+                                    nibble as i8 - 16
+                                } else {
+                                    nibble as i8
+                                };
+                                out[i] = signed as f64 * scale / 7.0;
+                            }
+                        }
+                        RerankPrecision::F16 => {
+                            for i in 0..d {
+                                let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2].try_into().unwrap();
+                                out[i] = half::f16::from_le_bytes(bytes).to_f64();
+                            }
+                        }
+                        _ => {
+                            for i in 0..d {
+                                let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                                out[i] = f32::from_le_bytes(bytes) as f64;
+                            }
                         }
                     }
                     let from_norm = out.iter().map(|x| x * x).sum::<f64>().sqrt();

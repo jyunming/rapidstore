@@ -28,11 +28,13 @@ db = Database.open(
                              #        4 = better recall (default), 8 = near-lossless)
     seed=42,                 # int — RNG seed for quantizer, must stay the same across sessions
     metric="ip",             # str — "ip" (inner product), "cosine", or "l2"
-    rerank=True,             # bool — enable reranking of ANN candidates; precision via rerank_precision
-    fast_mode=False,         # bool — When False (default), QJL residual is stored and used
-                             #        during reranking for best recall (+9–15 pp R@1 vs True).
-                             #        Set True for MSE-only mode (paper Figure 5 allocation,
-                             #        ~30% faster ingest, no recall benefit from rerank=True).
+    rerank=False,            # bool — store raw vectors for exact second-pass rescoring.
+                             #        False (default) = MSE codes only, minimum disk.
+                             #        True = stores INT8 raw vectors; +5–25 pp R@1 depending on d.
+    fast_mode=True,          # bool — True (default) = MSE-only (paper Figure 5 allocation,
+                             #        fastest ingest, minimum disk).
+                             #        False = also stores 1-bit QJL residual; adds +5–10 pp R@1
+                             #        at d ≥ 1536 when rerank=False; no benefit when rerank=True.
     rerank_precision=None,   # str|None — None → "int8" (default when rerank=True)
                              #            "int8"/"i8" = INT8 per-vector-scaled (+n×(d+4) bytes)
                              #            "int4"/"i4" = INT4 nibble-packed (+n×(⌈d/2⌉+4) bytes)
@@ -82,8 +84,10 @@ These two parameters work together and must be understood as a pair:
 
 | `fast_mode` | `rerank` | Storage | Recall impact |
 |-------------|----------|---------|---------------|
-| `False` (default) | `True` (default) | MSE+QJL codes + INT8 raw vectors | **Best at d ≥ 1536** — QJL residual adds signal at high-d |
-| `True` | `True` | MSE codes + INT8 raw vectors | **Best at d < 1536** — QJL is noisy at low-d; saves ~4–8 MB/100k |
+| `True` (default) | `False` (default) | MSE codes only | Minimum disk; fastest ingest |
+| `True` | `True` | MSE codes + INT8 raw vectors | +5–25 pp R@1 vs default; ~2–4× more disk |
+| `False` | `False` | MSE+QJL codes | d ≥ 1536: +5–10 pp R@1; d < 512: hurts recall |
+| `False` | `True` | MSE+QJL codes + INT8 raw vectors | Maximum recall at d ≥ 1536 |
 | `True` | `False` | MSE codes only | Paper Figure 5 baseline; minimum disk |
 | `False` | `False` | MSE+QJL codes only | Modest recall gain over fast_mode=True at d ≥ 1536 |
 
@@ -101,11 +105,11 @@ See [`docs/CONFIGURATION.md`](CONFIGURATION.md) for a full decision guide with s
 
 ```python
 db = Database.open(path, dimension=DIM, bits=4)
-# rerank=True → INT8 raw vectors stored (default); fast_mode=False (MSE+QJL, default)
+# rerank=False, fast_mode=True (defaults) — MSE codes only; minimum disk, fastest ingest
 results = db.search(query, top_k=10)
-# GloVe-200 (d=200):     R@1 ≈ 1.00  |  ~20 MB disk
-# arXiv-768 (d=768):     R@1 ≈ 0.99  |  ~74 MB disk
-# DBpedia-1536 (d=1536): R@1 ≈ 0.95  |  ~149 MB disk
+# GloVe-200 (d=200):     R@1 ≈ 0.72  |  ~22 MB disk
+# arXiv-768 (d=768):     R@1 ≈ 0.92  |  ~48 MB disk
+# DBpedia-1536 (d=1536): R@1 ≈ 0.92  |  ~108 MB disk
 ```
 
 ### Best recall, high-d (d ≥ 1536)
