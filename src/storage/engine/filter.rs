@@ -151,6 +151,7 @@ pub(crate) fn apply_comparison_op(field: Option<&JsonValue>, op: &str, op_val: &
     }
 }
 
+#[allow(dead_code)]
 const KNOWN_COMPARISON_OPS: &[&str] = &[
     "$eq",
     "$ne",
@@ -166,15 +167,18 @@ const KNOWN_COMPARISON_OPS: &[&str] = &[
 
 /// Recursively validate that all operator keys in `filter` are known.
 /// Returns `Err(message)` on the first unknown operator encountered.
+#[allow(dead_code)]
 pub(crate) fn validate_filter_operators(filter: &HashMap<String, JsonValue>) -> Result<(), String> {
     validate_filter_operators_obj(filter.iter().map(|(k, v)| (k.as_str(), v)))
 }
 
 /// Internal helper that accepts a `serde_json::Map` reference to avoid cloning.
+#[allow(dead_code)]
 fn validate_filter_operators_inner(map: &serde_json::Map<String, JsonValue>) -> Result<(), String> {
     validate_filter_operators_obj(map.iter().map(|(k, v)| (k.as_str(), v)))
 }
 
+#[allow(dead_code)]
 fn validate_filter_operators_obj<'a>(
     iter: impl Iterator<Item = (&'a str, &'a JsonValue)>,
 ) -> Result<(), String> {

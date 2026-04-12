@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tqdb::storage::engine::{BatchWriteItem, DistanceMetric, GetResult, TurboQuantEngine};
 use tracing::{error, info};
 
@@ -3089,7 +3089,7 @@ mod tests {
                 }
                 Err(err) => {
                     if err.to_string().contains("EOF while parsing a value") {
-                        std::thread::sleep(Duration::from_millis(10));
+                        std::thread::sleep(std::time::Duration::from_millis(10));
                         open_err = Some(err.to_string());
                         continue;
                     }
