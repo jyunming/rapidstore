@@ -186,6 +186,21 @@ impl Database {
                 bits
             )));
         }
+        if bits > 64 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "bits must be <= 64; got {}",
+                bits
+            )));
+        }
+        if let Some(qt) = quantizer_type.as_deref() {
+            let qt_lower = qt.to_ascii_lowercase();
+            if qt_lower != "dense" && qt_lower != "exact" && qt_lower != "srht" {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid quantizer_type: '{}'. Valid values: 'dense', 'exact', 'srht'.",
+                    qt
+                )));
+            }
+        }
         if dimension == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "dimension must be > 0",
@@ -595,7 +610,7 @@ impl Database {
 
         let inc = parse_include_set(include, &["id", "score", "metadata", "document"])?;
 
-        let results = py.allow_threads(|| {
+        let (results, is_l2) = py.allow_threads(|| {
             let engine = self.read_engine()?;
             if q.len() != engine.d {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -604,8 +619,9 @@ impl Database {
                     q.len()
                 )));
             }
+            let is_l2 = matches!(engine.metric, crate::storage::engine::DistanceMetric::L2);
             let use_ann = _use_ann.unwrap_or_else(|| engine.auto_use_ann());
-            engine
+            let results = engine
                 .search_with_filter_and_ann(
                     &q,
                     top_k,
@@ -614,7 +630,8 @@ impl Database {
                     use_ann,
                     rerank_factor,
                 )
-                .map_err(to_py_runtime)
+                .map_err(to_py_runtime)?;
+            Ok((results, is_l2))
         })?;
 
         let py_list = PyList::empty_bound(py);
@@ -624,7 +641,8 @@ impl Database {
                 dict.set_item("id", &r.id)?;
             }
             if inc.contains("score") {
-                dict.set_item("score", r.score)?;
+                let user_score = if is_l2 { -r.score } else { r.score };
+                dict.set_item("score", user_score)?;
             }
             if inc.contains("metadata") {
                 let meta_dict = PyDict::new_bound(py);
@@ -869,7 +887,7 @@ impl Database {
         } else {
             Some(&parsed_filter)
         };
-        let batch = py.allow_threads(|| {
+        let (batch, is_l2) = py.allow_threads(|| {
             let engine = self.read_engine()?;
             for (i, row) in queries.iter().enumerate() {
                 if row.len() != engine.d {
@@ -881,7 +899,8 @@ impl Database {
                     )));
                 }
             }
-            engine
+            let is_l2 = matches!(engine.metric, crate::storage::engine::DistanceMetric::L2);
+            let batch = engine
                 .search_batch(
                     &queries,
                     n_results,
@@ -890,7 +909,8 @@ impl Database {
                     _use_ann,
                     rerank_factor,
                 )
-                .map_err(to_py_runtime)
+                .map_err(to_py_runtime)?;
+            Ok((batch, is_l2))
         })?;
 
         let outer = PyList::empty_bound(py);
@@ -899,7 +919,7 @@ impl Database {
             for r in results {
                 let dict = PyDict::new_bound(py);
                 dict.set_item("id", r.id)?;
-                dict.set_item("score", r.score)?;
+                dict.set_item("score", if is_l2 { -r.score } else { r.score })?;
                 let meta_dict = PyDict::new_bound(py);
                 for (k, v) in r.metadata {
                     meta_dict.set_item(k, json_to_py(py, &v)?)?;

@@ -2420,10 +2420,13 @@ impl TurboQuantEngine {
         self.delta_slots.clear();
         self.delta_slots_dirty = true;
 
-        if let Some(state) = self.manifest.index_state.as_mut() {
-            state.indexed_nodes = self.index_ids.len();
-            state.search_list_size = search_list_size;
-        }
+        self.manifest.index_state = Some(IndexState {
+            max_degree,
+            ef_construction,
+            search_list_size,
+            alpha,
+            indexed_nodes: self.index_ids.len(),
+        });
         self.maybe_persist_state(true)?;
         Ok(())
     }
