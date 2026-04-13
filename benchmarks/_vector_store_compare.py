@@ -156,7 +156,6 @@ def bench_tqdb(corpus, queries, true_top_k, N, D, Q):
             build_s = time.perf_counter() - t0
             cpu_build = cpu_s.stop()
             gc.collect(); rss1 = rss_mb()
-            disk = disk_size_mb(tmpdir)
             for qi in range(min(10, Q)):
                 db.search(queries[qi], top_k=K)
             gc.collect(); rss2 = rss_mb()
@@ -167,6 +166,9 @@ def bench_tqdb(corpus, queries, true_top_k, N, D, Q):
             gc.collect(); rss3 = rss_mb()
             recall = compute_recall(res, true_top_k, Q)
             db.close()
+            # Measure disk AFTER close: segment files are deleted on clean close,
+            # so this reflects the true at-rest footprint users see on disk.
+            disk = disk_size_mb(tmpdir)
         runs.append(summarize(lats, recall, build_s, disk, rss1-rss0, rss3-rss2, cpu_build, cpu_query))
         print(f"    tqdb     rep {rep+1}: p50={runs[-1]['p50_ms']:.2f}ms "
               f"recall={recall:.3f} disk={disk:.1f}MB "
@@ -506,7 +508,12 @@ CASES = {
 parser = argparse.ArgumentParser()
 parser.add_argument("--case", default="all", choices=list(CASES) + ["all"])
 parser.add_argument("--engines", default="all")
+parser.add_argument("--repeats", type=int, default=None,
+                    help="Override N_REPEATS for this run (default: use module-level N_REPEATS=3)")
 args = parser.parse_args()
+
+if args.repeats is not None:
+    N_REPEATS = args.repeats  # noqa: F811 — intentional module-level override
 
 engines_to_run = (list(ENGINES.keys()) if args.engines == "all"
                   else [e.strip() for e in args.engines.split(",")])
