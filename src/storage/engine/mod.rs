@@ -2019,6 +2019,12 @@ impl TurboQuantEngine {
                                 ) * doc_norm as f64;
                                 out.push((slot, score));
                             }
+                            if out.len() > internal_k {
+                                out.select_nth_unstable_by(internal_k, |a, b| {
+                                    b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+                                });
+                                out.truncate(internal_k);
+                            }
                             out
                         })
                         .collect()
@@ -2049,6 +2055,12 @@ impl TurboQuantEngine {
                                 );
                                 let score = if q_norm > 0.0 { ip / q_norm } else { 0.0 };
                                 out.push((slot, score));
+                            }
+                            if out.len() > internal_k {
+                                out.select_nth_unstable_by(internal_k, |a, b| {
+                                    b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+                                });
+                                out.truncate(internal_k);
                             }
                             out
                         })
@@ -2084,6 +2096,12 @@ impl TurboQuantEngine {
                                 v.mapv_inplace(|x| x * doc_norm as f64);
                                 let score = score_vectors_with_metric(metric, query, &v);
                                 out.push((slot, score));
+                            }
+                            if out.len() > internal_k {
+                                out.select_nth_unstable_by(internal_k, |a, b| {
+                                    b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+                                });
+                                out.truncate(internal_k);
                             }
                             out
                         })
