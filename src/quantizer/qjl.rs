@@ -66,6 +66,17 @@ impl QjlQuantizer {
         Self::new(d, seed)
     }
 
+    /// No-op placeholder for fast_mode databases that never use QJL.
+    /// Stores nothing (empty diag, no projection matrix) — O(1) construction and O(0) disk.
+    pub fn new_noop(d: usize) -> Self {
+        Self {
+            d,
+            n: d,
+            projection_signs: vec![],
+            projection_matrix: None,
+        }
+    }
+
     /// Exact-paper mode: dense i.i.d. N(0,1) Gaussian projection matrix.
     /// Dense mode: full N(0,1) Gaussian projection matrix, n=d (no padding).
     /// Output is normalized by 1/√d, so dense-mode query scoring must compensate

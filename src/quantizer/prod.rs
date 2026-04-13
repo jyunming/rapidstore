@@ -74,7 +74,9 @@ impl ProdQuantizer {
     pub fn new_dense_fast(d: usize, b: usize, seed: u64) -> Self {
         assert!(b >= 2, "ProdQuantizer requires at least b=2");
         let mse_quantizer = MseQuantizer::new_dense(d, b, seed);
-        let qjl_quantizer = QjlQuantizer::new_dense(d, seed ^ 0xdeadbeef);
+        // fast_mode never uses the QJL projection — use a no-op placeholder (empty
+        // struct, zero disk/RAM) instead of the dense D×D Gaussian matrix.
+        let qjl_quantizer = QjlQuantizer::new_noop(d);
         Self {
             d,
             n: d,
@@ -140,8 +142,11 @@ impl ProdQuantizer {
             }
         }
 
+        // fast_mode: all gammas are 0 so sq is never used in scoring — skip projection.
         let mut sq = vec![0.0f32; self.n];
-        self.qjl_quantizer.apply_projection(&query_f32, &mut sq);
+        if !self.fast_mode {
+            self.qjl_quantizer.apply_projection(&query_f32, &mut sq);
+        }
 
         PreparedIpQuery {
             mse_lut,
@@ -158,8 +163,11 @@ impl ProdQuantizer {
         let mut y = vec![0.0f32; self.n];
         self.mse_quantizer.apply_rotation(&query_f32, &mut y);
 
+        // fast_mode: all gammas are 0 so sq is never used in scoring — skip projection.
         let mut sq = vec![0.0f32; self.n];
-        self.qjl_quantizer.apply_projection(&query_f32, &mut sq);
+        if !self.fast_mode {
+            self.qjl_quantizer.apply_projection(&query_f32, &mut sq);
+        }
 
         PreparedIpQueryLite {
             y,
