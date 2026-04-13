@@ -139,17 +139,17 @@ impl MetadataStore {
         Ok(out)
     }
 
-    pub fn get_many_properties(
-        &self,
+    pub fn get_many_properties<'a>(
+        &'a self,
         slots: &[u32],
     ) -> Result<
-        HashMap<u32, HashMap<String, serde_json::Value>>,
+        HashMap<u32, &'a HashMap<String, serde_json::Value>>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let mut out = HashMap::with_capacity(slots.len());
         for slot in slots {
             if let Some(meta) = self.data.get(slot) {
-                out.insert(*slot, meta.properties.clone());
+                out.insert(*slot, &meta.properties);
             }
         }
         Ok(out)

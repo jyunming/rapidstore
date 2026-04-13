@@ -223,9 +223,18 @@ impl IdPool {
         offsets: Vec<u32>,
         lens: Vec<u16>,
         alive: Vec<bool>,
-    ) -> Self {
-        let mut pool = Self::new();
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let n = offsets.len();
+        if lens.len() != n || alive.len() != n {
+            return Err(format!(
+                "corrupt sparse id pool: offsets/lens/alive length mismatch ({}/{}/{})",
+                n,
+                lens.len(),
+                alive.len()
+            )
+            .into());
+        }
+        let mut pool = Self::new();
         pool.bytes = bytes;
         pool.offsets = offsets;
         pool.lens = lens;
@@ -234,11 +243,21 @@ impl IdPool {
         for i in 0..n {
             let start = pool.offsets[i] as usize;
             let len = pool.lens[i] as usize;
-            let id_bytes = &pool.bytes[start..start + len];
+            let end = start.checked_add(len).ok_or_else(|| {
+                format!("corrupt sparse id pool: offset+len overflow at slot {i}")
+            })?;
+            if end > pool.bytes.len() {
+                return Err(format!(
+                    "corrupt sparse id pool: slot {i} range {start}..{end} out of bounds (bytes len={})",
+                    pool.bytes.len()
+                )
+                .into());
+            }
+            let id_bytes = &pool.bytes[start..end];
             pool.hashes.push(fnv1a64(id_bytes));
         }
         pool.rebuild_lookup();
-        pool
+        Ok(pool)
     }
 
     pub fn from_dense_id_dash(slot_count: usize, alive_bits: &[u8]) -> Self {

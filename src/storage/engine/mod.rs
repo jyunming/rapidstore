@@ -747,7 +747,7 @@ impl TurboQuantEngine {
             let ids: Vec<String> = active
                 .iter()
                 .filter(|(_, slot)| {
-                    let props = meta_map.get(slot).unwrap_or(&empty_props);
+                    let props = meta_map.get(slot).copied().unwrap_or(&empty_props);
                     metadata_matches_filter(props, f)
                 })
                 .map(|(id, _)| id.clone())
@@ -939,7 +939,7 @@ impl TurboQuantEngine {
         let count = slots
             .iter()
             .filter(|slot| {
-                let props = meta_map.get(slot).unwrap_or(&empty_props);
+                let props = meta_map.get(slot).copied().unwrap_or(&empty_props);
                 metadata_matches_filter(props, f)
             })
             .count();
@@ -1502,7 +1502,7 @@ impl TurboQuantEngine {
                         indexed
                             .into_iter()
                             .filter(|s| {
-                                let props = meta_map.get(s).unwrap_or(&empty_props);
+                                let props = meta_map.get(s).copied().unwrap_or(&empty_props);
                                 metadata_matches_filter(props, f)
                             })
                             .collect()
@@ -1515,7 +1515,7 @@ impl TurboQuantEngine {
                     let v: Vec<u32> = slots
                         .into_iter()
                         .filter(|s| {
-                            let props = meta_map.get(s).unwrap_or(&empty_props);
+                            let props = meta_map.get(s).copied().unwrap_or(&empty_props);
                             metadata_matches_filter(props, f)
                         })
                         .collect();
@@ -1842,7 +1842,7 @@ impl TurboQuantEngine {
                     slots
                         .into_iter()
                         .filter(|s| {
-                            let props = meta_map.get(s).unwrap_or(&empty_props);
+                            let props = meta_map.get(s).copied().unwrap_or(&empty_props);
                             metadata_matches_filter(props, f)
                         })
                         .collect()
@@ -1871,7 +1871,7 @@ impl TurboQuantEngine {
                             indexed_slots
                                 .into_iter()
                                 .filter(|s| {
-                                    let props = meta_map.get(s).unwrap_or(&empty_props);
+                                    let props = meta_map.get(s).copied().unwrap_or(&empty_props);
                                     metadata_matches_filter(props, f)
                                 })
                                 .collect()
@@ -1884,7 +1884,7 @@ impl TurboQuantEngine {
                         let cands: Vec<u32> = all_slots
                             .into_iter()
                             .filter(|s| {
-                                let props = meta_map.get(s).unwrap_or(&empty_props);
+                                let props = meta_map.get(s).copied().unwrap_or(&empty_props);
                                 metadata_matches_filter(props, f)
                             })
                             .collect();
@@ -3462,12 +3462,7 @@ fn deserialize_id_pool_bytes(
     }
     if bytes.starts_with(ID_POOL_SPARSE_MAGIC) {
         let sparse: SparseIdDisk = bincode::deserialize(&bytes[ID_POOL_SPARSE_MAGIC.len()..])?;
-        return Ok(IdPool::from_sparse(
-            sparse.bytes,
-            sparse.offsets,
-            sparse.lens,
-            sparse.alive,
-        ));
+        return IdPool::from_sparse(sparse.bytes, sparse.offsets, sparse.lens, sparse.alive);
     }
     // Legacy: raw bincode with hashes included.
     Ok(bincode::deserialize(bytes)?)
