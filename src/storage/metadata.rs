@@ -142,8 +142,10 @@ impl MetadataStore {
     pub fn get_many_properties(
         &self,
         slots: &[u32],
-    ) -> Result<HashMap<u32, HashMap<String, serde_json::Value>>, Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> Result<
+        HashMap<u32, HashMap<String, serde_json::Value>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let mut out = HashMap::with_capacity(slots.len());
         for slot in slots {
             if let Some(meta) = self.data.get(slot) {
@@ -260,20 +262,28 @@ impl MetadataStore {
             return Ok(());
         }
 
+        // Collect non-empty property entries and docs in a single pass.
+        // Slots with empty properties are omitted — they round-trip to the default
+        // VectorMetadata on load without needing disk space.
+        let mut non_empty_props: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut docs: Vec<(u32, String)> = Vec::new();
+        for (&slot, meta) in &self.data {
+            if !meta.properties.is_empty() {
+                non_empty_props.push((slot, serde_json::to_vec(&meta.properties)?));
+            }
+            if let Some(doc) = &meta.document {
+                docs.push((slot, doc.clone()));
+            }
+        }
+
         let tmp = self.path.with_extension("tmp");
         let mut writer = BufWriter::new(File::create(&tmp)?);
         writer.write_all(b"M2S2")?;
-        writer.write_all(&(self.data.len() as u64).to_le_bytes())?;
-
-        let mut docs: Vec<(u32, String)> = Vec::new();
-        for (slot, meta) in &self.data {
-            let props_bytes = serde_json::to_vec(&meta.properties)?;
+        writer.write_all(&(non_empty_props.len() as u64).to_le_bytes())?;
+        for (slot, props_bytes) in &non_empty_props {
             writer.write_all(&slot.to_le_bytes())?;
             writer.write_all(&(props_bytes.len() as u32).to_le_bytes())?;
-            writer.write_all(&props_bytes)?;
-            if let Some(doc) = &meta.document {
-                docs.push((*slot, doc.clone()));
-            }
+            writer.write_all(props_bytes)?;
         }
 
         writer.flush()?;
@@ -296,7 +306,7 @@ impl MetadataStore {
                 raw.write_all(&(b.len() as u32).to_le_bytes())?;
                 raw.write_all(b)?;
             }
-            let compressed = zstd::stream::encode_all(raw.as_slice(), 3)?;
+            let compressed = zstd::stream::encode_all(raw.as_slice(), 9)?;
             std::fs::write(&docs_tmp, compressed)?;
             #[cfg(target_os = "windows")]
             let _ = std::fs::remove_file(&self.docs_path);

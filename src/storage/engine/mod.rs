@@ -29,6 +29,9 @@ const DELTA_IDS_FILE: &str = "delta_ids.json";
 const ID_POOL_FILE: &str = "live_ids.bin";
 const MANIFEST_SAVE_INTERVAL_OPS: usize = 64;
 const ID_POOL_DENSE_MAGIC: &[u8; 8] = b"TQID2D1\0";
+/// Sparse format: stores bytes/offsets/lens/alive only — hashes recomputed on load.
+/// Saves 8 bytes × slot_count vs the raw bincode layout.
+const ID_POOL_SPARSE_MAGIC: &[u8; 8] = b"TQID2S1\0";
 /// Automatic maintenance: when segment count grows beyond this threshold,
 /// a compaction checkpoint is triggered on WAL flush.
 const AUTO_CHECKPOINT_SEGMENTS_THRESHOLD: usize = 64;
@@ -1486,7 +1489,8 @@ impl TurboQuantEngine {
             let filter_slots: Option<Vec<u32>> = if let Some(f) = filter {
                 let active_slots = self.id_pool.iter_active_slots();
 
-                let matches = if let Some(indexed) = self.resolve_filter_via_index(f, &active_slots) {
+                let matches = if let Some(indexed) = self.resolve_filter_via_index(f, &active_slots)
+                {
                     let all_eq = extract_indexable_eq(f)
                         .map(|eqs| eqs.len() == f.len())
                         .unwrap_or(false);
@@ -1826,6 +1830,7 @@ impl TurboQuantEngine {
             top_k
         };
         let q_norm = query.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let q_norm_inv = if q_norm > 0.0 { 1.0 / q_norm } else { 0.0 };
 
         // Build candidate slot list: either from the forced set or all active slots.
         // Pre-filter slots upfront to keep the hot scoring loop filter-free.
@@ -1955,7 +1960,7 @@ impl TurboQuantEngine {
                             &rec[mse_len..mse_len + qjl_len],
                             gamma as f64,
                         );
-                        let score = if q_norm > 0.0 { ip / q_norm } else { 0.0 };
+                        let score = ip * q_norm_inv;
                         out.push((slot, score));
                     }
                 }
@@ -2053,7 +2058,7 @@ impl TurboQuantEngine {
                                     &rec[mse_len..mse_len + qjl_len],
                                     gamma as f64,
                                 );
-                                let score = if q_norm > 0.0 { ip / q_norm } else { 0.0 };
+                                let score = ip * q_norm_inv;
                                 out.push((slot, score));
                             }
                             if out.len() > internal_k {
@@ -3377,6 +3382,7 @@ fn save_id_pool(
     pool: &IdPool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bytes = if let Some(alive_bits) = pool.dense_alive_bits_if_compatible() {
+        // Dense format: all IDs are "id-{slot}" — store only a bitset.
         let dense = DenseIdDashDisk {
             slot_count: pool.slot_count() as u32,
             alive_bits,
@@ -3385,7 +3391,17 @@ fn save_id_pool(
         out.extend_from_slice(&bincode::serialize(&dense)?);
         out
     } else {
-        bincode::serialize(pool)?
+        // Sparse format: omit the hashes field (recomputed on load from bytes/offsets/lens).
+        // Saves 8 bytes × slot_count vs the raw bincode layout.
+        let sparse = SparseIdDisk {
+            bytes: pool.raw_bytes().to_vec(),
+            offsets: pool.raw_offsets().to_vec(),
+            lens: pool.raw_lens().to_vec(),
+            alive: pool.raw_alive().to_vec(),
+        };
+        let mut out = ID_POOL_SPARSE_MAGIC.to_vec();
+        out.extend_from_slice(&bincode::serialize(&sparse)?);
+        out
     };
     let local = format!("{}/{}", local_dir, ID_POOL_FILE);
     std::fs::write(&local, &bytes)?;
@@ -3419,6 +3435,16 @@ struct DenseIdDashDisk {
     alive_bits: Vec<u8>,
 }
 
+/// Compact on-disk layout that omits the redundant `hashes` field.
+/// Hashes are recomputed from `bytes`/`offsets`/`lens` at load time.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SparseIdDisk {
+    bytes: Vec<u8>,
+    offsets: Vec<u32>,
+    lens: Vec<u16>,
+    alive: Vec<bool>,
+}
+
 fn deserialize_id_pool_bytes(
     bytes: &[u8],
 ) -> Result<IdPool, Box<dyn std::error::Error + Send + Sync>> {
@@ -3429,6 +3455,16 @@ fn deserialize_id_pool_bytes(
             &dense.alive_bits,
         ));
     }
+    if bytes.starts_with(ID_POOL_SPARSE_MAGIC) {
+        let sparse: SparseIdDisk = bincode::deserialize(&bytes[ID_POOL_SPARSE_MAGIC.len()..])?;
+        return Ok(IdPool::from_sparse(
+            sparse.bytes,
+            sparse.offsets,
+            sparse.lens,
+            sparse.alive,
+        ));
+    }
+    // Legacy: raw bincode with hashes included.
     Ok(bincode::deserialize(bytes)?)
 }
 

@@ -40,6 +40,20 @@ impl IdPool {
         self.bytes.len()
     }
 
+    /// Accessors for the sparse on-disk serialization (omits hashes).
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn raw_offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+    pub fn raw_lens(&self) -> &[u16] {
+        &self.lens
+    }
+    pub fn raw_alive(&self) -> &[bool] {
+        &self.alive
+    }
+
     pub fn contains(&self, id: &str) -> bool {
         self.get_slot(id).is_some()
     }
@@ -200,6 +214,31 @@ impl IdPool {
             }
         }
         Some(bits)
+    }
+
+    /// Reconstruct from the compact on-disk layout that omits the `hashes` field.
+    /// Hashes are recomputed here from the stored ID bytes, then `rebuild_lookup` is called.
+    pub fn from_sparse(
+        bytes: Vec<u8>,
+        offsets: Vec<u32>,
+        lens: Vec<u16>,
+        alive: Vec<bool>,
+    ) -> Self {
+        let mut pool = Self::new();
+        let n = offsets.len();
+        pool.bytes = bytes;
+        pool.offsets = offsets;
+        pool.lens = lens;
+        pool.alive = alive;
+        pool.hashes.reserve(n);
+        for i in 0..n {
+            let start = pool.offsets[i] as usize;
+            let len = pool.lens[i] as usize;
+            let id_bytes = &pool.bytes[start..start + len];
+            pool.hashes.push(fnv1a64(id_bytes));
+        }
+        pool.rebuild_lookup();
+        pool
     }
 
     pub fn from_dense_id_dash(slot_count: usize, alive_bits: &[u8]) -> Self {
