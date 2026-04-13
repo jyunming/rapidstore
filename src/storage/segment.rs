@@ -283,6 +283,22 @@ impl SegmentManager {
         self.segments.retain(|s| !names.contains(&s.name));
     }
 
+    /// Delete every segment file from the backend and clear the in-memory list.
+    ///
+    /// Called on clean close: `live_codes.bin` + `live_ids.bin` are the authoritative
+    /// state; segments are crash-recovery fallbacks that are no longer needed once the
+    /// database has been flushed and closed cleanly.  On the next open, an empty segment
+    /// list is treated as a fresh start — WAL replay and `live_codes.bin` restore state.
+    pub fn drop_all(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let names: Vec<String> = self.segments.iter().map(|s| s.name.clone()).collect();
+        for name in &names {
+            // Ignore errors — best-effort cleanup; a leftover file doesn't break anything.
+            let _ = self.backend.delete(name);
+        }
+        self.segments.clear();
+        Ok(())
+    }
+
     /// Add a segment to the internal list.
     pub fn add_segment(&mut self, segment: Segment) {
         self.segments.push(segment);

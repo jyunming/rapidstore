@@ -278,6 +278,8 @@ class Database:
         where_filter: dict[str, Any] | None = None,
         _use_ann: bool = False,
         ann_search_list_size: int | None = None,
+        rerank_factor: int | None = None,
+        include: list[str] | None = None,
     ) -> list[list[dict[str, Any]]]:
         """Search with multiple query vectors in one call.
 
@@ -288,10 +290,14 @@ class Database:
             where_filter: Optional metadata filter.
             _use_ann: Use HNSW index when ``True``. Default ``False``.
             ann_search_list_size: HNSW ``ef_search`` override.
+            rerank_factor: Oversampling multiplier for rerank candidate pool.
+            include: Subset of fields to include in each result dict.
+                Valid values: ``"id"``, ``"score"``, ``"metadata"``,
+                ``"document"``. Defaults to all four.
 
         Returns:
-            List of N result lists, each in the same format as
-            :meth:`search`.
+            List of N result lists. Each result dict contains the keys
+            requested via *include*.
         """
         ...
 
@@ -351,6 +357,10 @@ class Database:
 
     def flush(self) -> None:
         """Flush the WAL to an immutable segment file immediately."""
+        ...
+
+    def checkpoint(self) -> None:
+        """Flush pending writes and compact segments when threshold is met."""
         ...
 
     def close(self) -> None:

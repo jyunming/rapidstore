@@ -100,6 +100,9 @@ The number of candidates pre-selected by the quantized pass before exact re-scor
 - `rerank_factor=10`: default, good balance
 - `rerank_factor=20–50`: maximum recall, use when latency is not critical
 
+Default behavior note:
+- The default oversampling is intentionally fixed (`10` brute-force / `20` ANN). It is not auto-adapted by dimension unless you pass `rerank_factor` explicitly.
+
 ```python
 # High-recall, accepts 5× latency overhead
 results = db.search(query, top_k=10, rerank_factor=50)

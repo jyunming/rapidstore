@@ -69,3 +69,27 @@ jobs:
 
       - name: Run pytest test suite
         run: pytest tests/test_python_api.py -v --tb=short
+
+  perf-gate:
+    name: Perf gate (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Create virtualenv
+        run: python -m venv .venv && echo "$PWD/.venv/bin" >> $GITHUB_PATH && echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
+
+      - name: Install benchmark deps
+        run: pip install maturin numpy
+
+      - name: Build dev extension
+        run: maturin develop --release
+
+      - name: Run sprint perf gate
+        run: python benchmarks/sprint_smoke.py

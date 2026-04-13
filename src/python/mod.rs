@@ -620,13 +620,16 @@ impl Database {
             let is_l2 = matches!(engine.metric, crate::storage::engine::DistanceMetric::L2);
             let use_ann = _use_ann.unwrap_or_else(|| engine.auto_use_ann());
             let results = engine
-                .search_with_filter_and_ann(
+                .search_with_filter_and_ann_include(
                     &q,
                     top_k,
                     filter_ref,
                     ann_search_list_size,
                     use_ann,
                     rerank_factor,
+                    inc.contains("id"),
+                    inc.contains("metadata"),
+                    inc.contains("document"),
                 )
                 .map_err(to_py_runtime)?;
             Ok((results, is_l2))
@@ -755,6 +758,15 @@ impl Database {
         })
     }
 
+    /// Force a maintenance checkpoint: flush WAL and compact segments when
+    /// compaction threshold is reached.
+    fn checkpoint(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| {
+            let mut engine = self.write_engine()?;
+            engine.checkpoint().map_err(to_py_runtime)
+        })
+    }
+
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| {
             let mut engine = self.write_engine()?;
@@ -815,13 +827,16 @@ impl Database {
     ///         Only relevant when ``_use_ann=True`` and an index exists.
     ///     rerank_factor: Oversampling multiplier for the rerank candidate pool (see
     ///         :meth:`search` for full description). Default ``None``.
+    ///     include: Subset of fields to return — ``["id", "score", "metadata", "document"]``.
+    ///         Defaults to all four.
     ///
     /// Note:
     ///     Pass ``_use_ann=True`` to engage the HNSW index (must be built first via
     ///     :meth:`create_index`). Default is ``False`` (exhaustive brute-force).
     ///
     /// Returns:
-    ///     List of N result lists, each in the same format as :meth:`search`.
+    ///     List of N result lists. Each result dict contains the keys requested
+    ///     via ``include``.
     ///
     /// Example::
     ///
@@ -829,7 +844,7 @@ impl Database {
     ///         query_embeddings=np.stack([q1, q2, q3]),
     ///         n_results=5,
     ///     )
-    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=None, ann_search_list_size=None, rerank_factor=None))]
+    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=None, ann_search_list_size=None, rerank_factor=None, include=None))]
     fn query(
         &self,
         py: Python<'_>,
@@ -839,6 +854,7 @@ impl Database {
         _use_ann: Option<bool>,
         ann_search_list_size: Option<usize>,
         rerank_factor: Option<usize>,
+        include: Option<Vec<String>>,
     ) -> PyResult<PyObject> {
         if n_results <= 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -886,6 +902,11 @@ impl Database {
         } else {
             Some(&parsed_filter)
         };
+        let inc = parse_include_set(include, &["id", "score", "metadata", "document"])?;
+        let include_id = inc.contains("id");
+        let include_score = inc.contains("score");
+        let include_metadata = inc.contains("metadata");
+        let include_document = inc.contains("document");
         let (batch, is_l2) = py.allow_threads(|| {
             let engine = self.read_engine()?;
             for (i, row) in queries.iter().enumerate() {
@@ -900,13 +921,16 @@ impl Database {
             }
             let is_l2 = matches!(engine.metric, crate::storage::engine::DistanceMetric::L2);
             let batch = engine
-                .search_batch(
+                .search_batch_with_include(
                     &queries,
                     n_results,
                     filter_ref,
                     ann_search_list_size,
                     _use_ann,
                     rerank_factor,
+                    include_id,
+                    include_metadata,
+                    include_document,
                 )
                 .map_err(to_py_runtime)?;
             Ok((batch, is_l2))
@@ -917,15 +941,23 @@ impl Database {
             let inner = PyList::empty_bound(py);
             for r in results {
                 let dict = PyDict::new_bound(py);
-                dict.set_item("id", r.id)?;
-                dict.set_item("score", if is_l2 { -r.score } else { r.score })?;
-                let meta_dict = PyDict::new_bound(py);
-                for (k, v) in r.metadata {
-                    meta_dict.set_item(k, json_to_py(py, &v)?)?;
+                if include_id {
+                    dict.set_item("id", r.id)?;
                 }
-                dict.set_item("metadata", meta_dict)?;
-                if let Some(doc) = r.document {
-                    dict.set_item("document", doc)?;
+                if include_score {
+                    dict.set_item("score", if is_l2 { -r.score } else { r.score })?;
+                }
+                if include_metadata {
+                    let meta_dict = PyDict::new_bound(py);
+                    for (k, v) in r.metadata {
+                        meta_dict.set_item(k, json_to_py(py, &v)?)?;
+                    }
+                    dict.set_item("metadata", meta_dict)?;
+                }
+                if include_document {
+                    if let Some(doc) = r.document {
+                        dict.set_item("document", doc)?;
+                    }
                 }
                 inner.append(dict)?;
             }

@@ -11,6 +11,10 @@ python benchmarks/paper_recall_bench.py --update-readme --track
 ```
 (requires `pip install datasets psutil matplotlib`)
 
+CI perf gate:
+- PR CI runs a fast smoke perf gate (`benchmarks/sprint_smoke.py`) in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+- This is a regression tripwire (latency/recall/ingest), not a full publish benchmark replacement.
+
 ---
 
 <!-- PAPER_BENCH_START -->

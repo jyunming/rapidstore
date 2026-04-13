@@ -6,6 +6,33 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
+## [0.5.2] — 2026-04-13
+
+### Added
+
+- **`db.checkpoint()`** — new public method; triggers an immediate WAL flush and segment compaction when the compaction threshold is reached. Useful for explicit maintenance after large bulk loads.
+- **`include=` for `db.query()`** — `query()` now accepts the same `include` parameter as `search()`. Pass a subset of `["id", "score", "metadata", "document"]` to control which fields appear in each result dict. Defaults to all four. Reduces Python-side allocation and serialization overhead for callers that only need scores or IDs.
+- **`rerank_factor` for `db.query()`** — `query()` now accepts `rerank_factor` (previously only on `search()`). Consistent with the single-query API.
+
+### Performance
+
+- **QJL no-op in `fast_mode`** — `fast_mode=True` databases now use a zero-allocation placeholder instead of the QJL projection (dense mode: saves D²×4 bytes per database; SRHT mode: saves 4D bytes). The projection is never used in fast_mode, so this reduces both disk footprint and open-time memory.
+- **Sparse ID pool on disk** — the ID pool is now serialized without the redundant `hashes` array; hashes are recomputed on load. Saves 8 bytes × slot_count per database.
+- **Dense alive-bitmap encoding** — when all IDs match the `id-{slot}` pattern (common in benchmarks and migrations), the ID pool is stored as a compact bit-array. Reduces live_ids.bin size by ~10× for these workloads.
+- **Segment files deleted on clean close** — immutable segment files (crash-recovery fallbacks) are deleted when the database is closed cleanly. Saves 2–4 MB per database; state is recovered from live_codes.bin + WAL on reopen.
+- **Sequential path for small search batches** — `search_batch` / `query()` now uses a sequential loop for batches with < 4 queries, avoiding Rayon scheduling overhead on interactive RAG calls.
+- **Adaptive parallel threshold by dimension** — brute-force scoring switches to inner parallelism only when the candidate pool exceeds a per-dimension size threshold, reducing thread contention for small corpora.
+- **Auto-compaction on WAL flush** — when the segment count exceeds the `AUTO_CHECKPOINT_SEGMENTS_THRESHOLD` (64), a compaction checkpoint is automatically triggered on the next WAL flush.
+- **`q_norm_inv` precomputation** — query norm inverse precomputed once per search call instead of per-candidate, reducing redundant divisions in the scoring loop.
+- **Zero-copy metadata filter scan** — `get_many_properties()` returns only the properties map (not the full `VectorMetadata` struct), reducing allocations in hot filter and list_ids paths.
+- **Empty metadata skip** — `update_metadata()` now deletes the metadata entry when both properties and document are empty/None, avoiding writes of zero-content rows.
+
+### Documentation
+
+- **`server/README.md` → `docs/SERVER_API.md`** — server documentation consolidated into the `docs/` tree. README link updated.
+
+---
+
 ## [0.5.1] — 2026-04-12
 
 ### Added

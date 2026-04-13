@@ -128,12 +128,17 @@ len(db) / "id" in db                 # container protocol
 
 # Search — brute-force by default; pass _use_ann=True to use HNSW index
 results = db.search(query, top_k=10, filter=None, _use_ann=False,
-                    ann_search_list_size=None, include=None)
+                    ann_search_list_size=None, rerank_factor=None, include=None)
 # include: list of "id"|"score"|"metadata"|"document" (default all)
 # ann_search_list_size: HNSW ef_search override (only used when _use_ann=True)
+# rerank_factor: candidate oversampling multiplier (default 10 brute / 20 ANN)
 
-all_results = db.query(query_embeddings, n_results=10, where_filter=None)
+all_results = db.query(query_embeddings, n_results=10, where_filter=None,
+                       rerank_factor=None, include=None)
 # query_embeddings: np.ndarray (N, D) — returns list[list[dict]]
+
+# Manual maintenance checkpoint (WAL flush + segment compaction)
+db.checkpoint()
 
 # Index
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5,

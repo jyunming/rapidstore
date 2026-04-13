@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Allocation-free check: returns true iff `id == format!("id-{slot}")`.
+#[inline]
+fn is_id_dash_slot(id: &str, slot: u32) -> bool {
+    id.strip_prefix("id-")
+        .and_then(|s| s.parse::<u32>().ok())
+        .is_some_and(|n| n == slot)
+}
+
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct IdPool {
     bytes: Vec<u8>,
@@ -8,13 +16,24 @@ pub struct IdPool {
     lens: Vec<u16>,
     hashes: Vec<u64>,
     alive: Vec<bool>,
+    /// Derived index for fast ID -> slot lookup. Rebuilt after load.
+    #[serde(skip)]
     lookup: HashMap<u64, Vec<u32>>,
+    /// Derived count of live slots. Rebuilt after load.
+    #[serde(skip)]
     active_count: usize,
+    /// True when all alive IDs match the compact pattern `id-{slot}`.
+    /// Used to enable dense on-disk encoding of `live_ids.bin`.
+    #[serde(skip)]
+    dense_id_dash_possible: bool,
 }
 
 impl IdPool {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            dense_id_dash_possible: true,
+            ..Self::default()
+        }
     }
 
     pub fn slot_count(&self) -> usize {
@@ -27,6 +46,20 @@ impl IdPool {
 
     pub fn bytes_len(&self) -> usize {
         self.bytes.len()
+    }
+
+    /// Accessors for the sparse on-disk serialization (omits hashes).
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn raw_offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+    pub fn raw_lens(&self) -> &[u16] {
+        &self.lens
+    }
+    pub fn raw_alive(&self) -> &[bool] {
+        &self.alive
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -53,6 +86,10 @@ impl IdPool {
         self.hashes.push(hash);
         self.alive.push(true);
         self.bytes.extend_from_slice(id.as_bytes());
+
+        if self.dense_id_dash_possible && !is_id_dash_slot(id, slot) {
+            self.dense_id_dash_possible = false;
+        }
 
         self.lookup.entry(hash).or_default().push(slot);
         self.active_count += 1;
@@ -132,6 +169,18 @@ impl IdPool {
         out
     }
 
+    /// Iterate active slots only (no ID string materialization).
+    /// Use this in hot paths that only need slot numbers.
+    pub fn iter_active_slots(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity(self.active_count);
+        for slot in 0..self.offsets.len() {
+            if self.alive[slot] {
+                out.push(slot as u32);
+            }
+        }
+        out
+    }
+
     pub fn clear(&mut self) {
         self.bytes.clear();
         self.offsets.clear();
@@ -140,17 +189,104 @@ impl IdPool {
         self.alive.clear();
         self.lookup.clear();
         self.active_count = 0;
+        self.dense_id_dash_possible = true;
     }
 
     pub fn rebuild_lookup(&mut self) {
         self.lookup.clear();
         self.active_count = 0;
+        self.dense_id_dash_possible = true;
         for (i, &hash) in self.hashes.iter().enumerate() {
             if self.alive.get(i).copied().unwrap_or(false) {
                 self.lookup.entry(hash).or_default().push(i as u32);
                 self.active_count += 1;
+                if self
+                    .get_str(i as u32)
+                    .is_none_or(|id| !is_id_dash_slot(id, i as u32))
+                {
+                    self.dense_id_dash_possible = false;
+                }
             }
         }
+    }
+
+    pub fn dense_alive_bits_if_compatible(&self) -> Option<Vec<u8>> {
+        if !self.dense_id_dash_possible {
+            return None;
+        }
+        let n = self.alive.len();
+        let mut bits = vec![0u8; n.div_ceil(8)];
+        for (i, &alive) in self.alive.iter().enumerate() {
+            if alive {
+                bits[i / 8] |= 1u8 << (i % 8);
+            }
+        }
+        Some(bits)
+    }
+
+    /// Reconstruct from the compact on-disk layout that omits the `hashes` field.
+    /// Hashes are recomputed here from the stored ID bytes, then `rebuild_lookup` is called.
+    pub fn from_sparse(
+        bytes: Vec<u8>,
+        offsets: Vec<u32>,
+        lens: Vec<u16>,
+        alive: Vec<bool>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let n = offsets.len();
+        if lens.len() != n || alive.len() != n {
+            return Err(format!(
+                "corrupt sparse id pool: offsets/lens/alive length mismatch ({}/{}/{})",
+                n,
+                lens.len(),
+                alive.len()
+            )
+            .into());
+        }
+        let mut pool = Self::new();
+        pool.bytes = bytes;
+        pool.offsets = offsets;
+        pool.lens = lens;
+        pool.alive = alive;
+        pool.hashes.reserve(n);
+        for i in 0..n {
+            let start = pool.offsets[i] as usize;
+            let len = pool.lens[i] as usize;
+            let end = start.checked_add(len).ok_or_else(|| {
+                format!("corrupt sparse id pool: offset+len overflow at slot {i}")
+            })?;
+            if end > pool.bytes.len() {
+                return Err(format!(
+                    "corrupt sparse id pool: slot {i} range {start}..{end} out of bounds (bytes len={})",
+                    pool.bytes.len()
+                )
+                .into());
+            }
+            let id_bytes = &pool.bytes[start..end];
+            pool.hashes.push(fnv1a64(id_bytes));
+        }
+        pool.rebuild_lookup();
+        Ok(pool)
+    }
+
+    pub fn from_dense_id_dash(slot_count: usize, alive_bits: &[u8]) -> Self {
+        let mut pool = Self::new();
+        pool.offsets.reserve(slot_count);
+        pool.lens.reserve(slot_count);
+        pool.hashes.reserve(slot_count);
+        pool.alive.reserve(slot_count);
+
+        for i in 0..slot_count {
+            let id = format!("id-{}", i);
+            let hash = fnv1a64(id.as_bytes());
+            pool.offsets.push(pool.bytes.len() as u32);
+            pool.lens.push(id.len() as u16);
+            pool.hashes.push(hash);
+            let alive = ((alive_bits.get(i / 8).copied().unwrap_or(0) >> (i % 8)) & 1u8) != 0;
+            pool.alive.push(alive);
+            pool.bytes.extend_from_slice(id.as_bytes());
+        }
+        pool.rebuild_lookup();
+        pool
     }
 }
 
@@ -260,5 +396,23 @@ mod tests {
         let mut p = IdPool::new();
         let long_id = "x".repeat(u16::MAX as usize + 1);
         assert!(p.insert(&long_id).is_err());
+    }
+
+    #[test]
+    fn serde_roundtrip_rebuilds_lookup_and_active_count() {
+        let mut p = IdPool::new();
+        p.insert("a").unwrap();
+        p.insert("b").unwrap();
+        p.delete_by_id("a");
+
+        let bytes = bincode::serialize(&p).unwrap();
+        let mut p2: IdPool = bincode::deserialize(&bytes).unwrap();
+        // lookup + active_count are skipped in serde and must be rebuilt.
+        p2.rebuild_lookup();
+
+        assert_eq!(p2.slot_count(), 2);
+        assert_eq!(p2.active_count(), 1);
+        assert_eq!(p2.get_slot("a"), None);
+        assert_eq!(p2.get_slot("b"), Some(1));
     }
 }

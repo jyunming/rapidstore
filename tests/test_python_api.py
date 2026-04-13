@@ -620,6 +620,22 @@ class TestFlushClose:
         db.insert("a", np.ones(8, dtype=np.float32))
         db.close()  # should not raise
 
+    def test_checkpoint_is_callable(self, tmp_path):
+        db = open_db(str(tmp_path / "db"), d=8)
+        for i in range(5):
+            db.insert(str(i), np.ones(8, dtype=np.float32))
+        db.checkpoint()  # should not raise
+
+    def test_checkpoint_data_readable_after_reopen(self, tmp_path):
+        path = str(tmp_path / "db")
+        db = open_db(path, d=8)
+        for i in range(10):
+            db.insert(str(i), np.ones(8, dtype=np.float32))
+        db.checkpoint()
+        del db
+        db2 = open_db(path, d=8)
+        assert db2.count() == 10
+
     def test_flush_data_readable_after_reopen(self, tmp_path):
         path = str(tmp_path / "db")
         db = open_db(path, d=8)
@@ -892,6 +908,21 @@ class TestQueryBatch:
         queries = np.stack([vecs[0], vecs[1]]).astype(np.float64)
         all_results = db.query(queries, n_results=2)
         assert len(all_results) == 2
+
+    def test_batch_include_id_score_only(self, tmp_path):
+        db = open_db(str(tmp_path))
+        vecs = random_unit_vecs(8, 32)
+        for i in range(8):
+            db.insert(f"v{i}", vecs[i], metadata={"grp": "A"}, document=f"doc-{i}")
+        queries = np.stack([vecs[0], vecs[1]])
+        all_results = db.query(queries, n_results=3, include=["id", "score"])
+        assert len(all_results) == 2
+        for res in all_results:
+            for row in res:
+                assert "id" in row
+                assert "score" in row
+                assert "metadata" not in row
+                assert "document" not in row
 
 
 # ---------------------------------------------------------------------------

@@ -831,6 +831,29 @@ fn get_many_returns_mixed_results() {
     assert!(results[2].is_some());
 }
 
+#[test]
+fn empty_metadata_is_not_persisted_but_reads_as_empty() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+    let mut e = open_default(p, d);
+    e.insert("a".into(), &make_vec(d, 0.1), no_meta()).unwrap();
+    e.flush_wal_to_segment().unwrap();
+
+    let got = e.get("a").unwrap().unwrap();
+    assert!(
+        got.metadata.is_empty(),
+        "read path should expose empty metadata"
+    );
+    assert!(got.document.is_none());
+
+    let stats = e.stats();
+    assert_eq!(
+        stats.metadata_entries, 0,
+        "empty metadata rows should not be persisted on disk"
+    );
+}
+
 // ── upsert_many / update_many wrappers ────────────────────────────────
 
 #[test]

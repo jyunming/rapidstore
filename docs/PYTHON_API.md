@@ -509,8 +509,13 @@ tbl.optimize()   # no-op; tqdb handles compaction automatically
 ├── live_codes.bin       — Memory-mapped quantized vectors (hot path)
 ├── live_vectors.bin     — Raw vectors for exact reranking (only if rerank=True; precision set by rerank_precision)
 ├── wal.log              — Write-ahead log (crash recovery)
-├── metadata.bin         — Per-vector metadata and documents
-├── live_ids.bin         — ID → slot index
+├── metadata.bin         — Per-vector metadata properties
+├── metadata.docs.zst    — Document sidecar (adaptive codec container; backward-compatible loader)
+├── live_ids.bin         — ID → slot index (dense/sparse compact encodings; optional zstd for sparse)
 ├── graph.bin            — HNSW adjacency list (if index built)
 └── seg-XXXXXXXX.bin     — Immutable flushed segment files
 ```
+
+Notes:
+- `live_ids.bin` is persisted in a compact format (`TQID2D1` dense, `TQID2S1` sparse, `TQID2Z1` sparse+zstd). Legacy format is still readable.
+- `metadata.docs.zst` uses a small container header (`M2DZ`) with adaptive codec selection and remains backward-compatible with legacy `M2D1` zstd payloads.
