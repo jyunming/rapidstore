@@ -21,7 +21,7 @@ This matrix tracks practical API/behavior parity against common embedded RAG vec
 | Pagination controls | Yes | `offset`/`limit` (where applicable). |
 | Distance metrics | Yes | `ip`, `cosine`, `l2` (collection-configured). |
 | ANN build + tuning | Yes | Graph index build/search controls and persisted index state. |
-| Snapshot | Yes | Engine + service job-based snapshot workflow. Restore is not implemented in server mode. |
+| Snapshot / Restore | Yes | Engine + service job-based snapshot and restore workflow via background jobs. |
 | Multi-tenant service auth/RBAC | Yes | Persisted API keys, principals, role bindings. |
 | Quota controls | Yes | Collections, vectors, disk, concurrent jobs. |
 

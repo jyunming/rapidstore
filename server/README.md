@@ -28,6 +28,7 @@ cargo build --release
 
 ### Health
 - `GET /healthz`
+- `GET /metrics` — Prometheus text metrics (requires `Authorization: ApiKey <key>`)
 - `GET/POST /v1/tenants/:tenant/databases/:database/collections`
 - `DELETE /v1/tenants/:tenant/databases/:database/collections/:collection`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/add`
@@ -38,7 +39,9 @@ cargo build --release
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/compact`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/index`
 - `POST /v1/tenants/:tenant/databases/:database/collections/:collection/snapshot`
+- `POST /v1/tenants/:tenant/databases/:database/collections/:collection/restore`
 - `GET /v1/tenants/:tenant/databases/:database/collections/:collection/jobs`
+- `GET /v1/tenants/:tenant/databases/:database/quota_usage`
 - `GET /v1/jobs/:job_id`
 - `POST /v1/jobs/:job_id/cancel`
 - `POST /v1/jobs/:job_id/retry`
@@ -59,6 +62,7 @@ cargo build --release
 - `POST .../compact` — Start background compaction
 - `POST .../index` — Start background HNSW index build
 - `POST .../snapshot` — Start background snapshot
+- `POST .../restore` — Start background restore from a snapshot
 - `GET .../jobs` — List jobs for a collection
 - `GET /v1/jobs/:job_id` — Get job status
 - `POST /v1/jobs/:job_id/cancel` — Cancel a job
@@ -68,7 +72,7 @@ cargo build --release
 
 - **Authentication** — API keys with RBAC scoped to tenant/database/collection level, persisted in `auth_store.json`
 - **Quotas** — Per-collection limits on vector count, disk bytes, and concurrent jobs, persisted in `quota_store.json`
-- **Async jobs** — Compaction, index build, and snapshots run in background workers; restart-safe with up to 3 retry attempts, state persisted in `job_store.json`
+- **Async jobs** — Compaction, index build, snapshots, and restores run in background workers; restart-safe with up to 3 retry attempts, state persisted in `job_store.json`
 - **Partial-failure reporting** — `add` and `upsert` with `report=true` return `{applied: N, failed: [...]}` instead of fail-fast
 
 ### Data-Plane Request Notes

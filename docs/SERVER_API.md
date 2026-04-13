@@ -347,7 +347,7 @@ Response `202`:
 
 ### `GET /metrics`
 
-Returns Prometheus text-format metrics. **No authentication required.**
+Returns Prometheus text-format metrics. **Authentication required** (`Authorization: ApiKey <key>`).
 
 ```
 Content-Type: text/plain; version=0.0.4; charset=utf-8
@@ -419,7 +419,7 @@ Response `200` — job record nested under `"job"`:
 }
 ```
 
-`job_type` values: `"compact"`, `"index_build"`, `"snapshot"`
+`job_type` values: `"compact"`, `"index_build"`, `"snapshot"`, `"restore"`
 
 `status` values: `"queued"`, `"running"`, `"succeeded"`, `"failed"`, `"canceled"`
 

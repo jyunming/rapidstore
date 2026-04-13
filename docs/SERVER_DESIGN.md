@@ -130,15 +130,23 @@ Core endpoints:
 - `POST /v1/tenants/{tenant}/databases/{db}/collections`
 - `GET /v1/tenants/{tenant}/databases/{db}/collections`
 - `DELETE /v1/tenants/{tenant}/databases/{db}/collections/{collection}`
+- `POST /v1/.../{collection}/add`
 - `POST /v1/.../{collection}/upsert`
+- `POST /v1/.../{collection}/delete`
+- `POST /v1/.../{collection}/get`
 - `POST /v1/.../{collection}/query`
-- `POST /v1/.../{collection}/search`
+- `POST /v1/.../{collection}/compact`
 - `POST /v1/.../{collection}/index`
 - `POST /v1/.../{collection}/snapshot`
+- `POST /v1/.../{collection}/restore`
+- `GET /v1/tenants/{tenant}/databases/{db}/quota_usage`
+- `GET /metrics`
 
 Job endpoints:
 
 - `GET /v1/jobs/{job_id}`
+- `POST /v1/jobs/{job_id}/cancel`
+- `POST /v1/jobs/{job_id}/retry`
 - `GET /v1/.../{collection}/jobs`
 
 Error format:
@@ -265,7 +273,7 @@ Risk: background job contention with foreground writes.
 
 1. [x] Document the server API — see `docs/SERVER_API.md`.
 2. [x] Scaffold `server` crate with routing, auth middleware, and request context.
-3. Implement tenant/database path resolver and catalog helpers in storage layer.
+3. [x] Implement tenant/database path resolver and catalog helpers in storage layer.
 
 
 

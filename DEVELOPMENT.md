@@ -30,6 +30,9 @@ cargo fmt
 
 # Build distributable wheel
 maturin build --release --locked
+
+# Build optional HTTP server (server/Cargo.toml uses default-features = false to exclude PyO3)
+cd server && cargo build --release
 ```
 
 ## Testing
@@ -64,7 +67,7 @@ python benchmarks/compare_quantizers_paper.py
 ## Sprint / PR workflow
 
 One PR per sprint. All issues for a sprint go onto a single branch (e.g. `feat/v0.5-sprint`)
-and are merged via one PR. See `docs/sprint_process.md` for the full workflow.
+and are merged via one PR. See `CONTRIBUTING.md` for the full workflow.
 
 ## Git identity
 
