@@ -209,7 +209,7 @@ for r in results:
 
 ## Server Mode
 
-An optional Axum HTTP server in `server/` adds multi-tenancy, RBAC, and async jobs. See [`server/README.md`](https://github.com/jyunming/TurboQuantDB/blob/main/server/README.md) for setup and endpoint reference.
+An optional Axum HTTP server in `server/` adds multi-tenancy, RBAC, and async jobs. See [`docs/SERVER_API.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/SERVER_API.md) for setup, launch, and the full API reference.
 
 ---
 

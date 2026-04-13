@@ -1,4 +1,68 @@
-# Server API Reference
+# TurboQuantDB Server
+
+Optional Axum HTTP service providing TurboQuantDB in multi-tenant server mode. Use this when you need REST API access, multi-tenancy, authentication, quotas, or async job management. For single-process Python use, the embedded `tqdb` package is simpler.
+
+## Installation
+
+The server binary ships pre-built inside the `tqdb` wheel on all supported platforms
+(Linux x86-64, macOS, Windows). **Linux arm64/aarch64** is the exception — see
+[Building from Source](#building-from-source-development-only) for that platform.
+
+```bash
+pip install tqdb
+```
+
+## Launch
+
+```bash
+tqdb-server
+```
+
+This starts the server on `127.0.0.1:8080` by default. Set environment variables before
+launching to change the address, data directory, or other options (see
+[Environment Variables](#environment-variables) below).
+
+## Building from Source (development only)
+
+Linux arm64/aarch64 users and contributors building from the Git repo:
+
+```bash
+cd server
+cargo build --release
+```
+
+Then launch the compiled binary:
+
+```bash
+# Linux / macOS
+./target/release/tqdb-server
+
+# Windows
+.\target\release\tqdb-server.exe
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TQ_SERVER_ADDR` | `127.0.0.1:8080` | Listen address |
+| `TQ_LOCAL_ROOT` | `./data` | Root directory for all data files |
+| `TQ_STORAGE_URI` | `TQ_LOCAL_ROOT` | Storage URI (file:// path) |
+| `TQ_AUTH_STORE_PATH` | `<TQ_LOCAL_ROOT>/auth_store.json` | API key + RBAC store |
+| `TQ_QUOTA_STORE_PATH` | `<TQ_LOCAL_ROOT>/quota_store.json` | Quota limits store |
+| `TQ_JOB_STORE_PATH` | `<TQ_LOCAL_ROOT>/job_store.json` | Async job state store |
+| `TQ_JOB_WORKERS` | `2` | Concurrent async job workers |
+
+## Features
+
+- **Authentication** — API keys with RBAC scoped to tenant/database/collection level, persisted in `auth_store.json`
+- **Quotas** — Per-collection limits on vector count, disk bytes, and concurrent jobs, persisted in `quota_store.json`
+- **Async jobs** — Compaction, index build, snapshots, and restores run in background workers; restart-safe with up to 3 retry attempts, state persisted in `job_store.json`
+- **Partial-failure reporting** — `add` and `upsert` with `report=true` return `{applied: N, failed: [...]}` instead of fail-fast
+
+---
+
+# API Reference
 
 ## Purpose
 
