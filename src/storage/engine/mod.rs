@@ -1927,6 +1927,27 @@ impl TurboQuantEngine {
         };
         let par_chunk = (2_000_000 / quantizer.d.max(1)).clamp(128, par_chunk_max);
         let n_candidates = candidate_slots.len();
+        // Small-k fast path: avoid per-chunk full buffers + select_nth when
+        // the requested candidate budget is tiny (common top_k=10 workload).
+        let use_small_topk = internal_k <= 32;
+        let push_small_topk =
+            |out: &mut Vec<(u32, f64)>, slot: u32, score: f64, k: usize| {
+                if out.len() < k {
+                    out.push((slot, score));
+                    return;
+                }
+                let mut min_i = 0usize;
+                let mut min_s = out[0].1;
+                for (i, (_, s)) in out.iter().enumerate().skip(1) {
+                    if *s < min_s {
+                        min_s = *s;
+                        min_i = i;
+                    }
+                }
+                if score > min_s {
+                    out[min_i] = (slot, score);
+                }
+            };
         let merge_topk = |mut a: Vec<(u32, f64)>, mut b: Vec<(u32, f64)>| -> Vec<(u32, f64)> {
             if a.is_empty() {
                 if b.len() > internal_k {
@@ -1957,7 +1978,11 @@ impl TurboQuantEngine {
         };
         let scored: Vec<(u32, f64)> = if n_candidates <= seq_threshold {
             // Sequential path: single idx buffer reused across all slots.
-            let mut out = Vec::with_capacity(n_candidates);
+            let mut out = Vec::with_capacity(if use_small_topk {
+                internal_k
+            } else {
+                n_candidates
+            });
             let mut idx = vec![0u16; quantizer.n];
             match metric {
                 DistanceMetric::Ip => {
@@ -1982,7 +2007,11 @@ impl TurboQuantEngine {
                             &rec[mse_len..mse_len + qjl_len],
                             gamma as f64,
                         ) * doc_norm as f64;
-                        out.push((slot, score));
+                        if use_small_topk {
+                            push_small_topk(&mut out, slot, score, internal_k);
+                        } else {
+                            out.push((slot, score));
+                        }
                     }
                 }
                 DistanceMetric::Cosine => {
@@ -2003,7 +2032,11 @@ impl TurboQuantEngine {
                             gamma as f64,
                         );
                         let score = ip * q_norm_inv;
-                        out.push((slot, score));
+                        if use_small_topk {
+                            push_small_topk(&mut out, slot, score, internal_k);
+                        } else {
+                            out.push((slot, score));
+                        }
                     }
                 }
                 _ => {
@@ -2028,7 +2061,11 @@ impl TurboQuantEngine {
                         );
                         v.mapv_inplace(|x| x * doc_norm as f64);
                         let score = score_vectors_with_metric(metric, query, &v);
-                        out.push((slot, score));
+                        if use_small_topk {
+                            push_small_topk(&mut out, slot, score, internal_k);
+                        } else {
+                            out.push((slot, score));
+                        }
                     }
                 }
             }
@@ -2043,7 +2080,11 @@ impl TurboQuantEngine {
                         .par_chunks(par_chunk)
                         .map(|chunk| {
                             let mut idx = vec![0u16; quantizer.n];
-                            let mut out = Vec::with_capacity(chunk.len());
+                            let mut out = Vec::with_capacity(if use_small_topk {
+                                internal_k
+                            } else {
+                                chunk.len()
+                            });
                             for &slot in chunk {
                                 let rec = &codes_bytes
                                     [slot as usize * stride..(slot as usize + 1) * stride];
@@ -2065,9 +2106,13 @@ impl TurboQuantEngine {
                                     &rec[mse_len..mse_len + qjl_len],
                                     gamma as f64,
                                 ) * doc_norm as f64;
-                                out.push((slot, score));
+                                if use_small_topk {
+                                    push_small_topk(&mut out, slot, score, internal_k);
+                                } else {
+                                    out.push((slot, score));
+                                }
                             }
-                            if out.len() > internal_k {
+                            if !use_small_topk && out.len() > internal_k {
                                 out.select_nth_unstable_by(internal_k, |a, b| {
                                     b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
                                 });
@@ -2083,7 +2128,11 @@ impl TurboQuantEngine {
                         .par_chunks(par_chunk)
                         .map(|chunk| {
                             let mut idx = vec![0u16; quantizer.n];
-                            let mut out = Vec::with_capacity(chunk.len());
+                            let mut out = Vec::with_capacity(if use_small_topk {
+                                internal_k
+                            } else {
+                                chunk.len()
+                            });
                             for &slot in chunk {
                                 let rec = &codes_bytes
                                     [slot as usize * stride..(slot as usize + 1) * stride];
@@ -2102,9 +2151,13 @@ impl TurboQuantEngine {
                                     gamma as f64,
                                 );
                                 let score = ip * q_norm_inv;
-                                out.push((slot, score));
+                                if use_small_topk {
+                                    push_small_topk(&mut out, slot, score, internal_k);
+                                } else {
+                                    out.push((slot, score));
+                                }
                             }
-                            if out.len() > internal_k {
+                            if !use_small_topk && out.len() > internal_k {
                                 out.select_nth_unstable_by(internal_k, |a, b| {
                                     b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
                                 });
@@ -2120,7 +2173,11 @@ impl TurboQuantEngine {
                         .par_chunks(par_chunk)
                         .map(|chunk| {
                             let mut idx = vec![0u16; quantizer.n];
-                            let mut out = Vec::with_capacity(chunk.len());
+                            let mut out = Vec::with_capacity(if use_small_topk {
+                                internal_k
+                            } else {
+                                chunk.len()
+                            });
                             for &slot in chunk {
                                 let rec = &codes_bytes
                                     [slot as usize * stride..(slot as usize + 1) * stride];
@@ -2143,9 +2200,13 @@ impl TurboQuantEngine {
                                 );
                                 v.mapv_inplace(|x| x * doc_norm as f64);
                                 let score = score_vectors_with_metric(metric, query, &v);
-                                out.push((slot, score));
+                                if use_small_topk {
+                                    push_small_topk(&mut out, slot, score, internal_k);
+                                } else {
+                                    out.push((slot, score));
+                                }
                             }
-                            if out.len() > internal_k {
+                            if !use_small_topk && out.len() > internal_k {
                                 out.select_nth_unstable_by(internal_k, |a, b| {
                                     b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
                                 });
@@ -2325,13 +2386,21 @@ impl TurboQuantEngine {
             self.live_compact_slab()?;
             self.has_pending_deletes = false;
         }
-        self.live_codes.flush()?;
+        self.live_codes
+            .flush()
+            .map_err(|e| format!("flush_for_close: live_codes.flush failed: {e}"))?;
         if let Some(vraw) = &mut self.live_vraw {
-            vraw.flush()?;
+            vraw.flush()
+                .map_err(|e| format!("flush_for_close: live_vraw.flush failed: {e}"))?;
         }
-        self.wal.truncate()?;
-        self.metadata.flush()?;
-        self.persist_id_pool()?;
+        self.wal
+            .truncate()
+            .map_err(|e| format!("flush_for_close: wal.truncate failed: {e}"))?;
+        self.metadata
+            .flush()
+            .map_err(|e| format!("flush_for_close: metadata.flush failed: {e}"))?;
+        self.persist_id_pool()
+            .map_err(|e| format!("flush_for_close: persist_id_pool failed: {e}"))?;
 
         // Sync live_codes.bin to the backend (required for cloud / remote backends).
         self.live_codes.release_handles();
@@ -2369,22 +2438,33 @@ impl TurboQuantEngine {
     }
 
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.flush_for_close()?;
+        self.flush_for_close()
+            .map_err(|e| format!("close: flush_for_close failed: {e}"))?;
         // Trim pre-allocated capacity to the exact slot count so the on-disk and
         // memory-mapped sizes are minimal after the database is closed.
         let slot_count = self.id_pool.slot_count();
-        self.live_codes.truncate_to(slot_count)?;
+        self.live_codes
+            .truncate_to(slot_count)
+            .map_err(|e| format!("close: live_codes.truncate_to({slot_count}) failed: {e}"))?;
         if let Some(vraw) = &mut self.live_vraw {
-            vraw.truncate_to(slot_count)?;
+            vraw.truncate_to(slot_count).map_err(|e| {
+                format!("close: live_vraw.truncate_to({slot_count}) failed: {e}")
+            })?;
         }
-        self.metadata.flush()?;
-        self.persist_id_pool()?;
-        self.maybe_persist_state(true)?;
+        self.metadata
+            .flush()
+            .map_err(|e| format!("close: metadata.flush failed: {e}"))?;
+        self.persist_id_pool()
+            .map_err(|e| format!("close: persist_id_pool failed: {e}"))?;
+        self.maybe_persist_state(true)
+            .map_err(|e| format!("close: maybe_persist_state(true) failed: {e}"))?;
         // Segments are crash-recovery fallbacks: live_codes.bin + live_ids.bin are now
         // the authoritative state and are fully flushed.  Delete segment files so a clean
         // close does not leave duplicate data on disk.  On next open an empty segment list
         // is fine — WAL replay and live_codes restore state without them.
-        self.segments.drop_all()?;
+        self.segments
+            .drop_all()
+            .map_err(|e| format!("close: segments.drop_all failed: {e}"))?;
         Ok(())
     }
 

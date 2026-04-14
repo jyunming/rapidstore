@@ -72,7 +72,8 @@ impl ProdQuantizer {
     /// Dense fast-path: Haar-uniform QR rotation + all b bits to MSE (no QJL).
     /// Best recall of all modes; O(d²) ingest cost.
     pub fn new_dense_fast(d: usize, b: usize, seed: u64) -> Self {
-        assert!(b >= 2, "ProdQuantizer requires at least b=2");
+        // fast_mode assigns all bits to MSE and stores no QJL residual, so b=1 is valid.
+        assert!(b >= 1, "ProdQuantizer requires at least b=1 in fast mode");
         let mse_quantizer = MseQuantizer::new_dense(d, b, seed);
         // fast_mode never uses the QJL projection — use a no-op placeholder (empty
         // struct, zero disk/RAM) instead of the dense D×D Gaussian matrix.
