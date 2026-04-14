@@ -81,13 +81,13 @@ When `rerank=True`, raw vectors are stored on disk alongside compressed codes. D
 
 Each slot stores a `f32` per-vector scale (4 bytes) plus one `i8` per dimension (INT8) or two nibbles per byte (INT4). For unit-normalized vectors, INT8 quantization error is ~8×10⁻⁵ per dimension — far below the score gaps between true nearest neighbors at any d.
 
-**Disk impact at 100k vectors:**
+**Disk impact at 100k vectors (bits=4, total on-disk including codes):**
 
 | d    | rerank=False | int8 (default) | int4 | f16  | f32  |
 |------|-------------|---------------|------|------|------|
-| 200  | ~16 MB      | ~20 MB        | ~14 MB | ~40 MB | ~80 MB |
-| 768  | ~48 MB      | ~74 MB        | ~40 MB | ~154 MB | ~307 MB |
-| 1536 | ~96 MB      | ~149 MB       | ~79 MB | ~307 MB | ~614 MB |
+| 200  | ~11 MB      | ~31 MB        | ~21 MB | ~51 MB | ~91 MB |
+| 768  | ~40 MB      | ~117 MB       | ~79 MB | ~194 MB | ~347 MB |
+| 1536 | ~84 MB      | ~231 MB       | ~161 MB | ~391 MB | ~698 MB |
 
 **Recall impact (brute-force, bits=4):**
 
@@ -167,7 +167,7 @@ db = Database.open(path, dimension=768,
 ```python
 db = Database.open(path, dimension=DIM, bits=4)
 # rerank=False, fast_mode=True (defaults) — MSE codes only
-# ~22 MB (d=200), ~48 MB (d=768), ~108 MB (d=1536) per 100k vectors
+# ~11 MB (d=200), ~40 MB (d=768), ~84 MB (d=1536) per 100k vectors
 ```
 
 ### Preset 4 — Minimum disk

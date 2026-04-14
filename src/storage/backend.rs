@@ -38,6 +38,22 @@ pub trait StorageProvider: Send + Sync {
     /// is written before the old key is deleted, so a crash between those two
     /// operations leaves both keys present (safe to retry).
     fn rename(&self, from: &str, to: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Returns true when this provider writes directly into `local_dir` (i.e.
+    /// `LocalProvider`, whose root IS `local_dir`).
+    ///
+    /// Used to skip redundant `write()` calls for mmap'd slab files
+    /// (`live_codes.bin`, `live_vectors.bin`) on close: the mmap flush already
+    /// wrote the data in-place, so re-writing via `fs::write()` would only
+    /// truncate the file, which on Windows causes ERROR_USER_MAPPED_FILE (1224)
+    /// while the kernel SECTION object is still live.
+    ///
+    /// Remote / cloud backends (S3, GCS, …) return `false` here because their
+    /// `local_dir` is a cache directory separate from the storage root and the
+    /// upload is genuinely required to persist data.
+    fn is_local_filesystem(&self) -> bool {
+        false
+    }
 }
 
 /// Local filesystem storage provider.
@@ -54,6 +70,10 @@ impl LocalProvider {
 }
 
 impl StorageProvider for LocalProvider {
+    fn is_local_filesystem(&self) -> bool {
+        true
+    }
+
     fn read(&self, path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let full = self.root.join(path);
         Ok(fs::read(full)?)
@@ -418,6 +438,10 @@ impl StorageBackend {
         to: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.provider.rename(from, to)
+    }
+
+    pub fn is_local_filesystem(&self) -> bool {
+        self.provider.is_local_filesystem()
     }
 }
 

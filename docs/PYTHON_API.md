@@ -229,6 +229,27 @@ len(db)                          # int — number of active vectors
 "my-id" in db                    # bool — True if id exists
 ```
 
+### Crash Recovery Playbook (WAL)
+
+`wal.log` is replayed automatically on reopen. Use this playbook after an unclean shutdown:
+
+1. Stop writes to the database path.
+2. Copy the DB directory as a safety backup.
+3. Reopen:
+   ```python
+   db = Database.open("./my_db")
+   ```
+4. Validate:
+   - `db.stats()["vector_count"]`
+   - representative `db.get(...)` and `db.search(...)`
+5. Finalize recovered state:
+   ```python
+   db.checkpoint()   # flush WAL + compact segments
+   db.close()
+   ```
+
+If recovery cannot complete due to file corruption, restore from snapshot/backup (server mode: `POST .../snapshot` and `POST .../restore`; see `docs/SERVER_API.md`).
+
 **Stats keys** returned by `db.stats()`:
 
 | Key | Type | Description |

@@ -150,6 +150,27 @@ db.search(query, top_k=5, filter={"year": {"$gte": 2023}})
 db.search(query, top_k=5, filter={"$and": [{"topic": "ml"}, {"year": {"$gte": 2023}}]})
 ```
 
+### Dataset Recovery (WAL)
+
+TurboQuantDB replays `wal.log` automatically on reopen. For a local crash/power-loss recovery:
+
+1. Stop all writers to the DB directory.
+2. Make a copy of the DB folder (`manifest.json`, `live_codes.bin`, `live_ids.bin`, `wal.log`, etc.).
+3. Reopen the DB normally:
+   ```python
+   db = Database.open("./my_db")
+   ```
+4. Validate state:
+   - `db.stats()["vector_count"]`
+   - sample `db.get(...)` / `db.search(...)`
+5. Persist a clean post-recovery state:
+   ```python
+   db.checkpoint()   # flush WAL + compact
+   db.close()
+   ```
+
+If files are corrupted beyond WAL replay, restore from a snapshot/backup copy (server mode also supports snapshot/restore jobs; see `docs/SERVER_API.md`).
+
 ---
 
 ## Benchmarks
@@ -215,6 +236,8 @@ for r in results:
 ## Server Mode
 
 An optional Axum HTTP server in `server/` adds multi-tenancy, RBAC, and async jobs. See [`docs/SERVER_API.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/SERVER_API.md) for setup, launch, and the full API reference.
+
+For disaster recovery beyond local WAL replay, see **Server Recovery Runbook (Snapshot/Restore)** in `docs/SERVER_API.md`.
 
 ---
 

@@ -405,6 +405,30 @@ Response `202`:
 { "job_id": "job_0000000000000004", "status": "queued" }
 ```
 
+### Server Recovery Runbook (Snapshot/Restore)
+
+Use this when WAL replay is insufficient (for example, disk/file corruption) and you need a known-good restore point.
+
+1. Pause writes to the target collection.
+2. Trigger a snapshot:
+   - `POST /v1/tenants/{tenant}/databases/{database}/collections/{collection}/snapshot`
+   - body: `{ "snapshot_name": "pre-restore-backup", "async": true }`
+3. Wait for success:
+   - poll `GET /v1/jobs/{job_id}` until `status == "succeeded"`.
+4. Trigger restore from the desired snapshot:
+   - `POST /v1/tenants/{tenant}/databases/{database}/collections/{collection}/restore`
+   - body: `{ "snapshot_name": "<snapshot_name>", "async": true }`
+5. Wait for restore success:
+   - poll `GET /v1/jobs/{job_id}` until `status == "succeeded"`.
+6. Verify collection health:
+   - `POST /v1/tenants/{tenant}/databases/{database}/collections/{collection}/count`
+   - sample `query`/`get` requests for expected IDs/documents.
+7. Resume writes.
+
+Notes:
+- Restore is near-atomic at collection-directory level: the implementation renames the old directory aside then renames the snapshot directory into place. There is a brief window between the two renames where the collection directory does not exist; writes during that window will fail. Pause writes (step 1) to avoid this.
+- If restore fails, inspect job `error` via `GET /v1/jobs/{job_id}`, fix the root cause, then retry with `POST /v1/jobs/{job_id}/retry`.
+
 ---
 
 ## Observability

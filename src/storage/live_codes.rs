@@ -116,7 +116,13 @@ impl LiveCodesFile {
         &mut self,
         new_len: usize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.mmap = None; // mmap must be dropped before set_len on Windows
+        // On Windows, SetEndOfFile fails (error 1224) if the file has an associated
+        // mapping object — even after UnmapViewOfFile.  The original file handle
+        // retains the kernel-level section association until it is closed.
+        // Drop both the mmap view and the file handle, then reopen with a fresh
+        // handle that has no mapping history.
+        self.mmap = None;
+        self.file = None;
         self.ensure_open()?;
         self.file
             .as_ref()

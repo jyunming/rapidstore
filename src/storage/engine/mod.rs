@@ -2343,11 +2343,18 @@ impl TurboQuantEngine {
         }
         let live_codes_path = Path::new(&self.local_dir).join("live_codes.bin");
         let live_vraw_path = Path::new(&self.local_dir).join("live_vectors.bin");
-        let live_codes_data = std::fs::read(&live_codes_path)?;
-        self.backend.write("live_codes.bin", &live_codes_data)?;
-        if had_vraw {
-            let live_vraw_data = std::fs::read(&live_vraw_path)?;
-            self.backend.write("live_vectors.bin", &live_vraw_data)?;
+        // For local backends the mmap flush already wrote the data in-place;
+        // re-writing via backend.write() would truncate the file, which on
+        // Windows triggers ERROR_USER_MAPPED_FILE (1224) when the kernel has
+        // not yet fully released the previous section object.  Only upload for
+        // remote/cloud backends where local_dir is a cache separate from storage.
+        if !self.backend.is_local_filesystem() {
+            let live_codes_data = std::fs::read(&live_codes_path)?;
+            self.backend.write("live_codes.bin", &live_codes_data)?;
+            if had_vraw {
+                let live_vraw_data = std::fs::read(&live_vraw_path)?;
+                self.backend.write("live_vectors.bin", &live_vraw_data)?;
+            }
         }
         // Reopen handles so truncate_to() in close() can operate on an open file.
         self.live_codes = LiveCodesFile::open(live_codes_path, self.live_stride())?;
