@@ -426,7 +426,7 @@ Use this when WAL replay is insufficient (for example, disk/file corruption) and
 7. Resume writes.
 
 Notes:
-- Restore is atomic at collection-directory level and replaces current collection contents with the snapshot.
+- Restore is near-atomic at collection-directory level: the implementation renames the old directory aside then renames the snapshot directory into place. There is a brief window between the two renames where the collection directory does not exist; writes during that window will fail. Pause writes (step 1) to avoid this.
 - If restore fails, inspect job `error` via `GET /v1/jobs/{job_id}`, fix the root cause, then retry with `POST /v1/jobs/{job_id}/retry`.
 
 ---

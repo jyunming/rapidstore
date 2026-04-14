@@ -167,8 +167,7 @@ def load_dataset_slice(key: str) -> tuple[str, np.ndarray, np.ndarray, np.ndarra
 # ── Main run loop ─────────────────────────────────────────────────────────────
 
 def run_dataset(ds_label: str, corpus, queries, true_top1,
-                configs, all_results: dict,
-                rerank_precision: str = "int8") -> None:
+                configs, all_results: dict) -> None:
     existing = {r["label"]: r for r in all_results.get(ds_label, [])}
     new_results = list(existing.values())
     done_labels = set(existing.keys())
@@ -212,15 +211,9 @@ def main():
                         help="Which datasets to run (default: all 9)")
     parser.add_argument("--smoke", action="store_true",
                         help="Quick sanity check: 3 configs × first 2 datasets")
-    parser.add_argument("--precision", default="int8", choices=["int8", "int4", "f16", "f32"],
-                        help="Rerank storage precision for rerank=True configs (default: int8). "
-                             "Non-default values write to a separate output directory.")
     args = parser.parse_args()
 
-    precision = args.precision
-
-    # Non-default precision uses a separate output directory so int8 results are never touched.
-    out_dir = OUT_DIR if precision == "int8" else OUT_DIR.parent / f"_dim_sweep_{precision}_results"
+    out_dir = OUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     fcb.BENCH_DIR = out_dir
     results_path = out_dir / "dim_sweep_results.json"
@@ -232,9 +225,9 @@ def main():
     if args.smoke:
         configs = fcb.FULL_CONFIGS[:3]
         datasets_to_run = DEFAULT_ORDER[:2]
-        print(f"=== SMOKE TEST: 3 configs × 2 datasets  [{precision}] ===\n")
+        print("=== SMOKE TEST: 3 configs × 2 datasets ===\n")
 
-    print(f"Dim sweep [{precision}]: {len(datasets_to_run)} dataset(s) × {len(configs)} configs"
+    print(f"Dim sweep: {len(datasets_to_run)} dataset(s) × {len(configs)} configs"
           f" = {len(datasets_to_run) * len(configs)} runs")
     print(f"Corpus: {N_CORPUS:,}  Queries: {N_QUERIES}  Output: {out_dir}/\n")
 
@@ -253,8 +246,7 @@ def main():
         print(f"  {ds_label}  ({n_done}/{len(configs)} already done)")
         print(f"{'='*72}")
 
-        run_dataset(ds_label, corpus, queries, true_top1, configs, all_results,
-                    rerank_precision=precision)
+        run_dataset(ds_label, corpus, queries, true_top1, configs, all_results)
 
         # Save after each dataset
         results_path.write_text(json.dumps(all_results, indent=2), encoding="utf-8")

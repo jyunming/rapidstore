@@ -39,14 +39,19 @@ pub trait StorageProvider: Send + Sync {
     /// operations leaves both keys present (safe to retry).
     fn rename(&self, from: &str, to: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-    /// Returns true if this backend stores files at the same path as `local_dir`.
+    /// Returns true when this provider writes directly into `local_dir` (i.e.
+    /// `LocalProvider`, whose root IS `local_dir`).
     ///
-    /// When true, `write()` for mmap'd slab files (`live_codes.bin`,
-    /// `live_vectors.bin`) is a no-op: the mmap flush already wrote the data
-    /// in-place and re-writing the same bytes would needlessly truncate the file,
-    /// which on Windows causes ERROR_USER_MAPPED_FILE (1224) when a previous
-    /// mapping hasn't been fully released by the kernel yet.
-    fn is_local(&self) -> bool {
+    /// Used to skip redundant `write()` calls for mmap'd slab files
+    /// (`live_codes.bin`, `live_vectors.bin`) on close: the mmap flush already
+    /// wrote the data in-place, so re-writing via `fs::write()` would only
+    /// truncate the file, which on Windows causes ERROR_USER_MAPPED_FILE (1224)
+    /// while the kernel SECTION object is still live.
+    ///
+    /// Remote / cloud backends (S3, GCS, …) return `false` here because their
+    /// `local_dir` is a cache directory separate from the storage root and the
+    /// upload is genuinely required to persist data.
+    fn is_local_filesystem(&self) -> bool {
         false
     }
 }
@@ -65,7 +70,7 @@ impl LocalProvider {
 }
 
 impl StorageProvider for LocalProvider {
-    fn is_local(&self) -> bool {
+    fn is_local_filesystem(&self) -> bool {
         true
     }
 
@@ -435,8 +440,8 @@ impl StorageBackend {
         self.provider.rename(from, to)
     }
 
-    pub fn is_local(&self) -> bool {
-        self.provider.is_local()
+    pub fn is_local_filesystem(&self) -> bool {
+        self.provider.is_local_filesystem()
     }
 }
 

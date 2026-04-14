@@ -2348,7 +2348,7 @@ impl TurboQuantEngine {
         // Windows triggers ERROR_USER_MAPPED_FILE (1224) when the kernel has
         // not yet fully released the previous section object.  Only upload for
         // remote/cloud backends where local_dir is a cache separate from storage.
-        if !self.backend.is_local() {
+        if !self.backend.is_local_filesystem() {
             let live_codes_data = std::fs::read(&live_codes_path)?;
             self.backend.write("live_codes.bin", &live_codes_data)?;
             if had_vraw {

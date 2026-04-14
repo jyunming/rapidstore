@@ -7338,9 +7338,9 @@
   },
   {
     "timestamp": "2026-04-14T07:29:23.236222+00:00",
-    "git_commit": "ba6afac",
-    "git_branch": "main",
-    "version": "0.5.0",
+    "git_commit": "8b6ce9f",
+    "git_branch": "fix/v0.5.2-windows-close-and-bench-refresh",
+    "version": "0.5.2",
     "results": {
       "glove-200": {
         "b2_rerankF_brute_r1at1": 0.5108,
