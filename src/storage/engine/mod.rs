@@ -843,6 +843,193 @@ impl TurboQuantEngine {
         self.delta_slots.len() * AUTO_ANN_MAX_DELTA_DEN <= n * AUTO_ANN_MAX_DELTA_NUM
     }
 
+    /// Blocked batch scorer: scan all N codes once, score against all Q queries in parallel.
+    ///
+    /// Reduces memory traffic from Q×N×stride to N×stride bytes. Activated when
+    /// Q ≥ 8, N ≥ 50k, brute-force path, Ip/Cosine metric, rerank disabled.
+    fn score_batch_brute(
+        &self,
+        queries: &[Array1<f64>],
+        top_k: usize,
+        filter: Option<&HashMap<String, JsonValue>>,
+        include_id: bool,
+        include_metadata: bool,
+        include_document: bool,
+    ) -> Result<Vec<Vec<SearchResult>>, Box<dyn std::error::Error + Send + Sync>> {
+        let nq = queries.len();
+        let internal_k = top_k; // no rerank — caller already checked rerank_enabled=false
+
+        // Resolve candidate slots (shared across all Q queries).
+        let active_slots = self.id_pool.iter_active_slots();
+        if active_slots.is_empty() {
+            return Ok(vec![Vec::new(); nq]);
+        }
+        let candidate_slots: Vec<u32> = if let Some(f) = filter {
+            if let Some(indexed) = self.resolve_filter_via_index(f, &active_slots) {
+                let all_eq = extract_indexable_eq(f)
+                    .map(|eqs| eqs.len() == f.len())
+                    .unwrap_or(false);
+                if all_eq {
+                    indexed
+                } else {
+                    let meta_map = self.metadata.get_many_properties(&indexed)?;
+                    let empty: HashMap<String, JsonValue> = HashMap::new();
+                    indexed
+                        .into_iter()
+                        .filter(|s| {
+                            metadata_matches_filter(meta_map.get(s).copied().unwrap_or(&empty), f)
+                        })
+                        .collect()
+                }
+            } else {
+                let meta_map = self.metadata.get_many_properties(&active_slots)?;
+                let empty: HashMap<String, JsonValue> = HashMap::new();
+                active_slots
+                    .into_iter()
+                    .filter(|s| {
+                        metadata_matches_filter(meta_map.get(s).copied().unwrap_or(&empty), f)
+                    })
+                    .collect()
+            }
+        } else {
+            active_slots
+        };
+        if candidate_slots.is_empty() {
+            return Ok(vec![Vec::new(); nq]);
+        }
+
+        let codes_bytes = self.live_codes.as_bytes();
+        let stride = self.live_stride();
+        let mse_len = self.live_mse_len();
+        let qjl_len = self.live_qjl_len();
+        let quantizer = &self.quantizer;
+
+        // Per-query q_norm_inv for cosine.
+        let q_norms_inv: Vec<f64> = queries
+            .iter()
+            .map(|q| {
+                let n = q.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if n > 0.0 { 1.0 / n } else { 0.0 }
+            })
+            .collect();
+
+        // Pre-build Q LUTs — O(Q × n) work done once outside the scoring loop.
+        let preps: Vec<_> = queries
+            .iter()
+            .map(|q| quantizer.prepare_ip_query(q))
+            .collect();
+
+        // Per-query bounded heap: Vec<(slot, score)>, capped at internal_k.
+        let use_small_topk = internal_k <= 32;
+        let mut per_query: Vec<Vec<(u32, f64)>> = (0..nq)
+            .map(|_| Vec::with_capacity(internal_k.min(256)))
+            .collect();
+        let mut idx_buf = vec![0u16; quantizer.n];
+
+        for &slot in &candidate_slots {
+            let rec = &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
+            quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx_buf);
+            let gamma = f32::from_le_bytes(
+                rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                    .try_into()
+                    .expect("gamma field is 4 bytes"),
+            );
+            let doc_norm = f32::from_le_bytes(
+                rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                    .try_into()
+                    .expect("doc_norm field is 4 bytes"),
+            );
+            let qjl_bits = &rec[mse_len..mse_len + qjl_len];
+
+            for q_idx in 0..nq {
+                let raw =
+                    quantizer.score_ip_encoded(&preps[q_idx], &idx_buf, qjl_bits, gamma as f64)
+                        * doc_norm as f64;
+                let score = if matches!(self.metric, DistanceMetric::Cosine) {
+                    raw * q_norms_inv[q_idx]
+                } else {
+                    raw
+                };
+                let heap = &mut per_query[q_idx];
+                if use_small_topk {
+                    if heap.len() < internal_k {
+                        heap.push((slot, score));
+                    } else {
+                        let (mut min_i, mut min_s) = (0, heap[0].1);
+                        for (i, &(_, s)) in heap.iter().enumerate().skip(1) {
+                            if s < min_s {
+                                min_s = s;
+                                min_i = i;
+                            }
+                        }
+                        if score > min_s {
+                            heap[min_i] = (slot, score);
+                        }
+                    }
+                } else {
+                    heap.push((slot, score));
+                    // Periodic trim: avoid O(N) memory per query.
+                    if heap.len() > internal_k * 4 {
+                        heap.select_nth_unstable_by(internal_k, |a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+                        });
+                        heap.truncate(internal_k);
+                    }
+                }
+            }
+        }
+
+        // Finalize: trim, sort, convert to SearchResult.
+        let mut results = Vec::with_capacity(nq);
+        for mut candidates in per_query {
+            if !use_small_topk && candidates.len() > internal_k {
+                candidates.select_nth_unstable_by(internal_k, |a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+                });
+                candidates.truncate(internal_k);
+            }
+            candidates.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+            candidates.truncate(top_k);
+
+            let slots: Vec<u32> = candidates.iter().map(|(s, _)| *s).collect();
+            let meta_map = if (include_metadata || include_document) && self.metadata.len() > 0 {
+                Some(self.metadata.get_many(&slots)?)
+            } else {
+                None
+            };
+
+            let mut row = Vec::with_capacity(candidates.len());
+            for (cand_slot, score) in candidates {
+                let id = if include_id {
+                    self.id_pool
+                        .get_str(cand_slot)
+                        .unwrap_or_default()
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                let mut metadata = HashMap::new();
+                let mut document = None;
+                if let Some(meta) = meta_map.as_ref().and_then(|m| m.get(&cand_slot)).cloned() {
+                    if include_metadata {
+                        metadata = meta.properties;
+                    }
+                    if include_document {
+                        document = meta.document;
+                    }
+                }
+                row.push(SearchResult {
+                    id,
+                    score,
+                    metadata,
+                    document,
+                });
+            }
+            results.push(row);
+        }
+        Ok(results)
+    }
+
     /// Run the same search for multiple query vectors in one call.
     ///
     /// `use_ann_opt`:
@@ -884,6 +1071,25 @@ impl TurboQuantEngine {
         include_document: bool,
     ) -> Result<Vec<Vec<SearchResult>>, Box<dyn std::error::Error + Send + Sync>> {
         let use_ann = use_ann_opt.unwrap_or_else(|| self.auto_use_ann());
+        // Blocked batch scorer: one pass through codes scores all Q queries simultaneously.
+        // Break-even: Q ≥ 8, N ≥ 50k, brute-force, Ip/Cosine, no rerank.
+        const BATCH_BRUTE_MIN_Q: usize = 8;
+        const BATCH_BRUTE_MIN_N: usize = 50_000;
+        if !use_ann
+            && queries.len() >= BATCH_BRUTE_MIN_Q
+            && self.id_pool.active_count() >= BATCH_BRUTE_MIN_N
+            && !self.rerank_enabled
+            && matches!(self.metric, DistanceMetric::Ip | DistanceMetric::Cosine)
+        {
+            return self.score_batch_brute(
+                queries,
+                top_k,
+                filter,
+                include_id,
+                include_metadata,
+                include_document,
+            );
+        }
         // For small query batches, Rayon scheduling overhead can dominate
         // end-to-end latency. Use a sequential path to reduce p50/p99 for
         // tiny batches (common in interactive RAG calls).
