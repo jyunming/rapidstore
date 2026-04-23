@@ -19,8 +19,8 @@ use crate::quantizer::CodeIndex;
 use crate::quantizer::prod::ProdQuantizer;
 pub(crate) mod filter;
 use filter::{
-    extract_indexable_eq, extract_range_condition, get_nested_field, metadata_matches_filter,
-    score_vectors_with_metric,
+    extract_in_condition, extract_indexable_eq, extract_nin_condition, extract_or_single_field_eq,
+    extract_range_condition, get_nested_field, metadata_matches_filter, score_vectors_with_metric,
 };
 
 const QUANTIZER_STATE_FILE: &str = "quantizer.bin";
@@ -1805,6 +1805,36 @@ impl TurboQuantEngine {
         if let Some((field, lo, hi)) = extract_range_condition(filter) {
             let slots = self.metadata.get_range_candidates(field, lo, hi)?;
             return Some(intersect_sorted_slots(&slots, active_slots));
+        }
+
+        // Fast path 3: $in — union of eq_index lookups for each value in the list.
+        if let Some((field, values)) = extract_in_condition(filter) {
+            if let Some(candidates) = self.metadata.get_in_candidates(field, values) {
+                return Some(intersect_sorted_slots(&candidates, active_slots));
+            }
+            // Field not indexed → fall through to O(N) scan.
+        }
+
+        // Fast path 4: $nin — complement of excluded-value slots against active slots.
+        if let Some((field, excluded)) = extract_nin_condition(filter) {
+            let excluded_slots = self
+                .metadata
+                .get_in_candidates(field, excluded)
+                .unwrap_or_default();
+            let result: Vec<u32> = active_slots
+                .iter()
+                .copied()
+                .filter(|s| excluded_slots.binary_search(s).is_err())
+                .collect();
+            return Some(result);
+        }
+
+        // Fast path 5: single-field $or with pure equality sub-conditions → $in union.
+        if let Some((field, values)) = extract_or_single_field_eq(filter) {
+            if let Some(candidates) = self.metadata.get_in_candidates_refs(field, &values) {
+                return Some(intersect_sorted_slots(&candidates, active_slots));
+            }
+            // Field not indexed → fall through to O(N) scan.
         }
 
         None

@@ -30,6 +30,40 @@ fn value_to_index_key(v: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Merge `src` (sorted, unique) into `dst` (sorted, unique), preserving sorted-unique invariant.
+fn union_sorted_into(dst: &mut Vec<u32>, src: &[u32]) {
+    if src.is_empty() {
+        return;
+    }
+    if dst.is_empty() {
+        dst.extend_from_slice(src);
+        return;
+    }
+    let mut merged = Vec::with_capacity(dst.len() + src.len());
+    let mut i = 0;
+    let mut j = 0;
+    while i < dst.len() && j < src.len() {
+        match dst[i].cmp(&src[j]) {
+            std::cmp::Ordering::Equal => {
+                merged.push(dst[i]);
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => {
+                merged.push(dst[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                merged.push(src[j]);
+                j += 1;
+            }
+        }
+    }
+    merged.extend_from_slice(&dst[i..]);
+    merged.extend_from_slice(&src[j..]);
+    *dst = merged;
+}
+
 /// Map an f64 to a u64 that preserves numeric ordering for use as a BTreeMap key.
 ///
 /// The encoding:
@@ -175,6 +209,43 @@ impl MetadataStore {
         // short-circuits the caller to zero results rather than falling back to a full scan).
         let field_map = self.eq_index.get(field)?;
         Some(field_map.get(&key).map(Vec::as_slice).unwrap_or(&[]))
+    }
+
+    /// Return the union of eq_index slots for all values in `values` on `field`.
+    ///
+    /// Used for `$in` / `$nin` fast paths. Returns `None` when the field has no eq_index
+    /// entry (unknown field — callers must fall back to O(N) scan for `$in`; for `$nin`
+    /// an unknown field means all slots qualify so callers may treat `None` as empty exclude set).
+    /// Returns `Some(sorted_unique_slots)` when the field is indexed (may be empty).
+    pub fn get_in_candidates(&self, field: &str, values: &[serde_json::Value]) -> Option<Vec<u32>> {
+        let field_map = self.eq_index.get(field)?;
+        let mut result: Vec<u32> = Vec::new();
+        for v in values {
+            if let Some(key) = value_to_index_key(v) {
+                if let Some(slots) = field_map.get(&key) {
+                    union_sorted_into(&mut result, slots);
+                }
+            }
+        }
+        Some(result)
+    }
+
+    /// Same as `get_in_candidates` but accepts references (for single-field `$or`).
+    pub fn get_in_candidates_refs(
+        &self,
+        field: &str,
+        values: &[&serde_json::Value],
+    ) -> Option<Vec<u32>> {
+        let field_map = self.eq_index.get(field)?;
+        let mut result: Vec<u32> = Vec::new();
+        for v in values {
+            if let Some(key) = value_to_index_key(v) {
+                if let Some(slots) = field_map.get(&key) {
+                    union_sorted_into(&mut result, slots);
+                }
+            }
+        }
+        Some(result)
     }
 
     /// Return all slots where `field` falls within a numeric range.

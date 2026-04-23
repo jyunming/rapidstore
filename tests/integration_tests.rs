@@ -683,10 +683,10 @@ fn test_search_ann_override_api_and_high_beam_matches_bruteforce_top1() {
 
     let default_hits = engine.search(&query, 5).unwrap();
     let forced_small = engine
-        .search_with_filter_and_ann(&query, 5, None, Some(1), true)
+        .search_with_filter_and_ann(&query, 5, None, Some(1), true, None)
         .unwrap();
     let forced_large = engine
-        .search_with_filter_and_ann(&query, 5, None, Some(64), true)
+        .search_with_filter_and_ann(&query, 5, None, Some(64), true, None)
         .unwrap();
 
     let default_ids: Vec<_> = default_hits.iter().map(|r| r.id.clone()).collect();

@@ -283,6 +283,109 @@ pub(crate) fn extract_range_condition<'a>(
     Some((field.as_str(), lo, hi))
 }
 
+/// Extract a single `$in` condition that can use the eq_index.
+///
+/// Matches `{"field": {"$in": [v1, v2, ...]}}` with exactly one top-level field
+/// and no `$or`/`$and`. Returns `(field, values)` or `None`.
+pub(crate) fn extract_in_condition<'a>(
+    filter: &'a HashMap<String, JsonValue>,
+) -> Option<(&'a str, &'a Vec<JsonValue>)> {
+    if filter.contains_key("$or") || filter.contains_key("$and") || filter.len() != 1 {
+        return None;
+    }
+    let (field, val) = filter.iter().next()?;
+    if field.starts_with('$') {
+        return None;
+    }
+    let op_map = val.as_object()?;
+    if op_map.len() != 1 {
+        return None;
+    }
+    let (op, op_val) = op_map.iter().next()?;
+    if op != "$in" {
+        return None;
+    }
+    let arr = op_val.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    Some((field.as_str(), arr))
+}
+
+/// Extract a single `$nin` condition.
+///
+/// Matches `{"field": {"$nin": [v1, v2, ...]}}` with exactly one top-level field.
+/// Returns `(field, excluded_values)` or `None`.
+pub(crate) fn extract_nin_condition<'a>(
+    filter: &'a HashMap<String, JsonValue>,
+) -> Option<(&'a str, &'a Vec<JsonValue>)> {
+    if filter.contains_key("$or") || filter.contains_key("$and") || filter.len() != 1 {
+        return None;
+    }
+    let (field, val) = filter.iter().next()?;
+    if field.starts_with('$') {
+        return None;
+    }
+    let op_map = val.as_object()?;
+    if op_map.len() != 1 {
+        return None;
+    }
+    let (op, op_val) = op_map.iter().next()?;
+    if op != "$nin" {
+        return None;
+    }
+    let arr = op_val.as_array()?;
+    Some((field.as_str(), arr))
+}
+
+/// Detect a single-field `$or` whose sub-conditions are all plain equality on the same field.
+///
+/// Matches `{"$or": [{"f": v1}, {"f": v2}]}` or with `{"$eq": v}` sub-conditions.
+/// Returns `(field, collected_values)` or `None` if fields differ or sub-conditions are complex.
+pub(crate) fn extract_or_single_field_eq<'a>(
+    filter: &'a HashMap<String, JsonValue>,
+) -> Option<(&'a str, Vec<&'a JsonValue>)> {
+    if filter.len() != 1 {
+        return None;
+    }
+    let conditions = filter.get("$or")?.as_array()?;
+    if conditions.is_empty() {
+        return None;
+    }
+    let mut field_name: Option<&str> = None;
+    let mut values: Vec<&JsonValue> = Vec::new();
+    for cond in conditions {
+        let map = cond.as_object()?;
+        if map.len() != 1 {
+            return None;
+        }
+        let (f, v) = map.iter().next()?;
+        if f.starts_with('$') {
+            return None;
+        }
+        let f_str = f.as_str();
+        match field_name {
+            Some(prev) if prev != f_str => return None,
+            Some(_) => {}
+            None => field_name = Some(f_str),
+        }
+        match v {
+            JsonValue::Object(ops) => {
+                if ops.len() != 1 {
+                    return None;
+                }
+                let (op, op_val) = ops.iter().next()?;
+                if op != "$eq" {
+                    return None;
+                }
+                values.push(op_val);
+            }
+            _ => values.push(v),
+        }
+    }
+    Some((field_name?, values))
+}
+
 /// Extract simple equality conditions from a filter that can use the eq_index.
 ///
 /// Returns pairs of `(field, value)` for conditions of the form `{"field": value}`
