@@ -556,7 +556,7 @@ impl Database {
     ///
     /// Returns:
     ///     List of dicts, each with keys ``id``, ``score``, ``metadata``, ``document``.
-    #[pyo3(signature = (query, top_k, filter=None, _use_ann=None, ann_search_list_size=None, include=None, rerank_factor=None))]
+    #[pyo3(signature = (query, top_k, filter=None, _use_ann=None, ann_search_list_size=None, include=None, rerank_factor=None, nprobe=None))]
     fn search(
         &self,
         py: Python<'_>,
@@ -567,6 +567,7 @@ impl Database {
         ann_search_list_size: Option<usize>,
         include: Option<Vec<String>>,
         rerank_factor: Option<usize>,
+        nprobe: Option<usize>,
     ) -> PyResult<PyObject> {
         if top_k <= 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -618,9 +619,21 @@ impl Database {
                 )));
             }
             let is_l2 = matches!(engine.metric, crate::storage::engine::DistanceMetric::L2);
-            let use_ann = _use_ann.unwrap_or_else(|| engine.auto_use_ann());
-            let results = engine
-                .search_with_filter_and_ann_include(
+            let results = if let Some(np) = nprobe {
+                // IVF coarse routing: score only top-nprobe clusters.
+                engine.search_with_ivf(
+                    &q,
+                    top_k,
+                    filter_ref,
+                    np,
+                    rerank_factor,
+                    inc.contains("id"),
+                    inc.contains("metadata"),
+                    inc.contains("document"),
+                )
+            } else {
+                let use_ann = _use_ann.unwrap_or_else(|| engine.auto_use_ann());
+                engine.search_with_filter_and_ann_include(
                     &q,
                     top_k,
                     filter_ref,
@@ -631,7 +644,8 @@ impl Database {
                     inc.contains("metadata"),
                     inc.contains("document"),
                 )
-                .map_err(to_py_runtime)?;
+            }
+            .map_err(to_py_runtime)?;
             Ok((results, is_l2))
         })?;
 
@@ -660,6 +674,23 @@ impl Database {
             py_list.append(dict)?;
         }
         Ok(py_list.into())
+    }
+
+    /// Build IVF coarse routing index for fast approximate search at large N.
+    ///
+    /// After calling this, pass ``nprobe=N`` to :meth:`search` to enable IVF routing.
+    /// Only ``nprobe/n_clusters`` of the corpus is scored, reducing latency proportionally.
+    ///
+    /// Args:
+    ///     n_clusters: Number of coarse centroids. Recommended 256 for N ≥ 100k.
+    #[pyo3(signature = (n_clusters=256))]
+    fn create_coarse_index(&self, py: Python<'_>, n_clusters: usize) -> PyResult<()> {
+        py.allow_threads(|| {
+            let mut engine = self.write_engine()?;
+            engine
+                .create_coarse_index(n_clusters)
+                .map_err(to_py_runtime)
+        })
     }
 
     #[pyo3(signature = (max_degree=None, ef_construction=None, search_list_size=None, alpha=None, n_refinements=None))]

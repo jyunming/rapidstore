@@ -11,6 +11,7 @@ use super::backend::StorageBackend;
 use super::compaction::Compactor;
 use super::graph::GraphManager;
 use super::id_pool::IdPool;
+use super::ivf::IvfIndex;
 use super::live_codes::LiveCodesFile;
 use super::metadata::{MetadataStore, VectorMetadata};
 use super::segment::{SegmentManager, SegmentRecord};
@@ -316,6 +317,8 @@ pub struct TurboQuantEngine {
     /// When true, input vectors and query vectors are L2-normalised internally
     /// before quantisation / scoring so that IP ≡ cosine similarity.
     pub normalize: bool,
+    /// Optional IVF coarse index — loaded at open if `ivf.bin` exists.
+    ivf: Option<IvfIndex>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -563,6 +566,7 @@ impl TurboQuantEngine {
             has_pending_deletes: false,
             rerank_enabled: manifest.rerank_enabled,
             normalize: normalize_flag,
+            ivf: None,
         };
 
         let id_pool_loaded = if let Ok(ip) = load_id_pool(local_dir, &engine.backend) {
@@ -597,6 +601,11 @@ impl TurboQuantEngine {
             return Err(
                 "live_ids.bin missing and WAL is empty; database state appears corrupt".into(),
             );
+        }
+        // Load IVF index if present.
+        let ivf_path = Path::new(local_dir).join("ivf.bin");
+        if ivf_path.exists() {
+            engine.ivf = IvfIndex::load(&ivf_path).ok();
         }
         Ok(engine)
     }
@@ -1085,9 +1094,11 @@ impl TurboQuantEngine {
     ) -> Result<Vec<Vec<SearchResult>>, Box<dyn std::error::Error + Send + Sync>> {
         let use_ann = use_ann_opt.unwrap_or_else(|| self.auto_use_ann());
         // Blocked batch scorer: one pass through codes scores all Q queries simultaneously.
-        // Break-even: Q ≥ 8, N ≥ 50k, brute-force, Ip/Cosine, no rerank.
+        // Reduces memory traffic Q×N×stride → N×stride at the cost of sequential access.
+        // Break-even on memory-bandwidth-limited workloads (codes >> L3 cache, typically N > 500k).
+        // On multi-core machines with small N, the Rayon par_iter path beats this.
         const BATCH_BRUTE_MIN_Q: usize = 8;
-        const BATCH_BRUTE_MIN_N: usize = 50_000;
+        const BATCH_BRUTE_MIN_N: usize = 500_000;
         if !use_ann
             && queries.len() >= BATCH_BRUTE_MIN_Q
             && self.id_pool.active_count() >= BATCH_BRUTE_MIN_N
@@ -2953,6 +2964,114 @@ impl TurboQuantEngine {
         self.segments.add_segment(new_seg);
         compactor.finish_compaction()?;
         Ok(())
+    }
+
+    /// Build IVF coarse routing index and persist it to disk.
+    ///
+    /// `n_clusters`: number of clusters (coarse centroids). Recommended: 256 for N ≥ 100k.
+    /// Use `nprobe` parameter in `search()` to activate IVF routing at query time.
+    pub fn create_coarse_index(
+        &mut self,
+        n_clusters: usize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let active_slots = self.id_pool.iter_active_slots();
+        if active_slots.is_empty() {
+            return Ok(());
+        }
+        let codes_bytes = self.live_codes.as_bytes();
+        let stride = self.live_stride();
+        let mse_len = self.live_mse_len();
+        let n = self.quantizer.n;
+        let bits = self.quantizer.mse_bits_per_idx();
+        let mse_centroids = &self.quantizer.mse_quantizer.centroids;
+        let seed = self.quantizer.mse_quantizer.b as u64 * 1234567891;
+
+        let ivf = IvfIndex::build(
+            codes_bytes,
+            &active_slots,
+            stride,
+            mse_len,
+            n,
+            bits,
+            mse_centroids,
+            n_clusters,
+            20, // max_iter
+            seed,
+        );
+        let ivf_path = Path::new(&self.local_dir).join("ivf.bin");
+        ivf.save(&ivf_path)?;
+        self.ivf = Some(ivf);
+        Ok(())
+    }
+
+    /// Search using IVF coarse routing: score only nprobe clusters instead of all N vectors.
+    ///
+    /// Requires `create_coarse_index()` to have been called first. Falls back to
+    /// brute-force when no IVF index is loaded.
+    pub fn search_with_ivf(
+        &self,
+        query: &Array1<f64>,
+        top_k: usize,
+        filter: Option<&HashMap<String, JsonValue>>,
+        nprobe: usize,
+        rerank_factor: Option<usize>,
+        include_id: bool,
+        include_metadata: bool,
+        include_document: bool,
+    ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(ivf) = &self.ivf else {
+            // No IVF index — fall back to brute-force.
+            return self.search_with_filter_and_ann_include(
+                query,
+                top_k,
+                filter,
+                None,
+                false,
+                rerank_factor,
+                include_id,
+                include_metadata,
+                include_document,
+            );
+        };
+        if self.id_pool.active_count() == 0 || top_k == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Rotate query into SRHT space to score against IVF centroids.
+        let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
+        let mut y_query = vec![0.0f32; self.quantizer.n];
+        self.quantizer
+            .mse_quantizer
+            .apply_rotation(&query_f32, &mut y_query);
+
+        // Probe IVF: get candidate slots from top-nprobe clusters.
+        let mut candidates = ivf.probe(&y_query, nprobe);
+
+        // Intersect with filter candidates (use index fast path when available).
+        if let Some(f) = filter {
+            let active_slots = self.id_pool.iter_active_slots();
+            if let Some(filter_slots) = self.resolve_filter_via_index(f, &active_slots) {
+                // Intersect IVF candidates with filter-resolved slots (both sorted).
+                let fs_set: std::collections::HashSet<u32> = filter_slots.into_iter().collect();
+                candidates.retain(|s| fs_set.contains(s));
+            }
+        }
+
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Score the shortlist using the existing quantized scorer.
+        self.exhaustive_search_simd(
+            query,
+            top_k,
+            filter,
+            Some(candidates),
+            rerank_factor,
+            include_id,
+            include_metadata,
+            include_document,
+        )
     }
 
     /// Build the HNSW index with server-friendly defaults.

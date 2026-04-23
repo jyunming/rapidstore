@@ -17,6 +17,7 @@ pub mod compaction;
 pub mod engine;
 pub mod graph;
 pub mod id_pool;
+pub mod ivf;
 pub mod live_codes;
 pub mod metadata;
 pub mod segment;

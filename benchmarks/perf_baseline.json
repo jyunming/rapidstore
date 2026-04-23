@@ -28,23 +28,23 @@
     },
     "avg_latency_ms": {
       "higher_is_better": false,
-      "best": 0.7352579990401864
+      "best": 0.6478030001744628
     },
     "p50_latency_ms": {
       "higher_is_better": false,
-      "best": 0.7348000071942806
+      "best": 0.6476500420831144
     },
     "p95_latency_ms": {
       "higher_is_better": false,
-      "best": 0.7455099781509489
+      "best": 0.6531150778755546
     },
     "disk_bytes": {
       "higher_is_better": false,
-      "best": 1288594.0
+      "best": 1288630.0
     },
     "compression_ratio": {
       "higher_is_better": true,
-      "best": 6.208316971831314
+      "best": 6.208143532278466
     },
     "ram_estimate_bytes": {
       "higher_is_better": false,
