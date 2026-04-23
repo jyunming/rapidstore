@@ -6,6 +6,31 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
+## [0.6.0] — 2026-04-23
+
+### Added
+
+- **`db.create_coarse_index(n_clusters=256)`** — builds an IVF (Inverted File Index) coarse routing index by running k-means in the MSE-rotated SRHT space. Persisted as `ivf.bin`; loaded automatically on re-open.
+- **`db.search(…, nprobe=N)`** — activates IVF coarse routing when an IVF index exists. Scores only the top-nprobe clusters (≈ nprobe/k of the corpus). 2–4× speedup at N ≥ 50k; recall degrades gracefully with decreasing nprobe.
+- **`$in` / `$nin` / single-field `$or` filter fast paths** — filters of these patterns now use `eq_index` lookups instead of an O(N) full scan. `$eq` (5k/20k) is 11.7×, `$in`/`$or` (10k/20k) 6–7× faster than baseline scan.
+
+### Performance
+
+- **Dense-mode GEMM ingest** — `quantizer_type="dense"` now rotates all B vectors via a single SGEMM call (nalgebra/matrixmultiply) instead of B separate d×d matrix-vector multiplies. Dense ingest at d ≥ 512 now matches or exceeds SRHT throughput.
+- **Blocked batch scorer** — new `score_batch_brute()` kernel for `db.query()` at very large N (≥ 500k) reads `live_codes.bin` once and scores all Q queries simultaneously; reduces memory traffic from Q×N to N code-reads.
+- **Metadata index persistence** — `eq_index` and `range_index` now persisted as `metadata.idx` on every flush. `Database.open()` loads the persisted indexes directly, skipping the O(N) rebuild (1.7× faster startup at N=100k, scales with corpus size).
+- **Metadata WAL** — `put_many()` appends O(batch_size) WAL entries to `metadata.wal` instead of touching `metadata.bin`; the O(N) full rewrite is deferred to `checkpoint()`/close.
+- **Exact-index post-scan skip** — `$in`, `$nin`, single-field `$or`, and range conditions now short-circuit the per-candidate metadata re-evaluation step (was previously only done for pure-`$eq`). Measured ~20% end-to-end latency reduction on GloVe-200.
+
+### Fixed
+
+- **HNSW neighbor-selection deduplication** — `choose_top_ids()` helper replaces 4 identical 11-line blocks in the graph build/insert paths.
+- **Integration test arg count** — `search_with_filter_and_ann` call sites updated to match the 6-argument signature added in v0.5.2.
+- **ChromaDB ≥ 1.5 compat** — `list_collections()` now returns `List[str]` (was `List[CollectionInfo]`). Rename keeps the directory name stable (logical-only metadata rename).
+- **RAG hybrid results** — `SearchResultDocument` hybrid object supports both `doc.page_content` / `doc.metadata` (LangChain Document style) and `doc["id"]` / `doc["score"]` (dict style).
+
+---
+
 ## [0.5.2] — 2026-04-13
 
 ### Added
