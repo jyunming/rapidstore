@@ -1,3 +1,4 @@
+use nalgebra::DMatrix;
 use ndarray::Array1;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -543,6 +544,12 @@ impl ProdQuantizer {
     }
 
     pub fn quantize_batch(&self, xs: &[&[f32]]) -> Vec<(Vec<CodeIndex>, Vec<u8>, f64)> {
+        // Dense mode: batch all rotations via a single GEMM (Y = R × X) instead of
+        // B separate matrix-vector multiplies. Break-even at B ≥ 64.
+        const DENSE_BATCH_MIN: usize = 64;
+        if self.mse_quantizer.rotation_matrix.is_some() && xs.len() >= DENSE_BATCH_MIN {
+            return self.quantize_batch_dense_gemm(xs);
+        }
         // Below this threshold the Rayon thread-park/unpark overhead exceeds the
         // quantization work on all supported platforms (especially Windows).
         const PAR_THRESHOLD: usize = 512;
@@ -551,6 +558,51 @@ impl ProdQuantizer {
         } else {
             xs.par_iter().map(|x| self.quantize(x)).collect()
         }
+    }
+
+    /// Dense-mode batch quantization: rotate all B vectors at once via GEMM,
+    /// then per-vector centroid lookup + optional QJL residual encoding.
+    fn quantize_batch_dense_gemm(&self, xs: &[&[f32]]) -> Vec<(Vec<CodeIndex>, Vec<u8>, f64)> {
+        let d = self.d;
+        let b = xs.len();
+        // Build input matrix X (d×B): column col = vector xs[col].
+        let mut x_mat = DMatrix::<f32>::zeros(d, b);
+        for (col, x) in xs.iter().enumerate() {
+            for (row, &val) in x.iter().enumerate() {
+                x_mat[(row, col)] = val;
+            }
+        }
+        // GEMM: Y = R × X  (one call through matrixmultiply's SGEMM kernel).
+        let mat = self.mse_quantizer.rotation_matrix.as_ref().unwrap();
+        let r = DMatrix::from_row_slice(d, d, mat);
+        let y_mat = r * x_mat;
+
+        // Per-vector: centroid lookup on each column of Y, then QJL if needed.
+        (0..b)
+            .map(|col| {
+                let y_col = y_mat.column(col);
+                let idx: Vec<CodeIndex> = y_col
+                    .iter()
+                    .map(|&val| self.mse_quantizer.nearest_centroid_index(val))
+                    .collect();
+
+                if self.fast_mode {
+                    return (idx, vec![0u8; self.n.div_ceil(8)], 0.0f64);
+                }
+
+                let x_mse = self.mse_quantizer.dequantize(&idx);
+                let mut residual = Array1::zeros(d);
+                let mut gamma_sq = 0.0f64;
+                for i in 0..d {
+                    let rv = xs[col][i] as f64 - x_mse[i];
+                    residual[i] = rv;
+                    gamma_sq += rv * rv;
+                }
+                let gamma = gamma_sq.sqrt();
+                let qjl = self.qjl_quantizer.quantize(&residual);
+                (idx, qjl, gamma)
+            })
+            .collect()
     }
 
     pub fn dequantize(&self, idx: &[CodeIndex], qjl: &[u8], gamma: f64) -> Array1<f64> {

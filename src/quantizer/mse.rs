@@ -195,7 +195,7 @@ impl MseQuantizer {
         all_indices
     }
 
-    fn nearest_centroid_index(&self, val: f32) -> CodeIndex {
+    pub(crate) fn nearest_centroid_index(&self, val: f32) -> CodeIndex {
         let n = self.centroids.len();
         if n == 0 {
             return 0;
