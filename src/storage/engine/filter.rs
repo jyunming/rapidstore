@@ -669,3 +669,24 @@ mod tests {
         assert!((s - expected).abs() < 1e-10, "expected {expected}, got {s}");
     }
 }
+
+#[cfg(test)]
+mod or_fast_path_test {
+    use super::*;
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+
+    #[test]
+    fn extract_or_single_field_eq_basic() {
+        let mut f: HashMap<String, Value> = HashMap::new();
+        f.insert("$or".to_string(), json!([{"cat": "a"}, {"cat": "b"}]));
+        let result = extract_or_single_field_eq(&f);
+        assert!(
+            result.is_some(),
+            "should match $or with same-field equality"
+        );
+        let (field, vals) = result.unwrap();
+        assert_eq!(field, "cat");
+        assert_eq!(vals.len(), 2);
+    }
+}

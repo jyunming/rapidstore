@@ -154,6 +154,21 @@ fn has_meaningful_metadata(meta: &VectorMetadata) -> bool {
     !meta.properties.is_empty() || meta.document.is_some()
 }
 
+/// Returns true when `resolve_filter_via_index()` fully resolves `filter` with no
+/// additional per-candidate evaluation needed.  Pure-$eq, $in, $nin, single-field $or,
+/// and single-field range conditions are all exact — callers can skip the post-scan.
+fn filter_is_exact_index(filter: &HashMap<String, JsonValue>) -> bool {
+    // Pure equality conditions (existing behaviour).
+    if let Some(eqs) = extract_indexable_eq(filter) {
+        return eqs.len() == filter.len();
+    }
+    // Single-field $in / $nin / single-field $or / single-field range.
+    extract_in_condition(filter).is_some()
+        || extract_nin_condition(filter).is_some()
+        || extract_or_single_field_eq(filter).is_some()
+        || extract_range_condition(filter).is_some()
+}
+
 fn intersect_sorted_slots(a: &[u32], b: &[u32]) -> Vec<u32> {
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -866,9 +881,7 @@ impl TurboQuantEngine {
         }
         let candidate_slots: Vec<u32> = if let Some(f) = filter {
             if let Some(indexed) = self.resolve_filter_via_index(f, &active_slots) {
-                let all_eq = extract_indexable_eq(f)
-                    .map(|eqs| eqs.len() == f.len())
-                    .unwrap_or(false);
+                let all_eq = filter_is_exact_index(f);
                 if all_eq {
                     indexed
                 } else {
@@ -1699,10 +1712,7 @@ impl TurboQuantEngine {
 
                 let matches = if let Some(indexed) = self.resolve_filter_via_index(f, &active_slots)
                 {
-                    let all_eq = extract_indexable_eq(f)
-                        .map(|eqs| eqs.len() == f.len())
-                        .unwrap_or(false);
-                    if all_eq {
+                    if filter_is_exact_index(f) {
                         indexed
                     } else {
                         let meta_map = self.metadata.get_many_properties(&indexed)?;
@@ -2096,12 +2106,9 @@ impl TurboQuantEngine {
                 if let Some(f) = filter {
                     // Fast path: try eq_index for O(1) candidate resolution.
                     if let Some(indexed_slots) = self.resolve_filter_via_index(f, &active_slots) {
-                        // Still need full filter eval in case there are additional conditions
-                        // beyond the indexed ones (e.g. range operators alongside $eq).
-                        let all_eq = extract_indexable_eq(f)
-                            .map(|eqs| eqs.len() == f.len())
-                            .unwrap_or(false);
-                        if all_eq {
+                        // Skip post-scan when the indexed result is exact.
+                        // Applies to: pure-$eq, $in, $nin, single-field $or, single-field range.
+                        if filter_is_exact_index(f) {
                             indexed_slots
                         } else {
                             let meta_map = self.metadata.get_many_properties(&indexed_slots)?;

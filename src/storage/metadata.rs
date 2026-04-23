@@ -4,9 +4,20 @@ use std::fs::File;
 use std::io::{BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
+extern crate bincode;
+
 const DOCS_RAW_MAGIC: &[u8; 4] = b"M2D1";
 const DOCS_CONTAINER_MAGIC: &[u8; 4] = b"M2DZ";
 const DOCS_CODEC_RAW: u8 = 0;
+
+/// Persisted eq_index + range_index file magic.
+const IDX_MAGIC: &[u8; 4] = b"M2IX";
+/// Metadata WAL file magic.
+const WAL_MAGIC: &[u8; 4] = b"M2WA";
+/// WAL entry: Put (slot + properties JSON + optional document).
+const WAL_PUT: u8 = 0;
+/// WAL entry: Delete (slot only).
+const WAL_DELETE: u8 = 1;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct VectorMetadata {
@@ -85,8 +96,15 @@ pub(crate) fn f64_to_ord(v: f64) -> u64 {
 pub struct MetadataStore {
     path: PathBuf,
     docs_path: PathBuf,
+    /// Append-only WAL: records every Put/Delete since the last flush.
+    /// Enables O(batch_size) insert cost instead of O(N) full-rewrite per flush.
+    wal_path: PathBuf,
+    /// Persisted eq+range indexes: loaded on open to skip O(N) rebuild.
+    idx_path: PathBuf,
     data: HashMap<u32, VectorMetadata>,
     dirty: bool,
+    /// True when WAL has entries that have not yet been compacted into metadata.bin.
+    wal_has_entries: bool,
     /// Equality index: field -> value_key -> sorted slot list.
     /// Covers scalar (string/number/bool/null) top-level fields only.
     /// Enables O(1) pre-filter candidate lookup for $eq filter conditions.
@@ -101,6 +119,8 @@ impl MetadataStore {
     pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let path = PathBuf::from(path);
         let docs_path = path.with_extension("docs.zst");
+        let wal_path = path.with_extension("wal");
+        let idx_path = path.with_extension("idx");
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -117,13 +137,33 @@ impl MetadataStore {
                 data.entry(slot).or_default().document = Some(doc);
             }
         }
-        let eq_index = Self::build_eq_index(&data);
-        let range_index = Self::build_range_index(&data);
+
+        // Replay WAL entries if any exist since the last flush.
+        let wal_has_entries = if wal_path.exists() {
+            Self::replay_wal(&wal_path, &mut data).unwrap_or(false)
+        } else {
+            false
+        };
+
+        // Build or load indexes.
+        let (eq_index, range_index) = if !wal_has_entries && idx_path.exists() {
+            // No pending WAL mutations — try to load persisted indexes (avoids O(N) rebuild).
+            match Self::load_indexes(&idx_path) {
+                Ok((eq, rng)) => (eq, rng),
+                Err(_) => (Self::build_eq_index(&data), Self::build_range_index(&data)),
+            }
+        } else {
+            (Self::build_eq_index(&data), Self::build_range_index(&data))
+        };
+
         Ok(Self {
             path,
             docs_path,
+            wal_path,
+            idx_path,
             data,
             dirty: false,
+            wal_has_entries,
             eq_index,
             range_index,
         })
@@ -138,6 +178,7 @@ impl MetadataStore {
         self.data.insert(slot, meta.clone());
         self.index_add(slot, meta);
         self.dirty = true;
+        self.append_wal_put(slot, meta)?;
         Ok(())
     }
 
@@ -154,6 +195,7 @@ impl MetadataStore {
             self.index_add(*slot, meta);
         }
         self.dirty = true;
+        self.append_wal_put_many(entries)?;
         Ok(())
     }
 
@@ -197,6 +239,7 @@ impl MetadataStore {
         self.index_remove(slot);
         self.data.remove(&slot);
         self.dirty = true;
+        self.append_wal_delete(slot)?;
         Ok(())
     }
 
@@ -309,6 +352,9 @@ impl MetadataStore {
         self.eq_index.clear();
         self.range_index.clear();
         self.dirty = true;
+        // Stale WAL is now invalid — drop it so open() doesn't replay against empty state.
+        let _ = std::fs::remove_file(&self.wal_path);
+        self.wal_has_entries = false;
     }
 
     pub fn replace_all(&mut self, data: HashMap<u32, VectorMetadata>) {
@@ -316,6 +362,9 @@ impl MetadataStore {
         self.range_index = Self::build_range_index(&data);
         self.data = data;
         self.dirty = true;
+        // Compaction replaced all data; any pending WAL entries are superseded.
+        let _ = std::fs::remove_file(&self.wal_path);
+        self.wal_has_entries = false;
     }
 
     pub fn len(&self) -> usize {
@@ -409,6 +458,13 @@ impl MetadataStore {
             #[cfg(target_os = "windows")]
             let _ = std::fs::remove_file(&self.docs_path);
             std::fs::rename(docs_tmp, &self.docs_path)?;
+        }
+        // Persist eq+range indexes so Database.open() can skip the O(N) rebuild.
+        self.save_indexes()?;
+        // WAL is now redundant — all mutations are in metadata.bin.
+        if self.wal_has_entries {
+            let _ = std::fs::remove_file(&self.wal_path);
+            self.wal_has_entries = false;
         }
         self.dirty = false;
         Ok(())
@@ -637,6 +693,201 @@ impl MetadataStore {
             docs.insert(slot, doc);
         }
         Ok(docs)
+    }
+
+    // ── WAL helpers ───────────────────────────────────────────────────────────
+
+    fn wal_open_append(path: &Path) -> std::io::Result<File> {
+        let exists = path.exists();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)?;
+        if !exists {
+            // Write magic on first creation.
+            f.write_all(WAL_MAGIC)?;
+        }
+        Ok(f)
+    }
+
+    fn append_wal_put(
+        &mut self,
+        slot: u32,
+        meta: &VectorMetadata,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let props = serde_json::to_vec(&meta.properties)?;
+        let mut f = Self::wal_open_append(&self.wal_path)?;
+        f.write_all(&[WAL_PUT])?;
+        f.write_all(&slot.to_le_bytes())?;
+        f.write_all(&(props.len() as u32).to_le_bytes())?;
+        f.write_all(&props)?;
+        let (has_doc, doc_bytes) = match &meta.document {
+            Some(d) => (1u8, d.as_bytes().to_vec()),
+            None => (0u8, vec![]),
+        };
+        f.write_all(&[has_doc])?;
+        if has_doc == 1 {
+            f.write_all(&(doc_bytes.len() as u32).to_le_bytes())?;
+            f.write_all(&doc_bytes)?;
+        }
+        self.wal_has_entries = true;
+        Ok(())
+    }
+
+    fn append_wal_put_many(
+        &mut self,
+        entries: &[(u32, VectorMetadata)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut f = Self::wal_open_append(&self.wal_path)?;
+        for (slot, meta) in entries {
+            let props = serde_json::to_vec(&meta.properties)?;
+            f.write_all(&[WAL_PUT])?;
+            f.write_all(&slot.to_le_bytes())?;
+            f.write_all(&(props.len() as u32).to_le_bytes())?;
+            f.write_all(&props)?;
+            let (has_doc, doc_bytes) = match &meta.document {
+                Some(d) => (1u8, d.as_bytes().to_vec()),
+                None => (0u8, vec![]),
+            };
+            f.write_all(&[has_doc])?;
+            if has_doc == 1 {
+                f.write_all(&(doc_bytes.len() as u32).to_le_bytes())?;
+                f.write_all(&doc_bytes)?;
+            }
+        }
+        self.wal_has_entries = true;
+        Ok(())
+    }
+
+    fn append_wal_delete(
+        &mut self,
+        slot: u32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut f = Self::wal_open_append(&self.wal_path)?;
+        f.write_all(&[WAL_DELETE])?;
+        f.write_all(&slot.to_le_bytes())?;
+        self.wal_has_entries = true;
+        Ok(())
+    }
+
+    /// Replay WAL entries into `data`. Returns `true` if any entries were present.
+    fn replay_wal(
+        path: &Path,
+        data: &mut HashMap<u32, VectorMetadata>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let bytes = std::fs::read(path)?;
+        if bytes.len() < 4 {
+            return Ok(false);
+        }
+        if &bytes[..4] != WAL_MAGIC {
+            return Ok(false);
+        }
+        let mut cur = Cursor::new(&bytes[4..]);
+        let mut had_entries = false;
+
+        loop {
+            let mut tag = [0u8; 1];
+            if cur.read_exact(&mut tag).is_err() {
+                break;
+            }
+            match tag[0] {
+                WAL_PUT => {
+                    let mut slot_buf = [0u8; 4];
+                    cur.read_exact(&mut slot_buf)?;
+                    let slot = u32::from_le_bytes(slot_buf);
+
+                    let mut len_buf = [0u8; 4];
+                    cur.read_exact(&mut len_buf)?;
+                    let props_len = u32::from_le_bytes(len_buf) as usize;
+                    let mut props_bytes = vec![0u8; props_len];
+                    cur.read_exact(&mut props_bytes)?;
+                    let properties: HashMap<String, serde_json::Value> =
+                        serde_json::from_slice(&props_bytes)?;
+
+                    let mut has_doc_buf = [0u8; 1];
+                    cur.read_exact(&mut has_doc_buf)?;
+                    let document = if has_doc_buf[0] == 1 {
+                        let mut doc_len_buf = [0u8; 4];
+                        cur.read_exact(&mut doc_len_buf)?;
+                        let doc_len = u32::from_le_bytes(doc_len_buf) as usize;
+                        let mut doc_bytes = vec![0u8; doc_len];
+                        cur.read_exact(&mut doc_bytes)?;
+                        Some(String::from_utf8(doc_bytes)?)
+                    } else {
+                        None
+                    };
+
+                    data.insert(
+                        slot,
+                        VectorMetadata {
+                            properties,
+                            document,
+                        },
+                    );
+                    had_entries = true;
+                }
+                WAL_DELETE => {
+                    let mut slot_buf = [0u8; 4];
+                    cur.read_exact(&mut slot_buf)?;
+                    let slot = u32::from_le_bytes(slot_buf);
+                    data.remove(&slot);
+                    had_entries = true;
+                }
+                _ => break, // unknown tag — stop replaying (corrupt tail)
+            }
+        }
+        Ok(had_entries)
+    }
+
+    // ── Index persistence helpers ─────────────────────────────────────────────
+
+    fn save_indexes(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let eq_bytes = bincode::serialize(&self.eq_index)?;
+        let rng_bytes = bincode::serialize(&self.range_index)?;
+        let tmp = self.idx_path.with_extension("idx.tmp");
+        let mut f = BufWriter::new(File::create(&tmp)?);
+        f.write_all(IDX_MAGIC)?;
+        f.write_all(&(eq_bytes.len() as u64).to_le_bytes())?;
+        f.write_all(&eq_bytes)?;
+        f.write_all(&(rng_bytes.len() as u64).to_le_bytes())?;
+        f.write_all(&rng_bytes)?;
+        f.flush()?;
+        drop(f);
+        #[cfg(target_os = "windows")]
+        let _ = std::fs::remove_file(&self.idx_path);
+        std::fs::rename(tmp, &self.idx_path)?;
+        Ok(())
+    }
+
+    fn load_indexes(
+        path: &Path,
+    ) -> Result<
+        (
+            HashMap<String, HashMap<String, Vec<u32>>>,
+            HashMap<String, BTreeMap<u64, Vec<u32>>>,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let bytes = std::fs::read(path)?;
+        if bytes.len() < 4 || &bytes[..4] != IDX_MAGIC {
+            return Err("invalid idx magic".into());
+        }
+        let mut cur = Cursor::new(&bytes[4..]);
+        let mut len_buf = [0u8; 8];
+        cur.read_exact(&mut len_buf)?;
+        let eq_len = u64::from_le_bytes(len_buf) as usize;
+        let mut eq_bytes = vec![0u8; eq_len];
+        cur.read_exact(&mut eq_bytes)?;
+        cur.read_exact(&mut len_buf)?;
+        let rng_len = u64::from_le_bytes(len_buf) as usize;
+        let mut rng_bytes = vec![0u8; rng_len];
+        cur.read_exact(&mut rng_bytes)?;
+        let eq_index = bincode::deserialize(&eq_bytes)?;
+        let range_index = bincode::deserialize(&rng_bytes)?;
+        Ok((eq_index, range_index))
     }
 }
 
@@ -1023,5 +1274,53 @@ mod tests {
             store2.get_eq_candidates("color", &json!("red")).unwrap(),
             &[0, 2]
         );
+    }
+}
+
+#[cfg(test)]
+mod or_debug_test {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use tempfile::tempdir;
+
+    #[test]
+    fn or_index_lookup_works() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.bin");
+        let mut store = MetadataStore::open(path.to_str().unwrap()).unwrap();
+
+        // Insert slots with cat=a or cat=b
+        let entries: Vec<(u32, VectorMetadata)> = (0..20u32)
+            .map(|i| {
+                let cat = if i < 10 { "a" } else { "b" };
+                let mut props = HashMap::new();
+                props.insert("cat".to_string(), json!(cat));
+                (
+                    i,
+                    VectorMetadata {
+                        properties: props,
+                        document: None,
+                    },
+                )
+            })
+            .collect();
+        store.put_many(&entries).unwrap();
+
+        // Check eq_index has cat field
+        let all_a = store.get_eq_candidates("cat", &json!("a"));
+        println!("cat=a slots: {:?}", all_a);
+        assert!(all_a.is_some(), "cat field should be indexed");
+
+        // Check get_in_candidates_refs works
+        let vals = vec![json!("a"), json!("b")];
+        let val_refs: Vec<&serde_json::Value> = vals.iter().collect();
+        let candidates = store.get_in_candidates_refs("cat", &val_refs);
+        println!("or candidates: {:?}", candidates);
+        assert!(
+            candidates.is_some(),
+            "get_in_candidates_refs should return Some for indexed field"
+        );
+        assert_eq!(candidates.unwrap().len(), 20, "should find all 20 slots");
     }
 }
