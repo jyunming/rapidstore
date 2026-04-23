@@ -128,7 +128,8 @@ len(db) / "id" in db                 # container protocol
 
 # Search — brute-force by default; pass _use_ann=True to use HNSW index
 results = db.search(query, top_k=10, filter=None, _use_ann=False,
-                    ann_search_list_size=None, rerank_factor=None, include=None)
+                    ann_search_list_size=None, rerank_factor=None, include=None,
+                    nprobe=None)  # nprobe=N activates IVF routing (see create_coarse_index)
 # include: list of "id"|"score"|"metadata"|"document" (default all)
 # ann_search_list_size: HNSW ef_search override (only used when _use_ann=True)
 # rerank_factor: candidate oversampling multiplier (default 10 brute / 20 ANN)
@@ -144,10 +145,15 @@ db.checkpoint()
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5,
                 search_list_size=128, alpha=1.2)
 
-# Metadata filter operators
-# $eq $ne $gt $gte $lt $lte $in $nin $exists $and $or
+# IVF coarse routing (fast approximate search at large N)
+db.create_coarse_index(n_clusters=256)          # build once after loading data
+results = db.search(query, top_k=10, nprobe=16) # score ~6% of corpus
+
+# Metadata filter operators — $in/$nin/$or use index fast paths (O(1) per field)
+# $eq $ne $gt $gte $lt $lte $in $nin $exists $and $or $contains
 db.search(query, top_k=5, filter={"year": {"$gte": 2023}})
 db.search(query, top_k=5, filter={"$and": [{"topic": "ml"}, {"year": {"$gte": 2023}}]})
+db.search(query, top_k=5, filter={"topic": {"$in": ["ml", "systems"]}})    # O(1) indexed
 ```
 
 ### Dataset Recovery (WAL)

@@ -247,6 +247,8 @@ class Database:
         _use_ann: bool = False,
         ann_search_list_size: int | None = None,
         include: list[str] | None = None,
+        rerank_factor: int | None = None,
+        nprobe: int | None = None,
     ) -> list[dict[str, Any]]:
         """Search for the nearest neighbours of a query vector.
 
@@ -264,6 +266,11 @@ class Database:
             include: Subset of fields to include in each result dict.
                 Valid values: ``"id"``, ``"score"``, ``"metadata"``,
                 ``"document"``. Defaults to all four.
+            rerank_factor: Oversampling multiplier for rerank candidate pool.
+            nprobe: Number of IVF clusters to probe. When set, activates IVF
+                coarse routing (requires :meth:`create_coarse_index` first).
+                Higher values improve recall; lower values improve speed.
+                Typical: 16 for k=256 clusters.
 
         Returns:
             List of result dicts. Each dict contains the keys requested via
@@ -330,6 +337,28 @@ class Database:
                 :meth:`search` calls with ``_use_ann=True``. Default 128.
             alpha: Edge-pruning aggressiveness. Default 1.2.
             n_refinements: Refinement passes after build. Default 5.
+        """
+        ...
+
+    def create_coarse_index(self, n_clusters: int = 256) -> None:
+        """Build an IVF coarse routing index for fast approximate search.
+
+        Partitions the corpus into ``n_clusters`` clusters using k-means in
+        the MSE-rotated SRHT space.  Persisted as ``ivf.bin`` and loaded
+        automatically on :meth:`~Database.open`.
+
+        After calling this, pass ``nprobe=N`` to :meth:`search` to activate
+        IVF routing: only the top-N clusters (≈ N/n_clusters of the corpus)
+        are scored, giving proportional speedups with graceful recall decay.
+
+        Args:
+            n_clusters: Number of coarse centroids. Recommended 256 for
+                N ≥ 100k. Default 256.
+
+        Example::
+
+            db.create_coarse_index(n_clusters=256)
+            results = db.search(query, top_k=10, nprobe=16)  # score ~6% of corpus
         """
         ...
 
