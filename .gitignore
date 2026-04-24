@@ -34,6 +34,10 @@ python/tqdb/*.pdb
 /tmp/
 /tmp_*/
 /rq_fix_*/
+/.bench_ram_compare/
+/.comparison/
+/disk_breakdown_*/
+/segprobe_*/
 /_tmp/
 /_tmp_*/
 /_b_turbo/
