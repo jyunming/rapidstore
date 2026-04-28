@@ -474,7 +474,25 @@ Use `db.sync` (a property) to access the underlying synchronous `Database` for c
 
 ## RAG Integration
 
-`TurboQuantRetriever` is a lightweight LangChain-style wrapper around `Database`.
+TQDB has three Python-side surfaces for RAG pipelines:
+
+| Use case | Class | Module |
+|---|---|---|
+| LangChain v2 `VectorStore` ABC | `TurboQuantVectorStore` | `tqdb.vectorstore` |
+| LlamaIndex `BasePydanticVectorStore` | `TurboQuantVectorStore` | `tqdb.llama_index` |
+| Multi-vector / ColBERT (MaxSim) | `MultiVectorStore` | `tqdb.multivector` |
+| Asyncio facade for any of the above | `AsyncDatabase` | `tqdb.aio` |
+| Legacy LangChain-style retriever | `TurboQuantRetriever` | `tqdb.rag` |
+
+Dedicated guides:
+
+- **LangChain** → [`docs/integrations/langchain.md`](integrations/langchain.md)
+- **LlamaIndex** → [`docs/integrations/llama_index.md`](integrations/llama_index.md)
+- **Multi-vector / ColBERT** → [`docs/MULTI_VECTOR.md`](MULTI_VECTOR.md)
+- **Async API** → see the [Async API section above](#async-api)
+- **Migration from Chroma / LanceDB** → [`docs/MIGRATION.md`](MIGRATION.md)
+
+The legacy `TurboQuantRetriever` is preserved for back-compat:
 
 ```python
 from tqdb.rag import TurboQuantRetriever
@@ -489,7 +507,9 @@ retriever = TurboQuantRetriever(
 )
 ```
 
-### `add_texts(texts, embeddings, metadatas=None)`
+For new code prefer `TurboQuantVectorStore` (it's the full LangChain v2 ABC and supports `as_retriever()` for the same call sites). See `docs/integrations/langchain.md` for the migration recipe.
+
+### Legacy `add_texts(texts, embeddings, metadatas=None)`
 
 Batch-insert documents with their embeddings.
 
@@ -503,7 +523,7 @@ retriever.add_texts(
 
 IDs are auto-assigned as `doc_0`, `doc_1`, … continuing from the current count.
 
-### `similarity_search(query_embedding, k=4)`
+### Legacy `similarity_search(query_embedding, k=4)`
 
 Search for the `k` most similar documents.
 
