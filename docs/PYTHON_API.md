@@ -440,6 +440,38 @@ The delta overlay is persisted to `delta_ids.json` and survives restarts. Delete
 
 ---
 
+## Async API
+
+`AsyncDatabase` is an asyncio-friendly wrapper around `Database`. Every long-running method is awaitable; the underlying call dispatches to a thread-pool executor, so concurrent `await db.search(...)` calls genuinely run in parallel (the Rust extension releases the GIL inside).
+
+```python
+import asyncio
+from tqdb.aio import AsyncDatabase
+
+async def main():
+    async with await AsyncDatabase.open("./mydb", dimension=1536, bits=4) as db:
+        await db.insert("doc1", vec, document="...")
+        results = await db.search(query, top_k=5)
+        # 50 concurrent searches — actually run in parallel:
+        all_results = await asyncio.gather(
+            *(db.search(q, top_k=5) for q in queries)
+        )
+
+asyncio.run(main())
+```
+
+Every sync `Database` method has an async counterpart with the same signature and return shape: `insert`, `insert_batch`, `upsert`, `update`, `update_metadata`, `delete`, `delete_batch`, `get`, `get_many`, `list_all`, `list_ids`, `count`, `search`, `query`, `create_index`, `create_coarse_index`, `checkpoint`, `stats`, `close`.
+
+Constructor arguments:
+
+- `executor=None` — share an existing `ThreadPoolExecutor` across multiple `AsyncDatabase` instances or with other code. When `None`, `AsyncDatabase` creates its own pool sized to `min(32, cpu_count + 4)` and shuts it down on `close()`.
+- `max_workers=None` — override the auto-created pool size.
+- All other kwargs forward to `Database.open` (`dimension`, `bits`, `metric`, …).
+
+Use `db.sync` (a property) to access the underlying synchronous `Database` for cheap O(1) operations like `len(db.sync)` or `"id" in db.sync` that don't need an executor round-trip.
+
+---
+
 ## RAG Integration
 
 `TurboQuantRetriever` is a lightweight LangChain-style wrapper around `Database`.

@@ -50,6 +50,7 @@ tmp_path_retention_policy = "failed"
 # --basetemp is set only on Windows locally via conftest, not here, so CI
 # (Linux) uses pytest's default temp dir and doesn't fail on missing tmp/.
 addopts = []
+asyncio_mode = "strict"
 markers = [
     "slow: marks tests as slow (deselect with '-m not slow')",
 ]

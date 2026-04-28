@@ -19,6 +19,7 @@ See ``Database.open`` for all parameters and ``Database.search`` for filter synt
 from .tqdb import Database, TurboQuantDB
 from .chroma_compat import CompatClient as ChromaCompatClient, PersistentClient
 from .lancedb_compat import connect as lancedb_connect
+from .aio import AsyncDatabase
 from importlib.metadata import version, PackageNotFoundError
 
 try:
@@ -29,6 +30,7 @@ except PackageNotFoundError:
 __all__ = [
     "Database",
     "TurboQuantDB",
+    "AsyncDatabase",
     "__version__",
     "ChromaCompatClient",
     "PersistentClient",
