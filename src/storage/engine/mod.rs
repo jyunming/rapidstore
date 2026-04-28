@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::backend::StorageBackend;
+use super::bm25::Bm25Index;
 use super::compaction::Compactor;
 use super::graph::GraphManager;
 use super::id_pool::IdPool;
@@ -296,6 +297,10 @@ pub struct TurboQuantEngine {
     wal_flush_threshold: usize,
     segments: SegmentManager,
     metadata: MetadataStore,
+    /// BM25 sparse-retrieval sidecar. Populated only when documents are inserted;
+    /// flushes alongside `metadata` and is rebuilt from `metadata`'s docs on cold
+    /// open if `bm25.idx` is missing or invalid.
+    bm25: Bm25Index,
     graph: GraphManager,
     local_dir: String,
 
@@ -506,6 +511,17 @@ impl TurboQuantEngine {
         Compactor::new(backend.clone()).recover_if_needed()?;
         let segments = SegmentManager::open(backend.clone())?;
         let metadata = MetadataStore::open(&metadata_path)?;
+        let bm25_path = Path::new(local_dir).join("bm25.idx");
+        let mut bm25 = Bm25Index::open(bm25_path)?;
+        // Cold-start fallback: if the sidecar was missing/corrupt but the metadata
+        // store already has documents (e.g. an upgrade from a pre-BM25 release),
+        // rebuild from those docs. After `Database.open()` returns, BM25 is always
+        // queryable without a manual rebuild step.
+        if bm25.is_empty() && metadata.iter_docs().next().is_some() {
+            for (slot, doc) in metadata.iter_docs() {
+                bm25.put(slot, doc);
+            }
+        }
         let graph = GraphManager::open(backend.clone(), local_dir)?;
 
         // Use quantizer.n (not manifest.d.next_power_of_two()) so that exact mode (n=d)
@@ -553,6 +569,7 @@ impl TurboQuantEngine {
             wal_flush_threshold: wal_flush_threshold.unwrap_or(5_000),
             segments,
             metadata,
+            bm25,
             graph,
             local_dir: local_dir.to_string(),
             index_ids: load_index_ids(local_dir).unwrap_or_default(),
@@ -847,7 +864,43 @@ impl TurboQuantEngine {
         } else {
             self.metadata.delete(slot)?;
         }
+        match new_meta.document.as_deref() {
+            Some(doc) if !doc.is_empty() => self.bm25.put(slot, doc),
+            _ => self.bm25.delete(slot),
+        }
         Ok(())
+    }
+
+    /// Score documents for `query_text` using BM25 over the sparse index.
+    ///
+    /// Results are returned as `(id, score)` pairs sorted by descending score, with
+    /// at most `top_k` entries. Empty queries, an empty index, or `top_k == 0` all
+    /// return an empty vector. `filter`, when supplied, must be a sorted-unique slot
+    /// list (typically produced by the metadata pre-filter pipeline) — only those
+    /// slots are scored.
+    pub fn search_bm25(
+        &self,
+        query_text: &str,
+        top_k: usize,
+        filter: Option<&[u32]>,
+    ) -> Result<Vec<(String, f32)>, Box<dyn std::error::Error + Send + Sync>> {
+        let scored = self.bm25.search(query_text, top_k, filter);
+        let mut out = Vec::with_capacity(scored.len());
+        for (slot, score) in scored {
+            // A slot may be tombstoned between bm25.put and search if the user issued
+            // a delete and the tombstone hasn't propagated to bm25 yet (it always does
+            // synchronously today, but defend against future drift). Skip dead slots.
+            if let Some(id) = self.id_pool.get_str(slot) {
+                out.push((id.to_string(), score));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Number of documents currently indexed by BM25. Useful for tests, stats output,
+    /// and the auto-planner deciding whether sparse search is even possible.
+    pub fn bm25_doc_count(&self) -> u32 {
+        self.bm25.n_docs()
     }
 
     /// Query-planner decision: should this query use the HNSW index?
@@ -2601,6 +2654,7 @@ impl TurboQuantEngine {
         }
         self.wal.truncate()?;
         self.metadata.flush()?;
+        self.bm25.flush()?;
         self.persist_id_pool()?;
 
         self.live_codes.release_handles();
@@ -2667,6 +2721,9 @@ impl TurboQuantEngine {
         self.metadata
             .flush()
             .map_err(|e| format!("flush_for_close: metadata.flush failed: {e}"))?;
+        self.bm25
+            .flush()
+            .map_err(|e| format!("flush_for_close: bm25.flush failed: {e}"))?;
         self.persist_id_pool()
             .map_err(|e| format!("flush_for_close: persist_id_pool failed: {e}"))?;
 
@@ -2721,6 +2778,9 @@ impl TurboQuantEngine {
         self.metadata
             .flush()
             .map_err(|e| format!("close: metadata.flush failed: {e}"))?;
+        self.bm25
+            .flush()
+            .map_err(|e| format!("close: bm25.flush failed: {e}"))?;
         self.persist_id_pool()
             .map_err(|e| format!("close: persist_id_pool failed: {e}"))?;
         self.maybe_persist_state(true)
@@ -3487,6 +3547,7 @@ impl TurboQuantEngine {
             }
             self.id_pool = IdPool::new();
             self.metadata.clear();
+            self.bm25.clear();
         }
 
         for entry in entries {
@@ -3511,6 +3572,10 @@ impl TurboQuantEngine {
                 self.metadata.put(slot, &meta)?;
             } else {
                 self.metadata.delete(slot)?;
+            }
+            match meta.document.as_deref() {
+                Some(doc) if !doc.is_empty() => self.bm25.put(slot, doc),
+                _ => self.bm25.delete(slot),
             }
         }
 
@@ -3575,6 +3640,10 @@ impl TurboQuantEngine {
             let stride = self.live_stride();
             let rec = self.live_codes.get_slot_mut(slot as usize);
             rec[stride - 1] = 1u8;
+            // Drop the slot from BM25 immediately so deleted IDs disappear from
+            // sparse search results without waiting for compaction. (Dense search
+            // already filters via the deleted-flag byte set above.)
+            self.bm25.delete(slot);
         }
     }
 
@@ -3655,6 +3724,12 @@ impl TurboQuantEngine {
 
         self.id_pool = new_pool;
         self.metadata.replace_all(new_metadata);
+        // Compaction renumbers slots, so the BM25 index — keyed by slot — is now
+        // stale. The doc text survives in the new metadata; rebuild from there.
+        self.bm25.clear();
+        for (slot, doc) in self.metadata.iter_docs() {
+            self.bm25.put(slot, doc);
+        }
         Ok(())
     }
 
@@ -3806,6 +3881,13 @@ impl TurboQuantEngine {
             } else {
                 self.metadata.delete(slot)?;
             }
+            // BM25 mirrors the document field independently of `has_meaningful_metadata`:
+            // a non-empty doc must always be indexed, and a slot whose doc was just
+            // dropped must lose its sparse posting even if other metadata changed.
+            match meta.document.as_deref() {
+                Some(doc) if !doc.is_empty() => self.bm25.put(slot, doc),
+                _ => self.bm25.delete(slot),
+            }
         }
         // Inserts do NOT invalidate the HNSW index — new slots go to delta_slots.
         self.manifest.vector_count = self.live_active_count() as u64;
@@ -3923,6 +4005,18 @@ impl TurboQuantEngine {
             self.wal.append_batch(&wal_entries, false)?;
             self.metadata.put_many(&metadata_entries)?;
             self.metadata.delete_many(&metadata_deletes)?;
+            // Drive BM25 from the same per-slot decisions: any slot whose document
+            // is non-empty gets indexed; any slot in `metadata_deletes` (no-meta
+            // path) drops out of the sparse index too, since it carries no doc.
+            for (slot, meta) in &metadata_entries {
+                match meta.document.as_deref() {
+                    Some(doc) if !doc.is_empty() => self.bm25.put(*slot, doc),
+                    _ => self.bm25.delete(*slot),
+                }
+            }
+            if !metadata_deletes.is_empty() {
+                self.bm25.delete_many(&metadata_deletes);
+            }
             // Track newly allocated slots in the delta overlay so ANN search finds
             // them without a rebuild. indexed_set is built once before the chunk
             // loop. delta_slots is kept sorted; binary_search gives O(log n).
