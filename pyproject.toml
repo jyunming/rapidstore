@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "tqdb"
-version = "0.7.0"
+version = "0.8.0"
 description = "Embedded vector database using the TurboQuant algorithm (arXiv:2504.19874) — zero training, 2-4 bit compression, fast inner-product search"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,8 +30,21 @@ classifiers = [
     "Topic :: Database",
 ]
 
+[project.optional-dependencies]
+# Source-library readers required by `python -m tqdb.migrate`.
+migrate = ["chromadb>=0.5", "lancedb>=0.10"]
+# Just the Chroma migrator (no LanceDB).
+migrate-chroma = ["chromadb>=0.5"]
+# Just the LanceDB migrator (no Chroma).
+migrate-lancedb = ["lancedb>=0.10"]
+# LangChain v2 ``TurboQuantVectorStore`` in `tqdb.vectorstore`.
+langchain = ["langchain-core>=0.3"]
+# LlamaIndex ``TurboQuantVectorStore`` in `tqdb.llama_index`.
+llamaindex = ["llama-index-core>=0.10"]
+
 [project.scripts]
 tqdb-server = "tqdb._server_launcher:main"
+tqdb-migrate = "tqdb.migrate:main"
 
 [project.urls]
 Homepage = "https://jyunming.github.io/TurboQuantDB"
@@ -50,6 +63,7 @@ tmp_path_retention_policy = "failed"
 # --basetemp is set only on Windows locally via conftest, not here, so CI
 # (Linux) uses pytest's default temp dir and doesn't fail on missing tmp/.
 addopts = []
+asyncio_mode = "strict"
 markers = [
     "slow: marks tests as slow (deselect with '-m not slow')",
 ]

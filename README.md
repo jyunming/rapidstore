@@ -20,6 +20,9 @@ Two deployment modes:
 - **Two quantizer modes** — default (`dense`, best recall) and a faster ingest variant (`srht`) for streaming/high-d workloads. See [docs/QUANTIZER_MODES.md](https://github.com/jyunming/TurboQuantDB/blob/main/docs/QUANTIZER_MODES.md) for a full breakdown.
 - **Optional ANN index** — Build an HNSW graph after loading data for fast approximate search.
 - **Hybrid retrieval** — Built-in BM25 keyword index fuses with dense search via RRF (`db.search(..., hybrid={"text": "..."})`). Pure-dense behaviour is unchanged when the kwarg is omitted.
+- **Multi-vector / ColBERT** — `MultiVectorStore` for late-interaction retrieval with N token vectors per document and MaxSim scoring (`Σ_i max_j <q_i, d_j>`). See [`docs/MULTI_VECTOR.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/MULTI_VECTOR.md).
+- **Framework integrations** — native `VectorStore` for [LangChain v2](https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md#rag-integration) and [LlamaIndex](https://github.com/jyunming/TurboQuantDB/blob/main/docs/integrations/llama_index.md), plus an asyncio-friendly `AsyncDatabase`.
+- **Drop-in migration** — `python -m tqdb.migrate {chroma|lancedb} <src> <dst>` imports an existing collection in one command. See [`docs/MIGRATION.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/MIGRATION.md).
 - **Metadata filtering** — MongoDB-style filter operators on any metadata field.
 - **Crash recovery** — Write-ahead log (WAL) ensures durability without explicit flushing.
 - **Python native** — `pip install tqdb`; no server or sidecar required.

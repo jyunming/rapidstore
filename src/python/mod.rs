@@ -1264,8 +1264,16 @@ fn parse_metadata_rows(
             }
             let mut out = Vec::with_capacity(n);
             for item in list {
-                let dict = item.downcast::<PyDict>()?;
-                out.push(parse_pydict(Some(dict))?);
+                // The public type stub allows `None` per row to mean "no
+                // metadata for this row". Migration toolkits and Chroma's
+                // get(include=["metadatas"]) on metadata-less collections
+                // both produce lists of None.
+                if item.is_none() {
+                    out.push(HashMap::new());
+                } else {
+                    let dict = item.downcast::<PyDict>()?;
+                    out.push(parse_pydict(Some(dict))?);
+                }
             }
             Ok(out)
         } else {

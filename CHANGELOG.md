@@ -6,6 +6,38 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
+## [0.8.0] — 2026-04-28
+
+### Added
+
+- **`MultiVectorStore` (ColBERT-style late-interaction retrieval)** — new `python/tqdb/multivector.py`. Each document gets N token vectors; queries score via MaxSim (`Σ_i max_j <q_i, d_j>`). Python-layer wrapper over the existing single-vector engine: token vectors are stored as regular slots, a JSON sidecar maps `doc_id → [token_id]`, raw float32 token vectors live in a `.npz` sidecar for exact MaxSim. Public API: `MultiVectorStore.open(path, dimension, bits=4, metric="cosine")`, `insert(doc_id, vectors, document, metadata)`, `search(query_vectors, top_k, oversample=4, candidate_filter=None)`, `delete(doc_id)`, `get(doc_id)`. A future v0.9 native engine path will replace the wrapper while keeping the public API stable. Documented in `docs/MULTI_VECTOR.md`.
+- **LangChain v2 `VectorStore` integration** — new `python/tqdb/vectorstore.py` exporting `TurboQuantVectorStore(VectorStore)` with the full v2 ABC: `add_texts`, `add_documents`, `similarity_search`, `similarity_search_with_score`, `similarity_search_by_vector`, `delete`, `get_by_ids`, `from_texts`, `from_documents`, `as_retriever`, `_select_relevance_score_fn`, `embeddings`. Lazy class build via PEP 562 `__getattr__`; LangChain itself is an optional dep (`tqdb[langchain]`).
+- **LlamaIndex `BasePydanticVectorStore` integration** — new `python/tqdb/llama_index.py` exporting `TurboQuantVectorStore` with `add(nodes)`, `query(VectorStoreQuery)`, `delete(ref_doc_id)`, `delete_nodes`, `clear`, `persist`. `MetadataFilters` / `MetadataFilter` / `FilterOperator` / `FilterCondition` are translated to TQDB's MongoDB-style dialect. Lazy import; optional dep `tqdb[llamaindex]`.
+- **`AsyncDatabase` — asyncio-friendly facade** — new `python/tqdb/aio.py`. Every long-running `Database` method has an awaitable counterpart that dispatches to a thread-pool executor. PyO3 already releases the GIL inside, so 50 concurrent `await db.search(...)` calls genuinely run in parallel (verified by test). Auto-created executor sized to `min(32, cpu_count + 4)`; user can supply their own. Async context manager support. `db.sync` escape hatch for cheap O(1) operations.
+- **Chroma / LanceDB migration toolkit** — new `python/tqdb/migrate.py` with `migrate_chroma(src, dst, collection=None)` and `migrate_lancedb(src, dst, table_name)`. Reads each source library's native on-disk format (via the source library itself) and bulk-inserts into a fresh TQDB. CLI: `python -m tqdb.migrate {chroma|lancedb} <src> <dst>` and the `tqdb-migrate` console script. Preserves IDs, vectors, metadata, document text. Optional deps: `tqdb[migrate]` (both), `tqdb[migrate-chroma]`, `tqdb[migrate-lancedb]`.
+
+### Fixed
+
+- **`parse_metadata_rows` accepts `None` per-row entries** — the public `.pyi` stub for `Database.insert_batch` documents `metadatas: list[dict | None] | None`, but the Rust side previously rejected `None` entries with a TypeError. Chroma's `collection.get(include=["metadatas"])` returns `[None, None, ...]` for collections without metadata, which broke migration. Fixed to treat `None` as an empty dict per row, matching the documented contract.
+
+### Documentation
+
+- **`docs/MULTI_VECTOR.md`** — quickstart, API reference, knobs, recommended ColBERTv2 config, and a "limitations until v0.9" note.
+- **`docs/MIGRATION.md`** — install / CLI / API / preserved-fields reference for the migration toolkit.
+- **`docs/PYTHON_API.md`** — new "Async API" section with quickstart and constructor reference.
+- **`pyproject.toml`** — five optional-deps extras: `migrate`, `migrate-chroma`, `migrate-lancedb`, `langchain`, `llamaindex`.
+
+### Tests
+
+- 9 tests for the LangChain integration (`tests/test_langchain_compat.py`)
+- 9 tests for the LlamaIndex integration (`tests/test_llama_index.py`)
+- 9 tests for `AsyncDatabase` including a 50-concurrent-search proof of parallelism (`tests/test_async_api.py`)
+- 8 tests for the migration toolkit covering Chroma + LanceDB round-trip + CLI smoke (`tests/test_migrate.py`)
+- 10 tests for the multi-vector store including a MaxSim correctness check (`tests/test_multivector.py`)
+- All pre-existing suites (Rust 422, Python 14) continue to pass unchanged.
+
+---
+
 ## [0.7.0] — 2026-04-28
 
 ### Added
