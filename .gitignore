@@ -96,6 +96,7 @@ convert_pdf.py
 /benchmarks/store_comparison_bench.py
 /benchmarks/_combine_bench_results.py
 /benchmarks/_vector_store_compare.py
+/benchmarks/_bench_rotation_compare.py
 /benchmarks/compare_bench.py
 /benchmarks/hamming_nav_bench.py
 /benchmarks/ingest_speedup_bench.py
