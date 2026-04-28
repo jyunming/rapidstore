@@ -86,11 +86,17 @@ For ColBERTv2-style late interaction:
 
 ## Limitations (v0.8 — temporary)
 
-- Inserting `N` token vectors does `N` engine row-inserts. A single insert
-  with N=8 is ~5× slower than a single-vector insert.
+- Inserting `N` token vectors per document is still `O(N)` work per doc, but
+  `MultiVectorStore.insert()` batches all N tokens into a single
+  `Database.insert_batch(...)` call rather than N separate engine inserts.
+  An insert with N=8 is still materially slower than a single-vector insert
+  because more vectors must be quantised, written, and tracked.
 - Search wall-clock scales with the candidate doc count after union, not
   with `top_k`. Set a tight `candidate_filter` for narrow queries.
 - The raw float32 sidecar (`_mv_tokens.npz`) is read-back-rewrite for every
   modification — fine at 10k docs / 80k tokens, slow at 100k+ docs.
+- Only ``metric="ip"`` and ``metric="cosine"`` are supported; ``metric="l2"``
+  raises at construction time. MaxSim is a dot-product aggregation that
+  doesn't generalise cleanly to lower-is-better metrics.
 
-All three are addressed by the v0.9 native engine integration.
+All four are addressed by the v0.9 native engine integration.

@@ -104,13 +104,19 @@ def _build_class():
             metric: str = "cosine",
             **kwargs: Any,
         ) -> "TurboQuantVectorStore":
-            """Build a fresh store from raw texts. ``embedding`` is required."""
+            """Build a fresh store from raw texts. ``embedding`` is required.
+
+            Extra ``**kwargs`` are forwarded to ``Database.open`` so callers can
+            pass DB-side options (``rerank``, ``fast_mode``, ``normalize``,
+            ``rerank_precision``, ``wal_flush_threshold``, ``quantizer_type``,
+            ``seed``) through the LangChain constructor path.
+            """
             if not texts:
                 raise ValueError("from_texts requires at least one text")
             vecs = embedding.embed_documents(list(texts))
             arr = np.asarray(vecs, dtype=np.float32)
             d = arr.shape[1]
-            db = Database.open(path, dimension=d, bits=bits, metric=metric)
+            db = Database.open(path, dimension=d, bits=bits, metric=metric, **kwargs)
             store = cls(db, embedding=embedding)
             store.add_texts(list(texts), metadatas=metadatas, ids=ids, _vectors=arr)
             return store

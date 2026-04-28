@@ -190,7 +190,7 @@ def _detect_lance_columns(arrow_table) -> dict:
     if vector_col is None:
         raise RuntimeError(
             f"could not detect a vector column in {cols!r}; "
-            "rename it to 'vector' or pass it explicitly"
+            "rename the source column to 'vector' before migrating"
         )
 
     # ID column: prefer "id"; else first string column that's not the vector.

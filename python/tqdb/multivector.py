@@ -19,8 +19,11 @@ Quick start::
     from tqdb import Database
     from tqdb.multivector import MultiVectorStore
 
+    # `MultiVectorStore.open()` opens the underlying Database for you:
+    store = MultiVectorStore.open("./mvstore", dimension=96, bits=4, metric="cosine")
+    # — or wrap an already-open Database explicitly:
     db = Database.open("./mvstore", dimension=96, bits=4, metric="cosine")
-    store = MultiVectorStore(db)
+    store = MultiVectorStore(db, directory="./mvstore")
 
     # Insert a document with N=8 token vectors and the source text.
     store.insert("doc1", token_vectors_8x96, document="full text here")
@@ -70,7 +73,23 @@ class _RawTokenVecStore:
             return data["ids"].tolist(), data["vecs"]
 
     def _save(self, ids: List[str], vecs: np.ndarray) -> None:
-        np.savez(self._path, ids=np.array(ids, dtype=str), vecs=vecs.astype(np.float32))
+        # Write to a unique tmp first then atomically rename. A crash mid-write
+        # leaves the previous valid file untouched; concurrent writers don't
+        # collide on the same tmp.
+        tmp_base = f"{self._path}.{uuid.uuid4().hex}.tmp"
+        # np.savez appends .npz if missing; pass without the extension and
+        # rename the resulting `tmp_base + ".npz"` to the target path.
+        np.savez(tmp_base, ids=np.array(ids, dtype=str), vecs=vecs.astype(np.float32))
+        produced = tmp_base + ".npz"
+        try:
+            os.replace(produced, self._path)
+        except Exception:
+            # Best-effort cleanup of the orphan tmp on failure.
+            try:
+                os.remove(produced)
+            except OSError:
+                pass
+            raise
 
     def add(self, new_ids: List[str], new_vecs: np.ndarray) -> None:
         with self._lock:
@@ -164,17 +183,27 @@ class _DocIndex:
             return tids
 
     def get(self, doc_id: str) -> Optional[List[str]]:
-        return self._mapping.get(doc_id)
+        # Read paths take the lock too — otherwise a concurrent insert/delete
+        # could race with `dict.get` (CPython doesn't guarantee atomicity here)
+        # and inverse maps could observe `dictionary changed size during iteration`.
+        with self._lock:
+            tids = self._mapping.get(doc_id)
+            return list(tids) if tids is not None else None
 
     def doc_ids(self) -> List[str]:
-        return list(self._mapping.keys())
+        with self._lock:
+            return list(self._mapping.keys())
 
     def token_to_doc(self) -> Dict[str, str]:
         """Inverse map (built on demand) — one entry per token across all docs."""
-        return {tid: did for did, tids in self._mapping.items() for tid in tids}
+        with self._lock:
+            # Snapshot under the lock to avoid `dict changed size during iteration`.
+            snap = list(self._mapping.items())
+        return {tid: did for did, tids in snap for tid in tids}
 
     def __len__(self) -> int:
-        return len(self._mapping)
+        with self._lock:
+            return len(self._mapping)
 
 
 # ── public API ──────────────────────────────────────────────────────────
@@ -193,6 +222,20 @@ class MultiVectorStore:
     """
 
     def __init__(self, db: Database, directory: str) -> None:
+        # MaxSim is implemented as a dot product. That's correct for cosine
+        # (with unit-norm vectors) and for the engine's "ip" path. L2 would
+        # require lower-is-better semantics with very different fusion math
+        # — out of scope for v0.8. Reject at construction so callers don't
+        # silently get wrong rankings.
+        metric = db.stats().get("metric", "ip")
+        if metric not in {"ip", "cosine"}:
+            raise ValueError(
+                f"MultiVectorStore requires metric='ip' or 'cosine'; got "
+                f"{metric!r}. MaxSim aggregates dot-product similarities; "
+                "an L2 metric would need different (lower-is-better) fusion "
+                "math, which is out of scope for v0.8."
+            )
+        self._metric = metric
         self._db = db
         Path(directory).mkdir(parents=True, exist_ok=True)
         self._dir = directory
@@ -210,7 +253,15 @@ class MultiVectorStore:
         **db_kwargs: Any,
     ) -> "MultiVectorStore":
         """Open or create both the underlying Database and the multivector
-        sidecars at ``path``."""
+        sidecars at ``path``.
+
+        ``metric`` must be ``"ip"`` or ``"cosine"`` — see ``__init__`` for why
+        L2 is rejected.
+        """
+        if metric not in {"ip", "cosine"}:
+            raise ValueError(
+                f"MultiVectorStore requires metric='ip' or 'cosine'; got {metric!r}"
+            )
         db = Database.open(path, dimension=dimension, bits=bits, metric=metric, **db_kwargs)
         return cls(db, directory=path)
 

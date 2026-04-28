@@ -100,9 +100,16 @@ class AsyncDatabase:
                 thread_name_prefix="tqdb-async",
             )
         loop = asyncio.get_running_loop()
-        sync_db = await loop.run_in_executor(
-            executor, partial(Database.open, path, **kwargs)
-        )
+        try:
+            sync_db = await loop.run_in_executor(
+                executor, partial(Database.open, path, **kwargs)
+            )
+        except BaseException:
+            # If we created the executor, shut it down before re-raising —
+            # otherwise we'd leak a background thread on every failed open.
+            if owns and executor is not None:
+                executor.shutdown(wait=False)
+            raise
         return cls(sync_db, executor=executor, owns_executor=owns)
 
     async def close(self) -> None:
