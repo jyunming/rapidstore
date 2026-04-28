@@ -20,6 +20,7 @@ from .tqdb import Database, TurboQuantDB
 from .chroma_compat import CompatClient as ChromaCompatClient, PersistentClient
 from .lancedb_compat import connect as lancedb_connect
 from .aio import AsyncDatabase
+from .multivector import MultiVectorStore
 from importlib.metadata import version, PackageNotFoundError
 
 try:
@@ -31,6 +32,7 @@ __all__ = [
     "Database",
     "TurboQuantDB",
     "AsyncDatabase",
+    "MultiVectorStore",
     "__version__",
     "ChromaCompatClient",
     "PersistentClient",
