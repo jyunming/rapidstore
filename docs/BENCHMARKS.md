@@ -143,3 +143,47 @@ ANN costs ~2 points of recall while cutting latency from ~51ms to ~37ms p50. For
 | d ≤ 256 | Brute-force | Quantization noise collapses ANN recall |
 | d = 512–1024 | Either (test both) | Moderate quantization quality; ANN gain is partial |
 | d ≥ 1536 | ANN | High-d quantization is accurate; ANN gives 1.5–4× latency gain with <3% recall cost |
+
+---
+
+## Hybrid retrieval evaluation
+
+Dense retrieval misses keyword-heavy queries; sparse retrieval misses
+paraphrases. The harness at [`benchmarks/retrieval_eval.py`](https://github.com/jyunming/TurboQuantDB/blob/main/benchmarks/retrieval_eval.py)
+grades all three paths (dense, BM25, hybrid RRF) on the same query sets so
+new retrieval features can be judged against measured wins instead of
+anecdotes. Append-only history lives at `benchmarks/retrieval_eval_history.json`.
+
+```bash
+python benchmarks/retrieval_eval.py             # 1k synthetic corpus, ~3s
+python benchmarks/retrieval_eval.py --n 5000    # bigger corpus, ~15s
+python benchmarks/retrieval_eval.py --no-history # don't append to history
+```
+
+Three query sets are generated from the synthetic corpus:
+
+| Query set | What's in the query | Ideal retriever |
+|-----------|---------------------|-----------------|
+| `semantic` | A perturbed corpus vector, no text | Pure dense |
+| `lexical`  | A rare token + a random orthogonal vector | Pure BM25 |
+| `mixed`    | Half of each, interleaved | Hybrid (RRF) |
+
+Representative output (N=1k, D=128, Q=100 per set, weight=0.5):
+
+| query set | path | R@1 | R@10 | MRR@10 | NDCG@10 |
+|-----------|------|----:|-----:|-------:|--------:|
+| semantic  | dense  | 1.000 | 1.000 | 1.000 | 1.000 |
+| semantic  | bm25   | 0.000 | 0.000 | 0.000 | 0.000 |
+| semantic  | hybrid | 1.000 | 1.000 | 1.000 | 1.000 |
+| lexical   | dense  | 0.010 | 0.010 | 0.010 | 0.010 |
+| lexical   | bm25   | 1.000 | 1.000 | 1.000 | 1.000 |
+| lexical   | hybrid | 0.200 | 1.000 | 0.466 | 0.597 |
+| mixed     | dense  | 0.500 | 0.500 | 0.500 | 0.500 |
+| mixed     | bm25   | 0.500 | 0.500 | 0.500 | 0.500 |
+| mixed     | hybrid | 0.550 | 1.000 | 0.689 | 0.765 |
+
+Read the table as: **on the mixed workload, hybrid raises R@10 from 0.500
+to 1.000** (+50 pp) over either path alone, while losing nothing on
+semantic-only queries. On lexical queries hybrid is dominated by pure BM25
+on R@1, but still recovers the gold doc in the top-10 every time, which is
+what most RAG pipelines actually consume.

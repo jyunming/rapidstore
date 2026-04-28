@@ -111,6 +111,7 @@ convert_pdf.py
 /benchmarks/_ingest_speedup_plots.png
 /benchmarks/_ivf_prefilter_plots.png
 !/benchmarks/perf_history.json
+!/benchmarks/retrieval_eval_history.json
 !/benchmarks/benchmark_plots.png
 
 # Benchmark output artifacts
