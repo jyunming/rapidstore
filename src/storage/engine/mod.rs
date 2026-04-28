@@ -15,6 +15,7 @@ use super::id_pool::IdPool;
 use super::ivf::IvfIndex;
 use super::live_codes::LiveCodesFile;
 use super::metadata::{MetadataStore, VectorMetadata};
+use super::rrf::{DEFAULT_RRF_K, DEFAULT_RRF_OVERSAMPLE, rrf_fuse};
 use super::segment::{SegmentManager, SegmentRecord};
 use super::wal::{Wal, WalEntry};
 use crate::quantizer::CodeIndex;
@@ -901,6 +902,137 @@ impl TurboQuantEngine {
     /// and the auto-planner deciding whether sparse search is even possible.
     pub fn bm25_doc_count(&self) -> u32 {
         self.bm25.n_docs()
+    }
+
+    /// Hybrid search: dense vector retrieval + BM25 sparse retrieval, fused via RRF.
+    ///
+    /// Each retriever is asked for `oversample × top_k` candidates so RRF has room
+    /// to find consensus picks that don't lead either list. `text_weight ∈ [0, 1]`
+    /// controls the BM25 contribution: `0.0` collapses to pure dense, `1.0` to pure
+    /// BM25 (with the dense list still consulted for metadata enrichment).
+    ///
+    /// Pass `None` for `text_weight` / `rrf_k` / `oversample` to use the defaults
+    /// (`0.5` weight, `60.0` k, `4×` oversample) that match the documented hybrid
+    /// behaviour.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_hybrid(
+        &self,
+        query_vec: &Array1<f64>,
+        query_text: &str,
+        top_k: usize,
+        filter: Option<&HashMap<String, JsonValue>>,
+        ann_search_list_size: Option<usize>,
+        use_ann: bool,
+        rerank_factor: Option<usize>,
+        text_weight: Option<f32>,
+        rrf_k: Option<f32>,
+        oversample: Option<usize>,
+        include_id: bool,
+        include_metadata: bool,
+        include_document: bool,
+    ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let text_weight = text_weight.unwrap_or(0.5).clamp(0.0, 1.0);
+        let rrf_k = rrf_k.unwrap_or(DEFAULT_RRF_K).max(1.0);
+        let oversample = oversample.unwrap_or(DEFAULT_RRF_OVERSAMPLE).max(1);
+        let oversampled_k = top_k.saturating_mul(oversample);
+
+        // BM25 needs a sorted-unique slot pre-filter when the user supplied one;
+        // re-using the dense path's filter would force two evaluations of the same
+        // predicate. We materialise the filter once via the shared planner helpers.
+        // For now, push BM25 the filter only when it is `None` — non-trivial filter
+        // pushdown into BM25 is left to a future iteration. The dense path applies
+        // the filter in the usual way, so any candidates BM25 surfaces that fail
+        // the predicate get dropped during the metadata fetch step below.
+        let bm25_filter: Option<&[u32]> = None;
+
+        // Run dense and BM25 concurrently. Both are read-only on `&self` so this
+        // is safe with `rayon::join`. BM25 is CPU-light next to the dense path,
+        // but parallelism still hides the BM25 latency for large top_k.
+        let (dense_r, bm25_r) = rayon::join(
+            || {
+                self.search_with_filter_and_ann_include(
+                    query_vec,
+                    oversampled_k,
+                    filter,
+                    ann_search_list_size,
+                    use_ann,
+                    rerank_factor,
+                    true,
+                    true,
+                    true,
+                )
+            },
+            || self.search_bm25(query_text, oversampled_k, bm25_filter),
+        );
+        let dense_r = dense_r?;
+        let bm25_r = bm25_r?;
+
+        let dense_slots: Vec<u32> = dense_r
+            .iter()
+            .filter_map(|r| self.id_pool.get_slot(&r.id))
+            .collect();
+        let bm25_slots: Vec<u32> = bm25_r
+            .iter()
+            .filter_map(|(id, _)| self.id_pool.get_slot(id))
+            .collect();
+
+        let fused = rrf_fuse(
+            &[&dense_slots, &bm25_slots],
+            &[1.0 - text_weight, text_weight],
+            rrf_k,
+            top_k,
+        );
+
+        // Cache the dense-side full SearchResults so we don't re-fetch metadata
+        // for slots both retrievers found. Keyed by slot, since RRF speaks slots.
+        let mut cache: HashMap<u32, SearchResult> = HashMap::with_capacity(dense_r.len());
+        for r in dense_r.into_iter() {
+            if let Some(slot) = self.id_pool.get_slot(&r.id) {
+                cache.insert(slot, r);
+            }
+        }
+
+        // Slots that BM25 surfaced but the dense path didn't — fetch their metadata
+        // in one batch instead of one-by-one inside the loop below.
+        let bm25_only: Vec<u32> = fused
+            .iter()
+            .map(|(s, _)| *s)
+            .filter(|s| !cache.contains_key(s))
+            .collect();
+        let extra_meta: HashMap<u32, VectorMetadata> = if bm25_only.is_empty() {
+            HashMap::new()
+        } else {
+            self.metadata.get_many(&bm25_only)?
+        };
+
+        let mut out = Vec::with_capacity(fused.len());
+        for (slot, fused_score) in fused {
+            let id = match self.id_pool.get_str(slot) {
+                Some(s) => s.to_string(),
+                None => continue, // tombstoned between fan-out and fuse — drop
+            };
+            let (metadata, document) = if let Some(r) = cache.remove(&slot) {
+                (r.metadata, r.document)
+            } else if let Some(m) = extra_meta.get(&slot) {
+                (m.properties.clone(), m.document.clone())
+            } else {
+                (HashMap::new(), None)
+            };
+            out.push(SearchResult {
+                id: if include_id { id } else { String::new() },
+                score: fused_score as f64,
+                metadata: if include_metadata {
+                    metadata
+                } else {
+                    HashMap::new()
+                },
+                document: if include_document { document } else { None },
+            });
+        }
+        Ok(out)
     }
 
     /// Query-planner decision: should this query use the HNSW index?

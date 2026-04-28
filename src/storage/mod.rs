@@ -21,6 +21,7 @@ pub mod id_pool;
 pub mod ivf;
 pub mod live_codes;
 pub mod metadata;
+pub mod rrf;
 pub mod segment;
 pub mod tokenizer;
 pub mod wal;

@@ -170,6 +170,133 @@ fn empty_query_returns_empty_results() {
 }
 
 #[test]
+fn hybrid_recovers_keyword_dense_misses() {
+    // Construct a corpus where the dense-best doc has no rare term and the
+    // rare-term doc is far in dense space. Pure dense → A; pure BM25 → B;
+    // hybrid should surface B alongside A because the rare-term IDF dominates
+    // the BM25 ranking and RRF rewards the consensus.
+    fn aligned(d: usize, seed: f64) -> Array1<f64> {
+        // First component drives IP; remaining dims are tiny noise.
+        let mut v = Array1::<f64>::zeros(d);
+        v[0] = seed;
+        for j in 1..d {
+            v[j] = (j as f64) * 1e-6;
+        }
+        v
+    }
+
+    let dir = tempdir().unwrap();
+    let db = dir.path().to_str().unwrap();
+    let d = 32;
+    let mut engine = TurboQuantEngine::open(db, db, d, 4, 99).unwrap();
+
+    // Doc-A: aligned with the query (high IP). No rare word.
+    engine
+        .insert_with_document(
+            "doc-A".into(),
+            &aligned(d, 1.0),
+            HashMap::new(),
+            Some("ordinary common everyday text content".into()),
+        )
+        .unwrap();
+    // Doc-B: nearly orthogonal to the query (tiny IP). Carries the rare token.
+    let mut doc_b_vec = Array1::<f64>::zeros(d);
+    doc_b_vec[1] = 1.0;
+    engine
+        .insert_with_document(
+            "doc-B".into(),
+            &doc_b_vec,
+            HashMap::new(),
+            Some("ordinary common rare-token-xyz appears here".into()),
+        )
+        .unwrap();
+    // Filler docs in between so the rare term has meaningful IDF.
+    for i in 0..5u32 {
+        let mut v = Array1::<f64>::zeros(d);
+        v[2 + (i as usize) % (d - 2)] = 1.0;
+        engine
+            .insert_with_document(
+                format!("filler-{i}"),
+                &v,
+                HashMap::new(),
+                Some(format!("ordinary common filler-{i} payload")),
+            )
+            .unwrap();
+    }
+
+    let q = aligned(d, 1.0);
+    let dense_only = engine.search(&q, 5).unwrap();
+    assert_eq!(
+        dense_only[0].id, "doc-A",
+        "sanity: dense-only top-1 must be doc-A; got {dense_only:?}"
+    );
+
+    let hybrid = engine
+        .search_hybrid(
+            &q,
+            "rare-token-xyz",
+            5,
+            None,
+            None,
+            false,
+            None,
+            Some(0.5),
+            Some(60.0),
+            Some(4),
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+    let hybrid_ids: Vec<&str> = hybrid.iter().map(|r| r.id.as_str()).collect();
+    assert!(
+        hybrid_ids.contains(&"doc-B"),
+        "hybrid must surface doc-B (the only carrier of the rare token); got {hybrid_ids:?}"
+    );
+}
+
+#[test]
+fn hybrid_weight_zero_matches_dense_only() {
+    // weight=0.0 collapses RRF to the dense list alone, so the top hit must
+    // match what `search()` returns. (Order below the top may differ because
+    // RRF still ranks consensus picks, but the top-1 should be stable.)
+    let dir = tempdir().unwrap();
+    let db = dir.path().to_str().unwrap();
+    let d = 16;
+    let mut engine = TurboQuantEngine::open(db, db, d, 2, 7).unwrap();
+    for i in 0..6u32 {
+        engine
+            .insert_with_document(
+                format!("v{i}"),
+                &make_vec(d, i as f64 * 0.1),
+                HashMap::new(),
+                Some(format!("text {i}")),
+            )
+            .unwrap();
+    }
+    let q = make_vec(d, 0.0);
+    let dense = engine.search(&q, 3).unwrap();
+    let hybrid = engine
+        .search_hybrid(
+            &q,
+            "anything",
+            3,
+            None,
+            None,
+            false,
+            None,
+            Some(0.0),
+            Some(60.0),
+            Some(4),
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+    assert_eq!(hybrid[0].id, dense[0].id);
+}
+
+#[test]
 fn bm25_doc_count_is_zero_when_no_documents_inserted() {
     let dir = tempdir().unwrap();
     let db = dir.path().to_str().unwrap();
