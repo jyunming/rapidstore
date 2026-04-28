@@ -249,6 +249,7 @@ class Database:
         include: list[str] | None = None,
         rerank_factor: int | None = None,
         nprobe: int | None = None,
+        hybrid: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Search for the nearest neighbours of a query vector.
 
@@ -271,6 +272,14 @@ class Database:
                 coarse routing (requires :meth:`create_coarse_index` first).
                 Higher values improve recall; lower values improve speed.
                 Typical: 16 for k=256 clusters.
+            hybrid: Activate hybrid sparse+dense retrieval. Dict shape:
+                ``{"text": str, "weight": float, "rrf_k": float, "oversample": int}``.
+                Only ``text`` is required. ``weight`` ∈ [0, 1] controls the BM25
+                contribution (0=pure dense, 1=pure sparse, default 0.5). ``rrf_k``
+                is the Reciprocal Rank Fusion smoothing constant (default 60).
+                ``oversample`` is the per-list candidate multiplier (default 4).
+                Mutually exclusive with ``nprobe`` — if both are passed, ``hybrid``
+                wins.
 
         Returns:
             List of result dicts. Each dict contains the keys requested via
@@ -287,6 +296,7 @@ class Database:
         ann_search_list_size: int | None = None,
         rerank_factor: int | None = None,
         include: list[str] | None = None,
+        hybrid: dict[str, Any] | None = None,
     ) -> list[list[dict[str, Any]]]:
         """Search with multiple query vectors in one call.
 
@@ -301,6 +311,11 @@ class Database:
             include: Subset of fields to include in each result dict.
                 Valid values: ``"id"``, ``"score"``, ``"metadata"``,
                 ``"document"``. Defaults to all four.
+            hybrid: Activate hybrid sparse+dense retrieval. Dict shape:
+                ``{"text": str, "weight": float, "rrf_k": float, "oversample": int}`` —
+                ``text`` is broadcast to every query row. Or pass
+                ``{"texts": [str], ...}`` for per-row text matching the
+                ``query_embeddings`` rows.
 
         Returns:
             List of N result lists. Each result dict contains the keys

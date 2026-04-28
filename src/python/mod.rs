@@ -556,7 +556,7 @@ impl Database {
     ///
     /// Returns:
     ///     List of dicts, each with keys ``id``, ``score``, ``metadata``, ``document``.
-    #[pyo3(signature = (query, top_k, filter=None, _use_ann=None, ann_search_list_size=None, include=None, rerank_factor=None, nprobe=None))]
+    #[pyo3(signature = (query, top_k, filter=None, _use_ann=None, ann_search_list_size=None, include=None, rerank_factor=None, nprobe=None, hybrid=None))]
     fn search(
         &self,
         py: Python<'_>,
@@ -568,6 +568,7 @@ impl Database {
         include: Option<Vec<String>>,
         rerank_factor: Option<usize>,
         nprobe: Option<usize>,
+        hybrid: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyObject> {
         if top_k <= 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -608,6 +609,7 @@ impl Database {
         };
 
         let inc = parse_include_set(include, &["id", "score", "metadata", "document"])?;
+        let hybrid_args = parse_hybrid(hybrid)?;
 
         let (results, is_l2) = py.allow_threads(|| {
             let engine = self.read_engine()?;
@@ -619,7 +621,28 @@ impl Database {
                 )));
             }
             let is_l2 = matches!(engine.metric, crate::storage::engine::DistanceMetric::L2);
-            let results = if let Some(np) = nprobe {
+            let results = if let Some(h) = hybrid_args.as_ref() {
+                // Hybrid path: dense + BM25 + RRF. `nprobe` (IVF coarse routing) is
+                // mutually exclusive with hybrid in this version; if both are set,
+                // the hybrid path takes precedence and IVF is ignored. Document this
+                // in the PYTHON_API guide.
+                let use_ann = _use_ann.unwrap_or_else(|| engine.auto_use_ann());
+                engine.search_hybrid(
+                    &q,
+                    &h.text,
+                    top_k,
+                    filter_ref,
+                    ann_search_list_size,
+                    use_ann,
+                    rerank_factor,
+                    Some(h.weight),
+                    Some(h.rrf_k),
+                    Some(h.oversample),
+                    inc.contains("id"),
+                    inc.contains("metadata"),
+                    inc.contains("document"),
+                )
+            } else if let Some(np) = nprobe {
                 // IVF coarse routing: score only top-nprobe clusters.
                 engine.search_with_ivf(
                     &q,
@@ -875,7 +898,7 @@ impl Database {
     ///         query_embeddings=np.stack([q1, q2, q3]),
     ///         n_results=5,
     ///     )
-    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=None, ann_search_list_size=None, rerank_factor=None, include=None))]
+    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=None, ann_search_list_size=None, rerank_factor=None, include=None, hybrid=None))]
     fn query(
         &self,
         py: Python<'_>,
@@ -886,6 +909,7 @@ impl Database {
         ann_search_list_size: Option<usize>,
         rerank_factor: Option<usize>,
         include: Option<Vec<String>>,
+        hybrid: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyObject> {
         if n_results <= 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -938,6 +962,7 @@ impl Database {
         let include_score = inc.contains("score");
         let include_metadata = inc.contains("metadata");
         let include_document = inc.contains("document");
+        let hybrid_args = parse_hybrid_batch(hybrid, queries.len())?;
         let (batch, is_l2) = py.allow_threads(|| {
             let engine = self.read_engine()?;
             for (i, row) in queries.iter().enumerate() {
@@ -951,19 +976,50 @@ impl Database {
                 }
             }
             let is_l2 = matches!(engine.metric, crate::storage::engine::DistanceMetric::L2);
-            let batch = engine
-                .search_batch_with_include(
-                    &queries,
-                    n_results,
-                    filter_ref,
-                    ann_search_list_size,
-                    _use_ann,
-                    rerank_factor,
-                    include_id,
-                    include_metadata,
-                    include_document,
-                )
-                .map_err(to_py_runtime)?;
+            let batch = if let Some(per_query) = hybrid_args.as_ref() {
+                // Hybrid batch: dispatch per-row to search_hybrid. Less efficient than
+                // a true batched RRF, but each call is read-only on `&engine` so the
+                // caller's batch parallelism (search_batch_with_include) is replaced
+                // by per-row sequential calls. Acceptable for v1; revisit if hybrid
+                // batches become hot.
+                let use_ann = _use_ann.unwrap_or_else(|| engine.auto_use_ann());
+                let mut out: Vec<Vec<crate::storage::engine::SearchResult>> =
+                    Vec::with_capacity(queries.len());
+                for (i, q) in queries.iter().enumerate() {
+                    let h = &per_query[i];
+                    let r = engine.search_hybrid(
+                        q,
+                        &h.text,
+                        n_results,
+                        filter_ref,
+                        ann_search_list_size,
+                        use_ann,
+                        rerank_factor,
+                        Some(h.weight),
+                        Some(h.rrf_k),
+                        Some(h.oversample),
+                        include_id,
+                        include_metadata,
+                        include_document,
+                    );
+                    out.push(r.map_err(to_py_runtime)?);
+                }
+                out
+            } else {
+                engine
+                    .search_batch_with_include(
+                        &queries,
+                        n_results,
+                        filter_ref,
+                        ann_search_list_size,
+                        _use_ann,
+                        rerank_factor,
+                        include_id,
+                        include_metadata,
+                        include_document,
+                    )
+                    .map_err(to_py_runtime)?
+            };
             Ok((batch, is_l2))
         })?;
 
@@ -1300,6 +1356,178 @@ fn parse_include_set(
         }
     }
     Ok(items.into_iter().map(|s| s.to_ascii_lowercase()).collect())
+}
+
+/// Parsed `hybrid={...}` argument from `Database.search()` / `Database.query()`.
+struct HybridArgs {
+    text: String,
+    weight: f32,
+    rrf_k: f32,
+    oversample: usize,
+}
+
+/// Parse a `hybrid={"text": str, "weight": float?, "rrf_k": float?, "oversample": int?}` dict.
+///
+/// Returns `Ok(None)` when `hybrid` is `None` or its `text` is empty so the caller
+/// can fall through to the dense-only path. A missing `text` key raises `ValueError`.
+/// Defaults: weight=0.5, rrf_k=60.0, oversample=4. Unknown keys raise `ValueError`
+/// to catch typos early.
+fn parse_hybrid(dict: Option<&Bound<'_, PyDict>>) -> PyResult<Option<HybridArgs>> {
+    let Some(d) = dict else {
+        return Ok(None);
+    };
+    const VALID_KEYS: &[&str] = &["text", "weight", "rrf_k", "oversample"];
+    for (k, _) in d.iter() {
+        let key = k.extract::<String>()?;
+        if !VALID_KEYS.contains(&key.as_str()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "hybrid: unknown key {:?}; valid keys: {}",
+                key,
+                VALID_KEYS.join(", ")
+            )));
+        }
+    }
+    let text: String = match d.get_item("text")? {
+        Some(v) => v.extract()?,
+        None => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "hybrid: missing required key 'text'",
+            ));
+        }
+    };
+    if text.is_empty() {
+        // Empty text would tokenize to no tokens, so BM25 contributes nothing —
+        // treat it as "hybrid disabled" to keep the dense-only fast path.
+        return Ok(None);
+    }
+    let weight: f32 = match d.get_item("weight")? {
+        Some(v) => v.extract::<f64>()? as f32,
+        None => 0.5,
+    };
+    if !(0.0..=1.0).contains(&weight) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "hybrid.weight must be in [0.0, 1.0], got {weight}"
+        )));
+    }
+    let rrf_k: f32 = match d.get_item("rrf_k")? {
+        Some(v) => v.extract::<f64>()? as f32,
+        None => 60.0,
+    };
+    if rrf_k < 1.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "hybrid.rrf_k must be >= 1.0, got {rrf_k}"
+        )));
+    }
+    let oversample: usize = match d.get_item("oversample")? {
+        Some(v) => v.extract()?,
+        None => 4,
+    };
+    if oversample == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "hybrid.oversample must be >= 1",
+        ));
+    }
+    Ok(Some(HybridArgs {
+        text,
+        weight,
+        rrf_k,
+        oversample,
+    }))
+}
+
+/// Batch hybrid parser for `Database.query()`. Accepts either:
+/// - `texts`: a list of strings, one per query row (length must equal `n_queries`).
+/// - `text`:  a single string broadcast to every query row.
+///
+/// Other keys (`weight`, `rrf_k`, `oversample`) follow the same rules as
+/// [`parse_hybrid`] and apply to every query in the batch.
+fn parse_hybrid_batch(
+    dict: Option<&Bound<'_, PyDict>>,
+    n_queries: usize,
+) -> PyResult<Option<Vec<HybridArgs>>> {
+    let Some(d) = dict else {
+        return Ok(None);
+    };
+    const VALID_KEYS: &[&str] = &["text", "texts", "weight", "rrf_k", "oversample"];
+    for (k, _) in d.iter() {
+        let key = k.extract::<String>()?;
+        if !VALID_KEYS.contains(&key.as_str()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "hybrid: unknown key {:?}; valid keys: {}",
+                key,
+                VALID_KEYS.join(", ")
+            )));
+        }
+    }
+    let texts: Vec<String> = match (d.get_item("texts")?, d.get_item("text")?) {
+        (Some(_), Some(_)) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "hybrid: pass either 'texts' (per-query) or 'text' (broadcast), not both",
+            ));
+        }
+        (Some(v), None) => {
+            let extracted: Vec<String> = v.extract()?;
+            if extracted.len() != n_queries {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "hybrid.texts has {} entries but query_embeddings has {} rows",
+                    extracted.len(),
+                    n_queries
+                )));
+            }
+            extracted
+        }
+        (None, Some(v)) => {
+            let single: String = v.extract()?;
+            vec![single; n_queries]
+        }
+        (None, None) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "hybrid: missing 'text' (single) or 'texts' (per-query)",
+            ));
+        }
+    };
+    if texts.iter().all(|t| t.is_empty()) {
+        // All-empty inputs collapse to dense-only — keep the fast path.
+        return Ok(None);
+    }
+    let weight: f32 = match d.get_item("weight")? {
+        Some(v) => v.extract::<f64>()? as f32,
+        None => 0.5,
+    };
+    if !(0.0..=1.0).contains(&weight) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "hybrid.weight must be in [0.0, 1.0], got {weight}"
+        )));
+    }
+    let rrf_k: f32 = match d.get_item("rrf_k")? {
+        Some(v) => v.extract::<f64>()? as f32,
+        None => 60.0,
+    };
+    if rrf_k < 1.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "hybrid.rrf_k must be >= 1.0, got {rrf_k}"
+        )));
+    }
+    let oversample: usize = match d.get_item("oversample")? {
+        Some(v) => v.extract()?,
+        None => 4,
+    };
+    if oversample == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "hybrid.oversample must be >= 1",
+        ));
+    }
+    Ok(Some(
+        texts
+            .into_iter()
+            .map(|text| HybridArgs {
+                text,
+                weight,
+                rrf_k,
+                oversample,
+            })
+            .collect(),
+    ))
 }
 
 pub fn register(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {

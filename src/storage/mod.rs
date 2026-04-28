@@ -13,6 +13,7 @@
 //! | [`backend`] | `StorageProvider` trait: local filesystem, extensible to cloud |
 
 pub mod backend;
+pub mod bm25;
 pub mod compaction;
 pub mod engine;
 pub mod graph;
@@ -20,5 +21,7 @@ pub mod id_pool;
 pub mod ivf;
 pub mod live_codes;
 pub mod metadata;
+pub mod rrf;
 pub mod segment;
+pub mod tokenizer;
 pub mod wal;

@@ -411,6 +411,18 @@ impl MetadataStore {
         self.data.len()
     }
 
+    /// Iterate over (slot, document_text) pairs for every slot that has a non-empty
+    /// document. Used by the BM25 index to rebuild from scratch when its sidecar
+    /// file is missing or invalid.
+    pub fn iter_docs(&self) -> impl Iterator<Item = (u32, &str)> + '_ {
+        self.data.iter().filter_map(|(slot, meta)| {
+            meta.document
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| (*slot, s))
+        })
+    }
+
     pub fn approx_bytes(&self) -> usize {
         self.data
             .iter()

@@ -283,6 +283,8 @@ results = db.search(
     rerank_factor=None,          # int | None — rerank oversampling multiplier (requires rerank=True)
                                  #   default: 10 (brute-force), 20 (ANN)
                                  #   top (rerank_factor × top_k) candidates are re-scored exactly
+    nprobe=None,                 # int | None — IVF clusters to probe (requires create_coarse_index())
+    hybrid=None,                 # dict | None — sparse+dense fusion via RRF (see Hybrid Search below)
 )
 # Returns list of dicts: {"id": str, "score": float, "metadata": dict, "document": str | None}
 ```
@@ -292,6 +294,33 @@ With `_use_ann=None` (default), the planner auto-selects: ANN if an index exists
 `ann_search_list_size` trades recall for latency — higher values find better results but take longer. Values between 64 and 256 cover the practical range.
 
 `rerank_factor` follows the industry convention (Qdrant `oversampling`, LanceDB `refine_factor`). Higher values improve recall at the cost of exact re-score latency. Useful when `top_k` is small (1–10) and precision is critical.
+
+### Hybrid search (sparse + dense)
+
+When documents were inserted via `db.insert(..., document=...)` or `db.insert_batch(..., documents=[...])`, an in-memory BM25 sparse index is maintained automatically. Pass `hybrid={...}` to combine it with the dense vector search at query time using Reciprocal Rank Fusion (RRF):
+
+```python
+results = db.search(
+    query_vec,
+    top_k=10,
+    hybrid={
+        "text": "exact arXiv-2504.19874 paper",  # required — query string for the BM25 leg
+        "weight": 0.3,                            # optional — BM25 contribution in [0, 1]; default 0.5
+        "rrf_k": 60,                              # optional — RRF smoothing constant; default 60
+        "oversample": 4,                          # optional — per-list candidate multiplier; default 4
+    },
+)
+```
+
+How to read the parameters:
+
+- `weight=0.0` collapses to pure dense (the BM25 leg contributes nothing). `weight=1.0` collapses to pure BM25 (with the dense leg's metadata still used to enrich results that BM25 surfaces). `weight=0.5` (the default) gives sparse and dense equal voice.
+- `rrf_k=60` is the textbook value from Cormack et al. 2009. Larger `rrf_k` flattens the rank-decay curve so consensus picks across both lists are rewarded more than rank-1 winners on either alone.
+- `oversample=4` asks each leg for `4 × top_k` candidates so RRF has room to find shared hits that don't lead either list. Lower it (down to 1) for slightly faster queries; raise it for slightly higher recall on long-tail queries.
+- An empty `text` (or text with no alphanumeric tokens) collapses to the dense-only fast path — no overhead.
+- `hybrid` is mutually exclusive with `nprobe`: if both are passed, `hybrid` wins.
+
+The BM25 index itself is built from the `document` field only. It is persisted in `bm25.idx` and rebuilt automatically from the doc store on cold start if the sidecar is missing.
 
 ### Batch query
 
@@ -305,6 +334,8 @@ all_results = db.query(
     _use_ann=None,               # None=auto, True=force ANN, False=force brute-force (same semantics as search())
     ann_search_list_size=None,
     rerank_factor=None,          # int | None — same semantics as search(); default 10 (brute) / 20 (ANN)
+    hybrid=None,                 # dict | None — same shape as search(); accepts "texts": [str] for per-row text
+                                 # or "text": str to broadcast a single query to all rows
 )
 # Returns list[list[dict]] — one inner list per query vector
 ```

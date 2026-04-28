@@ -69,40 +69,40 @@ All 8 configs — brute-force and ANN (HNSW md=32, ef=128), all using `fast_mode
 
 | Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 6.9s | — | 6.2 | 192 | 16.72 | 226.71 | 51.1% | 0.651 |
-| b=2 rerank=T | Brute | 6.5s | — | 25.9 | 213 | 4.95 | 7.25 | 97.1% | 0.977 |
-| b=4 rerank=F | Brute | 2.1s | — | 11.0 | 198 | 1.82 | 3.39 | 81.9% | 0.898 |
-| b=4 rerank=T | Brute | 6.0s | — | 30.6 | 220 | 5.56 | 11.86 | 98.7% | 0.994 |
-| b=2 rerank=F | ANN | 1.7s | 12.4s | 14.8 | 228 | 0.77 | 1.56 | 32.2% | 0.398 |
-| b=2 rerank=T | ANN | 6.0s | 19.0s | 34.5 | 250 | 4.62 | 55.35 | 57.2% | 0.575 |
-| b=4 rerank=F | ANN | 4.9s | 12.2s | 19.6 | 230 | 0.51 | 1.75 | 49.3% | 0.528 |
-| b=4 rerank=T | ANN | 6.2s | 18.2s | 39.2 | 254 | 4.35 | 8.26 | 70.0% | 0.704 |
+| b=2 rerank=F | Brute | 1.3s | — | 6.2 | 193 | 2.54 | 3.43 | 51.1% | 0.651 |
+| b=2 rerank=T | Brute | 4.6s | — | 25.9 | 214 | 3.37 | 4.33 | 97.1% | 0.977 |
+| b=4 rerank=F | Brute | 1.7s | — | 11.0 | 198 | 1.56 | 2.37 | 81.9% | 0.898 |
+| b=4 rerank=T | Brute | 5.1s | — | 30.6 | 218 | 4.42 | 5.89 | 98.7% | 0.994 |
+| b=2 rerank=F | ANN | 1.4s | 9.7s | 14.8 | 223 | 0.54 | 1.19 | 32.3% | 0.398 |
+| b=2 rerank=T | ANN | 4.5s | 14.9s | 34.4 | 246 | 2.96 | 7.74 | 57.0% | 0.572 |
+| b=4 rerank=F | ANN | 1.7s | 10.7s | 19.6 | 230 | 0.34 | 0.97 | 50.6% | 0.543 |
+| b=4 rerank=T | ANN | 5.0s | 14.7s | 39.2 | 253 | 3.33 | 9.02 | 70.0% | 0.704 |
 
 **DBpedia OpenAI3 d=1536** (d=1536, 100,000 corpus, 1,000 queries)
 
 | Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 18.1s | — | 46.9 | 803 | 27.75 | 438.59 | 83.7% | 0.909 |
-| b=2 rerank=T | Brute | 60.4s | — | 193.8 | 950 | 117.56 | 536.78 | 99.7% | 0.999 |
-| b=4 rerank=F | Brute | 56.9s | — | 83.6 | 839 | 82.32 | 293.14 | 95.8% | 0.978 |
-| b=4 rerank=T | Brute | 68.2s | — | 230.4 | 986 | 74.87 | 276.40 | 99.7% | 0.999 |
-| b=2 rerank=F | ANN | 17.4s | 42.4s | 55.5 | 764 | 5.67 | 9.15 | 80.2% | 0.866 |
-| b=2 rerank=T | ANN | 17.3s | 143.8s | 202.4 | 915 | 21.74 | 34.49 | 97.7% | 0.979 |
-| b=4 rerank=F | ANN | 17.4s | 41.8s | 92.2 | 806 | 3.81 | 7.05 | 91.1% | 0.930 |
-| b=4 rerank=T | ANN | 25.7s | 147.4s | 239.0 | 950 | 15.25 | 26.28 | 97.8% | 0.979 |
+| b=2 rerank=F | Brute | 11.4s | — | 46.9 | 799 | 20.75 | 23.98 | 83.7% | 0.909 |
+| b=2 rerank=T | Brute | 14.2s | — | 193.8 | 947 | 21.60 | 25.32 | 99.7% | 0.999 |
+| b=4 rerank=F | Brute | 14.2s | — | 83.6 | 836 | 13.57 | 16.16 | 95.8% | 0.978 |
+| b=4 rerank=T | Brute | 16.8s | — | 230.4 | 984 | 14.82 | 16.73 | 99.7% | 0.999 |
+| b=2 rerank=F | ANN | 11.6s | 38.5s | 55.5 | 764 | 4.51 | 9.67 | 80.0% | 0.867 |
+| b=2 rerank=T | ANN | 15.4s | 131.6s | 202.4 | 915 | 18.58 | 30.27 | 97.7% | 0.979 |
+| b=4 rerank=F | ANN | 15.2s | 35.9s | 92.2 | 800 | 3.15 | 5.41 | 91.2% | 0.931 |
+| b=4 rerank=T | ANN | 16.8s | 125.9s | 239.0 | 948 | 11.22 | 18.47 | 97.9% | 0.981 |
 
 **DBpedia OpenAI3 d=3072** (d=3072, 100,000 corpus, 1,000 queries)
 
 | Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 53.6s | — | 110.6 | 1516 | 50.11 | 75.54 | 89.6% | 0.945 |
-| b=2 rerank=T | Brute | 82.4s | — | 403.9 | 1732 | 56.03 | 72.73 | 99.7% | 0.999 |
-| b=4 rerank=F | Brute | 76.2s | — | 183.8 | 1594 | 31.38 | 39.00 | 96.3% | 0.981 |
-| b=4 rerank=T | Brute | 110.8s | — | 477.1 | 1890 | 37.99 | 132.36 | 99.7% | 0.999 |
-| b=2 rerank=F | ANN | 66.1s | 76.7s | 119.2 | 1449 | 13.54 | 19.70 | 85.4% | 0.900 |
-| b=2 rerank=T | ANN | 83.4s | 538.2s | 412.5 | 1744 | 45.07 | 67.83 | 97.8% | 0.980 |
-| b=4 rerank=F | ANN | 60.1s | 72.9s | 192.4 | 1522 | 10.32 | 22.41 | 92.4% | 0.940 |
-| b=4 rerank=T | ANN | 69.3s | 525.8s | 485.8 | 1817 | 31.64 | 46.58 | 98.5% | 0.987 |
+| b=2 rerank=F | Brute | 43.9s | — | 110.6 | 1508 | 44.58 | 101.74 | 89.6% | 0.945 |
+| b=2 rerank=T | Brute | 50.3s | — | 403.9 | 1813 | 45.92 | 51.46 | 99.7% | 0.999 |
+| b=4 rerank=F | Brute | 50.3s | — | 183.8 | 1591 | 28.86 | 32.42 | 96.3% | 0.981 |
+| b=4 rerank=T | Brute | 58.8s | — | 477.1 | 1883 | 31.18 | 33.95 | 99.7% | 0.999 |
+| b=2 rerank=F | ANN | 44.9s | 66.4s | 119.2 | 1446 | 11.53 | 32.97 | 85.7% | 0.902 |
+| b=2 rerank=T | ANN | 55.4s | 491.5s | 412.5 | 1741 | 40.20 | 60.85 | 97.8% | 0.980 |
+| b=4 rerank=F | ANN | 50.4s | 65.4s | 192.4 | 1521 | 9.07 | 12.68 | 92.0% | 0.935 |
+| b=4 rerank=T | ANN | 66.2s | 541.5s | 485.8 | 1815 | 29.25 | 61.40 | 97.8% | 0.979 |
 
 **Reproduction:** `maturin develop --release && python benchmarks/paper_recall_bench.py --update-readme --track`  (requires `pip install datasets psutil matplotlib`)
 
@@ -143,3 +143,47 @@ ANN costs ~2 points of recall while cutting latency from ~51ms to ~37ms p50. For
 | d ≤ 256 | Brute-force | Quantization noise collapses ANN recall |
 | d = 512–1024 | Either (test both) | Moderate quantization quality; ANN gain is partial |
 | d ≥ 1536 | ANN | High-d quantization is accurate; ANN gives 1.5–4× latency gain with <3% recall cost |
+
+---
+
+## Hybrid retrieval evaluation
+
+Dense retrieval misses keyword-heavy queries; sparse retrieval misses
+paraphrases. The harness at [`benchmarks/retrieval_eval.py`](https://github.com/jyunming/TurboQuantDB/blob/main/benchmarks/retrieval_eval.py)
+grades all three paths (dense, BM25, hybrid RRF) on the same query sets so
+new retrieval features can be judged against measured wins instead of
+anecdotes. Append-only history lives at `benchmarks/retrieval_eval_history.json`.
+
+```bash
+python benchmarks/retrieval_eval.py             # 1k synthetic corpus, ~3s
+python benchmarks/retrieval_eval.py --n 5000    # bigger corpus, ~15s
+python benchmarks/retrieval_eval.py --no-history # don't append to history
+```
+
+Three query sets are generated from the synthetic corpus:
+
+| Query set | What's in the query | Ideal retriever |
+|-----------|---------------------|-----------------|
+| `semantic` | A perturbed corpus vector, no text | Pure dense |
+| `lexical`  | A rare token + a random orthogonal vector | Pure BM25 |
+| `mixed`    | Half of each, interleaved | Hybrid (RRF) |
+
+Representative output (N=1k, D=128, Q=100 per set, weight=0.5):
+
+| query set | path | R@1 | R@10 | MRR@10 | NDCG@10 |
+|-----------|------|----:|-----:|-------:|--------:|
+| semantic  | dense  | 1.000 | 1.000 | 1.000 | 1.000 |
+| semantic  | bm25   | 0.000 | 0.000 | 0.000 | 0.000 |
+| semantic  | hybrid | 1.000 | 1.000 | 1.000 | 1.000 |
+| lexical   | dense  | 0.010 | 0.010 | 0.010 | 0.010 |
+| lexical   | bm25   | 1.000 | 1.000 | 1.000 | 1.000 |
+| lexical   | hybrid | 0.200 | 1.000 | 0.466 | 0.597 |
+| mixed     | dense  | 0.500 | 0.500 | 0.500 | 0.500 |
+| mixed     | bm25   | 0.500 | 0.500 | 0.500 | 0.500 |
+| mixed     | hybrid | 0.550 | 1.000 | 0.689 | 0.765 |
+
+Read the table as: **on the mixed workload, hybrid raises R@10 from 0.500
+to 1.000** (+50 pp) over either path alone, while losing nothing on
+semantic-only queries. On lexical queries hybrid is dominated by pure BM25
+on R@1, but still recovers the gold doc in the top-10 every time, which is
+what most RAG pipelines actually consume.

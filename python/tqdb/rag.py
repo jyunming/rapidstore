@@ -142,13 +142,26 @@ class TurboQuantRetriever:
         result = self.embedding_function(texts)
         return np.asarray(result, dtype=np.float32)
 
-    def _search_db(self, vec: np.ndarray, k: int, filter: Optional[Dict[str, Any]]) -> List[Any]:
-        # Backward compatibility: older mocks/backends accept search(vec, k) only.
-        if filter is None:
+    def _search_db(
+        self,
+        vec: np.ndarray,
+        k: int,
+        filter: Optional[Dict[str, Any]],
+        hybrid: Optional[Dict[str, Any]] = None,
+    ) -> List[Any]:
+        # Build kwargs lazily so older mocks/backends that don't accept `filter` /
+        # `hybrid` still work via the positional fallback below.
+        kwargs: Dict[str, Any] = {}
+        if filter is not None:
+            kwargs["filter"] = filter
+        if hybrid is not None:
+            kwargs["hybrid"] = hybrid
+        if not kwargs:
             return self.db.search(vec, k)
         try:
-            return self.db.search(vec, k, filter=filter)
+            return self.db.search(vec, k, **kwargs)
         except TypeError:
+            # Fallback for stubs/mocks that haven't grown the new kwargs yet.
             return self.db.search(vec, k)
 
     def _results_to_rows(self, results: List[Any]) -> List[Dict[str, Any]]:
@@ -283,6 +296,7 @@ class TurboQuantRetriever:
         query_embedding: List[float],
         k: int = 4,
         filter: Optional[Dict[str, Any]] = None,
+        hybrid: Optional[Dict[str, Any]] = None,
     ) -> List[SearchResultDocument]:
         """Return the top-k most similar documents.
 
@@ -290,6 +304,9 @@ class TurboQuantRetriever:
             query_embedding: Query vector (same dimension as the database).
             k: Number of results to return.
             filter: Optional metadata filter dict (MongoDB-style operators).
+            hybrid: Optional hybrid-retrieval config; pass through to
+                :meth:`tqdb.Database.search`. Shape:
+                ``{"text": str, "weight": float, "rrf_k": float, "oversample": int}``.
 
         Returns:
             List of hybrid Document-like rows with ``page_content``/``metadata``
@@ -298,7 +315,7 @@ class TurboQuantRetriever:
         if k <= 0:
             return []
         vec = np.array(query_embedding, dtype=np.float32)
-        results = self._search_db(vec, k, filter)
+        results = self._search_db(vec, k, filter, hybrid=hybrid)
         return self._rows_to_documents(self._results_to_rows(results))
 
     def similarity_search_with_score(
