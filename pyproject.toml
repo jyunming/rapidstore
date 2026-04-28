@@ -30,8 +30,17 @@ classifiers = [
     "Topic :: Database",
 ]
 
+[project.optional-dependencies]
+# Source-library readers required by `python -m tqdb.migrate`.
+migrate = ["chromadb>=0.5", "lancedb>=0.10"]
+# Just the Chroma migrator (no LanceDB).
+migrate-chroma = ["chromadb>=0.5"]
+# Just the LanceDB migrator (no Chroma).
+migrate-lancedb = ["lancedb>=0.10"]
+
 [project.scripts]
 tqdb-server = "tqdb._server_launcher:main"
+tqdb-migrate = "tqdb.migrate:main"
 
 [project.urls]
 Homepage = "https://jyunming.github.io/TurboQuantDB"
