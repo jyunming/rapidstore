@@ -6,6 +6,34 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
+## [0.7.0] — 2026-04-28
+
+### Added
+
+- **BM25 sparse retrieval foundation** — new `Bm25Index` sidecar (`bm25.idx`) maintained alongside the dense store. Indexes the `document` field of every vector via a deterministic Unicode-word tokenizer (lowercase + FNV-1a hashing) and Okapi BM25 (k1=1.2, b=0.75). Persisted on every flush via tmp+rename, rebuilt from `metadata.iter_docs()` when the sidecar is missing or corrupt. Insert/upsert/delete/compaction paths all keep BM25 in sync. Engine API: `engine.search_bm25(query_text, top_k, filter)`.
+- **`db.search(…, hybrid={…})` and `db.query(…, hybrid={…})`** — hybrid sparse+dense retrieval via Reciprocal Rank Fusion (RRF). Shape: `{"text": str, "weight": float, "rrf_k": float, "oversample": int}`. `weight` ∈ [0, 1] (default 0.5) controls the BM25 contribution; `rrf_k` (default 60) is the smoothing constant; `oversample` (default 4) is the per-list candidate multiplier. Dense and BM25 legs run in parallel via `rayon::join`. `query()` accepts `texts: [str]` for per-row text in batch mode. Empty text collapses to dense-only fast path.
+- **`TurboQuantRetriever.similarity_search(..., hybrid={…})`** — the LangChain wrapper at `python/tqdb/rag.py` passes `hybrid` through to the underlying `Database.search` so RAG users can opt in without touching the lower-level API.
+- **`benchmarks/retrieval_eval.py`** — repeatable retrieval-eval harness that scores dense, BM25, and hybrid paths on three query sets (semantic, lexical, mixed) over a synthetic self-contained corpus. Reports R@1, R@10, MRR@10, NDCG@10, and p50/p95 latency in one markdown table; appends to `benchmarks/retrieval_eval_history.json`. Documented in `docs/BENCHMARKS.md`.
+
+### Performance
+
+- No change to dense or ANN paths — all 24 paper-bench configs (3 datasets × 8 configs) at v0.7.0 are within ±1pp R@1 of v0.6.0 and ≤ baseline on every latency/ingest metric. Hybrid `search_hybrid()` is amortized O(K') per query where K' = oversample × top_k, i.e. ≤ 1.5× the dense-only latency at default settings.
+- Sparse index lookup (`engine.search_bm25`) ≤ 0.5 ms p95 at N = 5k on the harness's synthetic corpus.
+
+### Documentation
+
+- `docs/BENCHMARKS.md` — new "Hybrid retrieval evaluation" section explaining the harness, the three query sets, and the expected outcome (hybrid raises mixed R@10 from 0.500 to 1.000 over either path alone).
+- `docs/PYTHON_API.md` — `search()` / `query()` signatures updated with the `hybrid` kwarg.
+- `python/tqdb/tqdb.pyi` — type stubs reflect the new kwarg on both methods.
+
+### Tests
+
+- 7 tokenizer unit tests + 12 BM25 unit tests + 8 RRF unit tests (`src/storage/{tokenizer,bm25,rrf}.rs`).
+- 12 engine integration tests in `tests/test_bm25.rs`: keyword match, delete, upsert, persistence round-trip, hybrid recovers keyword-dense-misses, hybrid weight=0 collapses to dense, slot-reuse identity (no doc leak across deleted IDs), cold-start rebuild matches persisted, compaction with documents preserves search, hybrid with empty BM25 falls back to dense.
+- 14 Python boundary tests in `tests/test_python_hybrid.py`: malformed dict shapes, wrong types, weight/rrf_k/oversample out-of-range, both `text` and `texts` set, `texts` length mismatch, Unicode round-trip.
+
+---
+
 ## [0.6.0] — 2026-04-23
 
 ### Added

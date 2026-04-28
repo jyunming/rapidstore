@@ -19,6 +19,7 @@ Two deployment modes:
 - **5–10× compression** — b=4 reduces 1536-dim float32 embeddings from 586 MB to 108 MB (5.4×); b=2 reaches 59 MB (9.9×) at 100k vectors.
 - **Two quantizer modes** — default (`dense`, best recall) and a faster ingest variant (`srht`) for streaming/high-d workloads. See [docs/QUANTIZER_MODES.md](https://github.com/jyunming/TurboQuantDB/blob/main/docs/QUANTIZER_MODES.md) for a full breakdown.
 - **Optional ANN index** — Build an HNSW graph after loading data for fast approximate search.
+- **Hybrid retrieval** — Built-in BM25 keyword index fuses with dense search via RRF (`db.search(..., hybrid={"text": "..."})`). Pure-dense behaviour is unchanged when the kwarg is omitted.
 - **Metadata filtering** — MongoDB-style filter operators on any metadata field.
 - **Crash recovery** — Write-ahead log (WAL) ensures durability without explicit flushing.
 - **Python native** — `pip install tqdb`; no server or sidecar required.
@@ -129,13 +130,19 @@ len(db) / "id" in db                 # container protocol
 # Search — brute-force by default; pass _use_ann=True to use HNSW index
 results = db.search(query, top_k=10, filter=None, _use_ann=False,
                     ann_search_list_size=None, rerank_factor=None, include=None,
-                    nprobe=None)  # nprobe=N activates IVF routing (see create_coarse_index)
+                    nprobe=None,        # nprobe=N activates IVF routing (see create_coarse_index)
+                    hybrid=None)        # hybrid={"text": "...", "weight": 0.5} = sparse+dense via RRF
 # include: list of "id"|"score"|"metadata"|"document" (default all)
 # ann_search_list_size: HNSW ef_search override (only used when _use_ann=True)
 # rerank_factor: candidate oversampling multiplier (default 10 brute / 20 ANN)
 
+# Hybrid (sparse BM25 + dense) — recovers keyword/exact-match queries dense alone misses
+results = db.search(query, top_k=10,
+                    hybrid={"text": "user query string", "weight": 0.3, "rrf_k": 60})
+
 all_results = db.query(query_embeddings, n_results=10, where_filter=None,
-                       rerank_factor=None, include=None)
+                       rerank_factor=None, include=None,
+                       hybrid=None)  # also accepts hybrid={"texts": [str], ...} for per-row text
 # query_embeddings: np.ndarray (N, D) — returns list[list[dict]]
 
 # Manual maintenance checkpoint (WAL flush + segment compaction)
