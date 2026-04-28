@@ -37,6 +37,10 @@ migrate = ["chromadb>=0.5", "lancedb>=0.10"]
 migrate-chroma = ["chromadb>=0.5"]
 # Just the LanceDB migrator (no Chroma).
 migrate-lancedb = ["lancedb>=0.10"]
+# LangChain v2 ``TurboQuantVectorStore`` in `tqdb.vectorstore`.
+langchain = ["langchain-core>=0.3"]
+# LlamaIndex ``TurboQuantVectorStore`` in `tqdb.llama_index`.
+llamaindex = ["llama-index-core>=0.10"]
 
 [project.scripts]
 tqdb-server = "tqdb._server_launcher:main"
