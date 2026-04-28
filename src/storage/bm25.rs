@@ -18,12 +18,15 @@
 //! | 8 | bincode payload length (u64 LE) |
 //! | …  | bincode-serialized [`Bm25Snapshot`] |
 //!
-//! Atomic replace mirrors `metadata.idx`: write to `<path>.tmp`, fsync, rename.
+//! Atomic replace mirrors `metadata.idx`: buffered write to `<path>.tmp`, then
+//! atomic rename. The OS may still hold dirty pages after rename returns; if
+//! crash-on-rename durability ever matters we'll add `File::sync_all()` here
+//! and in `metadata.rs::flush` together.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Cursor, Read, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::storage::tokenizer::tokenize;
@@ -265,13 +268,21 @@ impl Bm25Index {
         if bytes.len() < 12 || &bytes[..4] != IDX_MAGIC {
             return Err("invalid bm25 idx magic".into());
         }
-        let mut cur = Cursor::new(&bytes[4..]);
-        let mut len_buf = [0u8; 8];
-        cur.read_exact(&mut len_buf)?;
-        let payload_len = u64::from_le_bytes(len_buf) as usize;
-        let mut payload = vec![0u8; payload_len];
-        cur.read_exact(&mut payload)?;
-        let snap: Bm25Snapshot = bincode::deserialize(&payload)?;
+        // Validate the on-disk length header against the actual file size before
+        // allocating. A corrupt or maliciously crafted `bm25.idx` could otherwise
+        // claim a payload length of, say, 2^60 bytes and trigger an OOM.
+        let payload_len_u64 = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+        let payload_len = usize::try_from(payload_len_u64)
+            .map_err(|_| "bm25 idx payload length exceeds platform usize")?;
+        let payload = &bytes[12..];
+        if payload_len != payload.len() {
+            return Err(format!(
+                "bm25 idx payload length mismatch: header says {payload_len}, file has {}",
+                payload.len()
+            )
+            .into());
+        }
+        let snap: Bm25Snapshot = bincode::deserialize(payload)?;
         Ok(snap)
     }
 }

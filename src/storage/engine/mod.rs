@@ -939,13 +939,10 @@ impl TurboQuantEngine {
         let oversample = oversample.unwrap_or(DEFAULT_RRF_OVERSAMPLE).max(1);
         let oversampled_k = top_k.saturating_mul(oversample);
 
-        // BM25 needs a sorted-unique slot pre-filter when the user supplied one;
-        // re-using the dense path's filter would force two evaluations of the same
-        // predicate. We materialise the filter once via the shared planner helpers.
-        // For now, push BM25 the filter only when it is `None` — non-trivial filter
-        // pushdown into BM25 is left to a future iteration. The dense path applies
-        // the filter in the usual way, so any candidates BM25 surfaces that fail
-        // the predicate get dropped during the metadata fetch step below.
+        // BM25 doesn't share the dense path's filter machinery, so we don't push the
+        // filter into the BM25 leg directly — it's evaluated as a post-filter on
+        // BM25-only fused slots below. The dense path always applies the filter, so
+        // any slot that came from the dense leg is already filter-correct.
         let bm25_filter: Option<&[u32]> = None;
 
         // Run dense and BM25 concurrently. Both are read-only on `&self` so this
@@ -1014,13 +1011,22 @@ impl TurboQuantEngine {
                 Some(s) => s.to_string(),
                 None => continue, // tombstoned between fan-out and fuse — drop
             };
-            let (metadata, document) = if let Some(r) = cache.remove(&slot) {
-                (r.metadata, r.document)
+            let (metadata, document, from_dense) = if let Some(r) = cache.remove(&slot) {
+                (r.metadata, r.document, true)
             } else if let Some(m) = extra_meta.get(&slot) {
-                (m.properties.clone(), m.document.clone())
+                (m.properties.clone(), m.document.clone(), false)
             } else {
-                (HashMap::new(), None)
+                (HashMap::new(), None, false)
             };
+            // Filter correctness: dense-side slots are pre-filtered by
+            // `search_with_filter_and_ann_include`. BM25-side slots bypass that
+            // pipeline, so when the caller supplied a `filter` we re-check the
+            // predicate here for any slot that didn't come through the dense leg.
+            if let Some(f) = filter {
+                if !from_dense && !metadata_matches_filter(&metadata, f) {
+                    continue;
+                }
+            }
             out.push(SearchResult {
                 id: if include_id { id } else { String::new() },
                 score: fused_score as f64,

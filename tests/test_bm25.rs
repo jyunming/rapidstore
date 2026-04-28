@@ -478,6 +478,85 @@ fn compaction_with_docs_preserves_search() {
 }
 
 #[test]
+fn hybrid_respects_metadata_filter_on_bm25_only_slots() {
+    // Regression: search_hybrid used to pass `bm25_filter=None` AND skip the
+    // post-filter, so a slot found only by the BM25 leg could leak into results
+    // even when its metadata violated the user's filter. Verify it doesn't.
+    let dir = tempdir().unwrap();
+    let db = dir.path().to_str().unwrap();
+    let d = 16;
+    let mut engine = TurboQuantEngine::open(db, db, d, 2, 13).unwrap();
+
+    // Two docs share a rare BM25 token but differ in metadata.
+    // Doc-allow has color=red and a vector aligned with the query.
+    // Doc-deny has color=blue and an orthogonal vector — only BM25 will surface it.
+    let mut q = Array1::<f64>::zeros(d);
+    q[0] = 1.0;
+    let mut allow_v = Array1::<f64>::zeros(d);
+    allow_v[0] = 0.99;
+    let mut deny_v = Array1::<f64>::zeros(d);
+    deny_v[1] = 1.0;
+
+    let mut allow_meta = HashMap::new();
+    allow_meta.insert("color".to_string(), serde_json::Value::String("red".into()));
+    let mut deny_meta = HashMap::new();
+    deny_meta.insert(
+        "color".to_string(),
+        serde_json::Value::String("blue".into()),
+    );
+
+    engine
+        .insert_with_document(
+            "allow".into(),
+            &allow_v,
+            allow_meta,
+            Some("rare-shared-tag allow-marker".into()),
+        )
+        .unwrap();
+    engine
+        .insert_with_document(
+            "deny".into(),
+            &deny_v,
+            deny_meta,
+            Some("rare-shared-tag deny-marker".into()),
+        )
+        .unwrap();
+
+    // Filter on color=red. The dense leg will surface "allow" (and only allow,
+    // because the filter is enforced in the dense pipeline). BM25 will surface
+    // both; without the post-filter, "deny" would slip through into the fused
+    // output even though its metadata fails the predicate.
+    let mut filter = HashMap::new();
+    filter.insert("color".to_string(), serde_json::json!("red"));
+    let r = engine
+        .search_hybrid(
+            &q,
+            "rare-shared-tag",
+            10,
+            Some(&filter),
+            None,
+            false,
+            None,
+            Some(0.5),
+            Some(60.0),
+            Some(4),
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+    let ids: Vec<&str> = r.iter().map(|x| x.id.as_str()).collect();
+    assert!(
+        ids.contains(&"allow"),
+        "allow must pass the filter; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"deny"),
+        "deny must be filtered out even though BM25 matches its document; got {ids:?}"
+    );
+}
+
+#[test]
 fn hybrid_with_empty_bm25_falls_back_to_dense() {
     // Database with vectors but zero documents → BM25 is empty. search_hybrid
     // must not panic; it should return the dense leg's hits.

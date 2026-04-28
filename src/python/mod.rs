@@ -1368,9 +1368,10 @@ struct HybridArgs {
 
 /// Parse a `hybrid={"text": str, "weight": float?, "rrf_k": float?, "oversample": int?}` dict.
 ///
-/// Returns `Ok(None)` when `hybrid` is `None` or its `text` is missing/empty so the
-/// caller can fall through to the dense-only path. Defaults: weight=0.5, rrf_k=60.0,
-/// oversample=4. Unknown keys raise `ValueError` to catch typos early.
+/// Returns `Ok(None)` when `hybrid` is `None` or its `text` is empty so the caller
+/// can fall through to the dense-only path. A missing `text` key raises `ValueError`.
+/// Defaults: weight=0.5, rrf_k=60.0, oversample=4. Unknown keys raise `ValueError`
+/// to catch typos early.
 fn parse_hybrid(dict: Option<&Bound<'_, PyDict>>) -> PyResult<Option<HybridArgs>> {
     let Some(d) = dict else {
         return Ok(None);
