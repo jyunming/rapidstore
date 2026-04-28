@@ -474,7 +474,7 @@ Use `db.sync` (a property) to access the underlying synchronous `Database` for c
 
 ## RAG Integration
 
-TQDB has three Python-side surfaces for RAG pipelines:
+TQDB has five Python-side surfaces for RAG pipelines:
 
 | Use case | Class | Module |
 |---|---|---|

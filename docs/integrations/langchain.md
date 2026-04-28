@@ -17,8 +17,15 @@ its import cost.
 
 ## Quickstart
 
+The example below uses `OpenAIEmbeddings` from
+[`langchain-openai`](https://pypi.org/project/langchain-openai/), which is
+**not** part of `tqdb[langchain]` (we pin `langchain-core` only). Install
+your provider's embedding package separately, e.g.
+`pip install langchain-openai`. Any class implementing
+`langchain_core.embeddings.Embeddings` works.
+
 ```python
-from langchain_openai import OpenAIEmbeddings  # or any langchain_core.embeddings.Embeddings
+from langchain_openai import OpenAIEmbeddings  # provider package — install separately
 from tqdb.vectorstore import TurboQuantVectorStore
 
 embed = OpenAIEmbeddings()
@@ -139,5 +146,7 @@ ret = store.as_retriever()
 
 ## Supported versions
 
-The `[langchain]` extra pins `langchain-core>=0.3`. Earlier `langchain<0.3`
-versions are not tested.
+The `[langchain]` extra pins `langchain-core>=0.3`. Earlier
+`langchain-core<0.3` versions are not tested. (A user may have `langchain`
+installed at any version, but `langchain-core` is the package whose
+`VectorStore` ABC TQDB implements.)

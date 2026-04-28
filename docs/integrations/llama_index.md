@@ -17,10 +17,18 @@ the class.
 
 ## Quickstart with `VectorStoreIndex`
 
+The example uses `OpenAIEmbedding` from
+[`llama-index-embeddings-openai`](https://pypi.org/project/llama-index-embeddings-openai/),
+which is **not** part of `tqdb[llamaindex]` (we pin `llama-index-core` only).
+Install the provider package separately:
+`pip install llama-index-embeddings-openai`. Any LlamaIndex embedder works
+(`HuggingFaceEmbedding`, `OpenAIEmbedding`, etc.).
+
 ```python
-from llama_index.core import VectorStoreIndex, StorageContext, Document
-from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core import VectorStoreIndex, StorageContext
+from llama_index.core.schema import Document
 from llama_index.core import Settings
+from llama_index.embeddings.openai import OpenAIEmbedding  # provider package
 
 from tqdb.llama_index import TurboQuantVectorStore
 
@@ -118,7 +126,7 @@ Supported operators (LlamaIndex → TQDB):
 | `delete(ref_doc_id)` | LlamaIndex `delete` semantics — single ref_doc_id at a time. |
 | `delete_nodes(node_ids=None, filters=None)` | Bulk delete by IDs or by metadata filter. |
 | `clear()` | Drop every node. |
-| `persist()` | Calls `db.checkpoint()` (TQDB writes through, so this is a no-op-style flush). |
+| `persist()` | Calls `db.checkpoint()`. TQDB writes through on every operation so most state is already on disk, but `checkpoint()` itself flushes the WAL into a segment and may trigger compaction — non-trivial work. Avoid calling it on every node insert; let LlamaIndex drive `persist()` at its natural intervals. |
 | `client` | Property exposing the underlying `Database` for advanced use. |
 
 Class flags:
