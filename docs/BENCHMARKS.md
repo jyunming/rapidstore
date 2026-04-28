@@ -187,3 +187,15 @@ to 1.000** (+50 pp) over either path alone, while losing nothing on
 semantic-only queries. On lexical queries hybrid is dominated by pure BM25
 on R@1, but still recovers the gold doc in the top-10 every time, which is
 what most RAG pipelines actually consume.
+
+---
+
+## v0.8 features — what isn't yet benchmarked
+
+The v0.8 sprint added five Python-side features. Three of them have correctness coverage in the test suite but aren't yet tracked in the longitudinal perf history:
+
+- **Multi-vector / MaxSim retrieval at scale** (`MultiVectorStore`) — the v0.8 wrapper is a Python layer over the existing single-vector engine. Per-config recall and latency at 10k+ docs / 80k+ tokens are pending, and will be the headline numbers when v0.9 lands the native engine integration.
+- **`AsyncDatabase` concurrent-search throughput** — `tests/test_async_api.py` includes a 50-concurrent-search proof of parallelism but no longitudinal numbers; the actual ceiling depends on user thread-pool sizing and embedder latency.
+- **Migration toolkit throughput** (`tqdb.migrate`) — the CLI prints rows/sec per run but those numbers aren't tracked in perf_history. For now, expect rates close to a plain `Database.insert_batch` loop on the same hardware.
+
+LangChain / LlamaIndex / hybrid-via-integration overhead is also not benchmarked separately. The wrappers add a small Python-layer cost per call (one filter-dict translation + one numpy conversion) which has been negligible in practice on the 1k-5k corpora the test suite uses.

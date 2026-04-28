@@ -35,9 +35,30 @@ maturin develop --release
 # Rust unit tests
 cargo test -q --lib
 
-# Python test suite
+# Python test suite (some files require optional integration deps — see below)
 pytest tests/ -v
 ```
+
+#### Test layout (post v0.8)
+
+| File | Tests | Required extra | Auto-skips? |
+|---|---|---|---|
+| `tests/test_async_api.py` | 9 | none (async is core) | n/a |
+| `tests/test_multivector.py` | 10 | none | n/a |
+| `tests/test_python_hybrid.py` | 14 | none | n/a |
+| `tests/test_langchain_compat.py` | 9 | `tqdb[langchain]` | yes (`pytest.importorskip("langchain_core")`) |
+| `tests/test_llama_index.py` | 9 | `tqdb[llamaindex]` | yes (`pytest.importorskip("llama_index.core")`) |
+| `tests/test_migrate.py` | 8 | `tqdb[migrate]` | no — fails on import without it |
+
+For the full 59-test run install all extras at once:
+
+```bash
+pip install -e '.[migrate,langchain,llamaindex]'
+pytest tests/
+```
+
+CI runs the full suite. Local development without an extra installed will see
+its tests skip (or fail at import, for `test_migrate.py`); both are acceptable.
 
 ---
 

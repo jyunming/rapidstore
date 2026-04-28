@@ -21,7 +21,7 @@ Two deployment modes:
 - **Optional ANN index** — Build an HNSW graph after loading data for fast approximate search.
 - **Hybrid retrieval** — Built-in BM25 keyword index fuses with dense search via RRF (`db.search(..., hybrid={"text": "..."})`). Pure-dense behaviour is unchanged when the kwarg is omitted.
 - **Multi-vector / ColBERT** — `MultiVectorStore` for late-interaction retrieval with N token vectors per document and MaxSim scoring (`Σ_i max_j <q_i, d_j>`). See [`docs/MULTI_VECTOR.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/MULTI_VECTOR.md).
-- **Framework integrations** — native `VectorStore` for [LangChain v2](https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md#rag-integration) and [LlamaIndex](https://github.com/jyunming/TurboQuantDB/blob/main/docs/integrations/llama_index.md), plus an asyncio-friendly `AsyncDatabase`.
+- **Framework integrations** — native `VectorStore` for [LangChain v2](https://github.com/jyunming/TurboQuantDB/blob/main/docs/integrations/langchain.md) and [LlamaIndex](https://github.com/jyunming/TurboQuantDB/blob/main/docs/integrations/llama_index.md), plus an asyncio-friendly `AsyncDatabase`.
 - **Drop-in migration** — `python -m tqdb.migrate {chroma|lancedb} <src> <dst>` imports an existing collection in one command. See [`docs/MIGRATION.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/MIGRATION.md).
 - **Metadata filtering** — MongoDB-style filter operators on any metadata field.
 - **Crash recovery** — Write-ahead log (WAL) ensures durability without explicit flushing.
@@ -32,10 +32,18 @@ Two deployment modes:
 ## Installation
 
 ```bash
-pip install tqdb
+pip install tqdb                       # core engine + Python API
+
+# Optional integrations (install only what you need):
+pip install 'tqdb[langchain]'          # LangChain v2 VectorStore
+pip install 'tqdb[llamaindex]'         # LlamaIndex BasePydanticVectorStore
+pip install 'tqdb[migrate]'            # Chroma + LanceDB import toolkit
+pip install 'tqdb[migrate-chroma]'     # Chroma migrator only
+pip install 'tqdb[migrate-lancedb]'    # LanceDB migrator only
 ```
 
 Building from source (Rust toolchain required): see [`DEVELOPMENT.md`](https://github.com/jyunming/TurboQuantDB/blob/main/DEVELOPMENT.md).
+Upgrading from v0.7? See [`docs/WHAT_S_NEW_0_8.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/WHAT_S_NEW_0_8.md).
 
 ---
 

@@ -45,7 +45,21 @@ cargo test -q --lib
 cargo test --test integration_tests
 cargo test --test bench_search
 cargo test --test bench_batch_crud
+cargo test --test test_bm25                # v0.7 BM25 + hybrid integration
+cargo test --test test_multi_vector        # if/when v0.9 lands native multi-vector
 
+# Full Python test suite (requires optional integration deps)
+maturin develop --release
+pip install -e '.[migrate,langchain,llamaindex]'
+pytest tests/                              # 59 Python tests across 6 files
+```
+
+The integration test files (`test_langchain_compat.py`, `test_llama_index.py`,
+`test_migrate.py`) auto-skip when their corresponding extra isn't installed via
+`pytest.importorskip(...)`, so a partial install just runs a smaller suite — it
+doesn't fail. CI installs all extras so the full suite runs there.
+
+```bash
 # Python quality gate (requires maturin develop first)
 python benchmarks/ci_quality_gate.py   # min recall 0.60, max latency 100ms
 ```

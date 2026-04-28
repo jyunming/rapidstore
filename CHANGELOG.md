@@ -8,6 +8,8 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ## [0.8.0] — 2026-04-28
 
+> Release overview + upgrade notes: [`docs/WHAT_S_NEW_0_8.md`](docs/WHAT_S_NEW_0_8.md).
+
 ### Added
 
 - **`MultiVectorStore` (ColBERT-style late-interaction retrieval)** — new `python/tqdb/multivector.py`. Each document gets N token vectors; queries score via MaxSim (`Σ_i max_j <q_i, d_j>`). Python-layer wrapper over the existing single-vector engine: token vectors are stored as regular slots, a JSON sidecar maps `doc_id → [token_id]`, raw float32 token vectors live in a `.npz` sidecar for exact MaxSim. Public API: `MultiVectorStore.open(path, dimension, bits=4, metric="cosine")`, `insert(doc_id, vectors, document, metadata)`, `search(query_vectors, top_k, oversample=4, candidate_filter=None)`, `delete(doc_id)`, `get(doc_id)`. A future v0.9 native engine path will replace the wrapper while keeping the public API stable. Documented in `docs/MULTI_VECTOR.md`.
