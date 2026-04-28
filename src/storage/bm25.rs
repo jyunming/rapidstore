@@ -409,4 +409,52 @@ mod tests {
         let idx = Bm25Index::open(p).unwrap();
         assert_eq!(idx.n_docs(), 0);
     }
+
+    #[test]
+    fn flush_tmp_orphan_is_ignored() {
+        // A crash mid-flush can leave a `bm25.idx.tmp` next to a missing
+        // `bm25.idx`. Open() must NOT pick up the tmp file; it should yield
+        // an empty index and let the next flush overwrite it.
+        let d = tempdir().unwrap();
+        let final_path = d.path().join("bm25.idx");
+        let tmp_path = d.path().join("bm25.idx.tmp");
+        // Pre-populate the tmp with garbage that would crash bincode if loaded.
+        std::fs::write(&tmp_path, b"M2BX\xff\xff\xff\xff\xff\xff\xff\xffNOT_VALID").unwrap();
+        // Final file does NOT exist yet — this simulates the dead-process state.
+        assert!(!final_path.exists());
+
+        let idx = Bm25Index::open(final_path.clone()).unwrap();
+        assert_eq!(
+            idx.n_docs(),
+            0,
+            "must not load anything from the orphan tmp"
+        );
+
+        // The tmp file is allowed to linger; the next flush will overwrite-then-rename it.
+        // Verify the next flush succeeds and produces a valid final file.
+        let mut idx = idx;
+        idx.put(0, "smoke");
+        idx.flush().unwrap();
+        assert!(
+            final_path.exists(),
+            "flush should have produced a final bm25.idx"
+        );
+    }
+
+    #[test]
+    fn truncated_payload_is_treated_as_empty() {
+        // Valid magic bytes but truncated payload — bincode deserialization
+        // should fail and the index should fall back to empty rather than panic.
+        let d = tempdir().unwrap();
+        let p = d.path().join("bm25.idx");
+        // magic + length=1000 (LE u64) but only 4 bytes of "payload" follow
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"M2BX");
+        bytes.extend_from_slice(&1000u64.to_le_bytes());
+        bytes.extend_from_slice(b"abcd");
+        std::fs::write(&p, &bytes).unwrap();
+
+        let idx = Bm25Index::open(p).unwrap();
+        assert_eq!(idx.n_docs(), 0);
+    }
 }

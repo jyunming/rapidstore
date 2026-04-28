@@ -297,6 +297,233 @@ fn hybrid_weight_zero_matches_dense_only() {
 }
 
 #[test]
+fn slot_reuse_does_not_leak_doc() {
+    // Insert id "alice" with doc-A, delete alice, then insert "bob" with doc-B.
+    // Bob may end up in the same slot alice vacated; whether or not the slot is
+    // physically reused, BM25 must not associate alice's tokens with bob.
+    let dir = tempdir().unwrap();
+    let db = dir.path().to_str().unwrap();
+    let d = 16;
+    let mut engine = TurboQuantEngine::open(db, db, d, 2, 5).unwrap();
+
+    // Tokens must be single alphanumeric words; the tokenizer splits on
+    // non-alphanumeric chars, so "alpha-uniq" would become ["alpha", "uniq"]
+    // and any shared substring would create false positives.
+    engine
+        .insert_with_document(
+            "alice".into(),
+            &make_vec(d, 0.1),
+            HashMap::new(),
+            Some("alphaword alicemarker".into()),
+        )
+        .unwrap();
+    engine.delete("alice".into()).unwrap();
+    engine
+        .insert_with_document(
+            "bob".into(),
+            &make_vec(d, 0.2),
+            HashMap::new(),
+            Some("betaword bobmarker".into()),
+        )
+        .unwrap();
+
+    // Alice's tokens must not surface bob.
+    let r_alpha = engine.search_bm25("alphaword", 10, None).unwrap();
+    let alpha_ids: Vec<&str> = r_alpha.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(
+        !alpha_ids.contains(&"bob"),
+        "bob inherited alice's tokens; alphaword returned {alpha_ids:?}"
+    );
+    let r_marker = engine.search_bm25("alicemarker", 10, None).unwrap();
+    assert!(
+        r_marker.is_empty(),
+        "alicemarker should hit nothing after alice was deleted; got {r_marker:?}"
+    );
+    // Bob's tokens must work normally.
+    let r_beta = engine.search_bm25("betaword", 10, None).unwrap();
+    let beta_ids: Vec<&str> = r_beta.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(
+        beta_ids.contains(&"bob"),
+        "betaword did not return bob; got {beta_ids:?}"
+    );
+}
+
+#[test]
+fn cold_start_rebuild_matches_persisted() {
+    // Open, insert, close → bm25.idx is persisted. Reopen capture A.
+    // Delete bm25.idx, reopen → rebuild from metadata.iter_docs(). Capture B.
+    // The two captures must yield the same top-K IDs in the same order.
+    let dir = tempdir().unwrap();
+    let db = dir.path().to_str().unwrap();
+    let d = 16;
+    {
+        let mut engine = TurboQuantEngine::open(db, db, d, 2, 99).unwrap();
+        for i in 0..20u32 {
+            engine
+                .insert_with_document(
+                    format!("doc-{i}"),
+                    &make_vec(d, i as f64 * 0.01),
+                    HashMap::new(),
+                    Some(format!("shared-tag rare-{i} mid-{}", i % 3)),
+                )
+                .unwrap();
+        }
+        engine.close().unwrap();
+    }
+
+    // Reopen with persisted bm25.idx — the "fast path".
+    let persisted_results = {
+        let engine = TurboQuantEngine::open(db, db, d, 2, 99).unwrap();
+        engine.search_bm25("shared-tag mid-1", 10, None).unwrap()
+    };
+
+    // Now delete bm25.idx and reopen — forces the cold-start rebuild path.
+    let bm25_path = dir.path().join("bm25.idx");
+    assert!(
+        bm25_path.exists(),
+        "bm25.idx should have been written by close()"
+    );
+    std::fs::remove_file(&bm25_path).unwrap();
+
+    let rebuilt_results = {
+        let engine = TurboQuantEngine::open(db, db, d, 2, 99).unwrap();
+        engine.search_bm25("shared-tag mid-1", 10, None).unwrap()
+    };
+
+    // Compare by ID→score map: the partial sort breaks ties unstably, so the
+    // exact ordering may differ across runs even when the underlying index is
+    // identical. The right correctness check is "same docs surface, with the
+    // same scores."
+    let p_map: std::collections::HashMap<String, f32> = persisted_results
+        .iter()
+        .map(|(s, sc)| (s.clone(), *sc))
+        .collect();
+    let r_map: std::collections::HashMap<String, f32> = rebuilt_results
+        .iter()
+        .map(|(s, sc)| (s.clone(), *sc))
+        .collect();
+
+    // Every doc in the persisted result whose score is strictly above the
+    // tie threshold (the lowest score in the rebuilt set) must also appear
+    // in the rebuilt set with the same score. Tied docs at the cutoff may
+    // swap which side of top-10 they land on; that's acceptable.
+    let cutoff_rebuilt = rebuilt_results.last().map(|(_, s)| *s).unwrap_or(0.0);
+    for (id_p, score_p) in &p_map {
+        if *score_p > cutoff_rebuilt + 1e-5 {
+            let score_r = r_map.get(id_p).unwrap_or_else(|| {
+                panic!(
+                    "doc {id_p} (score {score_p}) is strictly above cutoff {cutoff_rebuilt} \
+                     but missing from rebuilt set; rebuild must have produced different data"
+                );
+            });
+            assert!(
+                (score_p - score_r).abs() < 1e-5,
+                "score drift on {id_p}: persisted={score_p} rebuilt={score_r}"
+            );
+        }
+    }
+    // And the top-1 must be identical (no ties at the very top in this corpus).
+    assert_eq!(
+        persisted_results[0].0, rebuilt_results[0].0,
+        "top-1 differs: persisted={} rebuilt={}",
+        persisted_results[0].0, rebuilt_results[0].0
+    );
+}
+
+#[test]
+fn compaction_with_docs_preserves_search() {
+    // Insert 20 docs with documents, delete half, force a compaction via
+    // flush_wal_to_segment (which calls live_compact_slab when has_pending_deletes).
+    // After compaction, BM25 has been remapped/rebuilt; search results from the
+    // surviving docs must still be returnable by their unique tokens.
+    let dir = tempdir().unwrap();
+    let db = dir.path().to_str().unwrap();
+    let d = 16;
+    let mut engine = TurboQuantEngine::open(db, db, d, 2, 7).unwrap();
+
+    for i in 0..20u32 {
+        engine
+            .insert_with_document(
+                format!("d{i}"),
+                &make_vec(d, i as f64 * 0.01),
+                HashMap::new(),
+                Some(format!("common-word unique-tag-{i}")),
+            )
+            .unwrap();
+    }
+    // Delete every other doc.
+    for i in (0..20u32).step_by(2) {
+        let ok = engine.delete(format!("d{i}")).unwrap();
+        assert!(ok, "delete d{i} returned false");
+    }
+
+    // Force compaction. This must run live_compact_slab under the hood
+    // (has_pending_deletes is set by delete()).
+    engine.flush_wal_to_segment().unwrap();
+
+    // Surviving docs (odd-numbered) must still be findable by their unique tag.
+    let r = engine.search_bm25("unique-tag-7", 10, None).unwrap();
+    let ids: Vec<&str> = r.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(
+        ids.contains(&"d7"),
+        "d7 should survive compaction and be findable; got {ids:?}"
+    );
+    // Deleted docs must not surface.
+    let r0 = engine.search_bm25("unique-tag-0", 10, None).unwrap();
+    let ids0: Vec<&str> = r0.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(
+        !ids0.contains(&"d0"),
+        "d0 was deleted before compaction but still appears in search; got {ids0:?}"
+    );
+}
+
+#[test]
+fn hybrid_with_empty_bm25_falls_back_to_dense() {
+    // Database with vectors but zero documents → BM25 is empty. search_hybrid
+    // must not panic; it should return the dense leg's hits.
+    let dir = tempdir().unwrap();
+    let db = dir.path().to_str().unwrap();
+    let d = 16;
+    let mut engine = TurboQuantEngine::open(db, db, d, 2, 11).unwrap();
+    for i in 0..5u32 {
+        // Insert without a document.
+        engine
+            .insert(
+                format!("v{i}"),
+                &make_vec(d, i as f64 * 0.05),
+                HashMap::new(),
+            )
+            .unwrap();
+    }
+    assert_eq!(engine.bm25_doc_count(), 0);
+
+    let q = make_vec(d, 0.0);
+    let results = engine
+        .search_hybrid(
+            &q,
+            "anything",
+            3,
+            None,
+            None,
+            false,
+            None,
+            Some(0.5),
+            Some(60.0),
+            Some(4),
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+    // Empty BM25 contributes nothing to RRF; output is the dense leg's top-K.
+    assert!(
+        !results.is_empty(),
+        "hybrid with empty BM25 should still return dense results"
+    );
+    assert!(results.len() <= 3);
+}
+
+#[test]
 fn bm25_doc_count_is_zero_when_no_documents_inserted() {
     let dir = tempdir().unwrap();
     let db = dir.path().to_str().unwrap();
