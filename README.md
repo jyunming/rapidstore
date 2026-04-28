@@ -32,10 +32,18 @@ Two deployment modes:
 ## Installation
 
 ```bash
-pip install tqdb
+pip install tqdb                       # core engine + Python API
+
+# Optional integrations (install only what you need):
+pip install 'tqdb[langchain]'          # LangChain v2 VectorStore
+pip install 'tqdb[llamaindex]'         # LlamaIndex BasePydanticVectorStore
+pip install 'tqdb[migrate]'            # Chroma + LanceDB import toolkit
+pip install 'tqdb[migrate-chroma]'     # Chroma migrator only
+pip install 'tqdb[migrate-lancedb]'    # LanceDB migrator only
 ```
 
 Building from source (Rust toolchain required): see [`DEVELOPMENT.md`](https://github.com/jyunming/TurboQuantDB/blob/main/DEVELOPMENT.md).
+Upgrading from v0.7? See [`docs/WHAT_S_NEW_0_8.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/WHAT_S_NEW_0_8.md).
 
 ---
 

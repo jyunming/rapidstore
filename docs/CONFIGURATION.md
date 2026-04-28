@@ -199,6 +199,40 @@ results = db.search(query, top_k=10, _use_ann=True)
 
 ---
 
+## Multi-vector mode (v0.8)
+
+`MultiVectorStore` (see [`docs/MULTI_VECTOR.md`](MULTI_VECTOR.md)) is a Python-layer
+wrapper over `Database`. Every parameter above (`bits`, `metric`, `quantizer_type`, …)
+applies identically — the wrapper just adds doc-id-grouping sidecars on top.
+
+Recommended starting config for ColBERTv2-style late interaction:
+
+| Parameter | Value | Why |
+|---|---|---|
+| `dimension` | 96 (ColBERTv2) or 128 (ColBERT) | per-token dim of the model |
+| `bits` | 4 | good recall at modest disk |
+| `metric` | `"cosine"` | ColBERT vectors are unit-normalised |
+| `quantizer_type` | `"dense"` (default) | best recall |
+
+The wrapper rejects `metric="l2"` at construction — MaxSim is a dot-product
+aggregation that doesn't generalise cleanly to lower-is-better metrics.
+
+## Async executor tuning (v0.8)
+
+`AsyncDatabase` (see [`docs/PYTHON_API.md` — Async API](PYTHON_API.md#async-api))
+takes two construction-time knobs that aren't on `Database.open`:
+
+| Kwarg | Default | When to override |
+|---|---|---|
+| `executor` | None (auto-create) | Pass an external `ThreadPoolExecutor` to share a pool across multiple `AsyncDatabase` instances. External pools are not shut down on `close()`. |
+| `max_workers` | `min(32, cpu_count + 4)` | Override the auto-pool size. Ignored when `executor=` is supplied. |
+
+The default sizing matches Python 3.13's standard `ThreadPoolExecutor` heuristic.
+Raise it for heavy concurrent-search workloads on machines with many cores; lower
+it on memory-constrained hosts.
+
+---
+
 ## Decision Flowchart
 
 ```

@@ -25,8 +25,26 @@ This matrix tracks practical API/behavior parity against common embedded RAG vec
 | Multi-tenant service auth/RBAC | Yes | Persisted API keys, principals, role bindings. |
 | Quota controls | Yes | Collections, vectors, disk, concurrent jobs. |
 
+## Integration Version Matrix
+
+Versions pinned in [`pyproject.toml`](../pyproject.toml). Install the matching extra to pull in the third-party library and enable the corresponding TQDB module.
+
+| Integration | Min version | TQDB extra | Module |
+|---|---|---|---|
+| Python | 3.10 | (built into wheel) | — |
+| LangChain | `langchain-core>=0.3` | `tqdb[langchain]` | `tqdb.vectorstore.TurboQuantVectorStore` |
+| LlamaIndex | `llama-index-core>=0.10` | `tqdb[llamaindex]` | `tqdb.llama_index.TurboQuantVectorStore` |
+| Chroma (migrator) | `chromadb>=0.5` | `tqdb[migrate]` / `tqdb[migrate-chroma]` | `tqdb.migrate.migrate_chroma` |
+| LanceDB (migrator) | `lancedb>=0.10` | `tqdb[migrate]` / `tqdb[migrate-lancedb]` | `tqdb.migrate.migrate_lancedb` |
+
+The integration modules import their third-party deps **lazily** — TQDB never pulls
+them in at top-level import time. A user who installs plain `pip install tqdb` and
+never touches `tqdb.vectorstore` / `tqdb.llama_index` / `tqdb.migrate` doesn't pay
+their import cost.
+
 ## Known Gaps / Follow-ups
 
 - Additional protocol-level compatibility shims may still be needed for drop-in client replacement.
 - Full workload validation is pending comprehensive user-side test plan.
+- LangChain / LlamaIndex compatibility is tested against the pinned versions above; older versions are not tested. No async / streaming integration wrappers yet for either framework — `AsyncDatabase` is a separate facade that doesn't yet have LangChain/LlamaIndex async parity.
 

@@ -2,6 +2,24 @@
 
 Optional Axum HTTP service providing TurboQuantDB in multi-tenant server mode. Use this when you need REST API access, multi-tenancy, authentication, quotas, or async job management. For single-process Python use, the embedded `tqdb` package is simpler.
 
+## v0.8 feature availability
+
+The v0.8 sprint shipped five Python-side features. Most are **embedded-Python only**
+— they don't have HTTP equivalents on the server. Use the embedded `tqdb` package
+when you need them.
+
+| Feature | Embedded Python | HTTP server |
+|---|---|---|
+| LangChain `TurboQuantVectorStore` (`tqdb.vectorstore`) | yes | no — use embedded mode |
+| LlamaIndex `TurboQuantVectorStore` (`tqdb.llama_index`) | yes | no — use embedded mode |
+| `MultiVectorStore` ColBERT (`tqdb.multivector`) | yes | no — uses embedded sidecar files |
+| `AsyncDatabase` (`tqdb.aio`) | yes | n/a — server is already async (Axum/Tokio) |
+| Migration toolkit (`tqdb.migrate`, CLI) | yes | n/a — offline batch tool |
+| BM25 hybrid (`db.search(..., hybrid={...})`, v0.7) | yes | yes — `hybrid` field in `/query` request |
+
+Bridging integrations into server mode is a v0.9-or-later candidate; the embedded
+mode is canonical for those workflows today.
+
 ## Installation
 
 The server binary ships pre-built inside the `tqdb` wheel on all supported platforms
