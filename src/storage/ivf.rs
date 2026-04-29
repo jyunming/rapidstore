@@ -151,9 +151,21 @@ impl IvfIndex {
     /// Return sorted candidate slots for a query using nprobe clusters.
     ///
     /// `y_query`: the query already rotated into SRHT space (n-dimensional).
+    ///
+    /// `nprobe` is clamped to `[1, self.k]` — passing 0 still probes the single
+    /// best cluster (treated as "minimum useful work"); passing > k probes all
+    /// clusters. If the index has zero clusters (degenerate `build()` call),
+    /// returns an empty vec.
     pub fn probe(&self, y_query: &[f32], nprobe: usize) -> Vec<u32> {
         debug_assert_eq!(y_query.len(), self.n);
-        let nprobe = nprobe.min(self.k);
+        if self.k == 0 {
+            return Vec::new();
+        }
+        // A4 (v0.8.2 audit): clamp nprobe to >=1 so we always probe at least
+        // one cluster. nprobe=0 previously called select_nth_unstable_by(0, ...)
+        // which is defined but useless (returns the smallest score); engine
+        // callers depend on getting at least one cluster's worth of candidates.
+        let nprobe = nprobe.max(1).min(self.k);
 
         // Score query against all k centroids.
         let mut centroid_scores: Vec<(u32, f32)> = (0..self.k as u32)
@@ -275,4 +287,196 @@ fn lcg_next(state: u64) -> u64 {
     state
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Build a simple `codes_bytes` array with `n_slots` records, each carrying
+    /// the same all-zero MSE codes. Tests that need varying codes should write
+    /// directly into the returned buffer.
+    fn make_codes(n_slots: usize, mse_len: usize) -> Vec<u8> {
+        vec![0u8; n_slots * mse_len]
+    }
+
+    /// Centroids of size `2^bits` mapping index → centroid value.
+    fn linear_centroids(bits: usize) -> Vec<f32> {
+        let n = 1 << bits;
+        (0..n).map(|i| i as f32 - (n as f32 / 2.0)).collect()
+    }
+
+    /// Tiny build-able fixture: 4-bit MSE, 8 dims, 4 byte stride per slot.
+    fn fixture_params() -> (usize, usize, usize, usize, Vec<f32>) {
+        let bits = 4;
+        let n = 8;
+        let mse_len = (n * bits + 7) / 8; // 4 bytes for n=8 b=4
+        let stride = mse_len;
+        (bits, n, mse_len, stride, linear_centroids(bits))
+    }
+
+    /// A4: zero-cluster IVF returns empty probe results without panicking.
+    #[test]
+    fn probe_on_zero_cluster_index_returns_empty() {
+        let ivf = IvfIndex {
+            centroids: Vec::new(),
+            n: 8,
+            k: 0,
+            cluster_map: Vec::new(),
+            cluster_index: Vec::new(),
+        };
+        let q = vec![0.0f32; 8];
+        let probed = ivf.probe(&q, 4);
+        assert!(probed.is_empty(), "k=0 IVF must return empty probe");
+    }
+
+    /// A4: probe with nprobe=0 still probes at least one cluster (clamped to 1).
+    #[test]
+    fn probe_with_zero_nprobe_clamps_to_one_cluster() {
+        let (bits, n, mse_len, stride, centroids) = fixture_params();
+        let n_slots = 16;
+        let codes = make_codes(n_slots, mse_len);
+        let active: Vec<u32> = (0..n_slots as u32).collect();
+        let ivf = IvfIndex::build(
+            &codes, &active, stride, mse_len, n, bits, &centroids, 4, 5, 42,
+        );
+        let q = vec![1.0f32; n];
+        let probed = ivf.probe(&q, 0);
+        assert!(
+            !probed.is_empty(),
+            "nprobe=0 should clamp to 1 and return at least one cluster's slots"
+        );
+    }
+
+    /// C1: build with the same code for every slot puts everything in one cluster.
+    #[test]
+    fn build_assigns_all_slots_to_some_cluster() {
+        let (bits, n, mse_len, stride, centroids) = fixture_params();
+        let n_slots = 32;
+        let codes = make_codes(n_slots, mse_len);
+        let active: Vec<u32> = (0..n_slots as u32).collect();
+        let ivf = IvfIndex::build(
+            &codes, &active, stride, mse_len, n, bits, &centroids, 4, 10, 42,
+        );
+
+        // Every slot should be assigned to some cluster (no slot left unassigned).
+        assert_eq!(ivf.cluster_map.len(), n_slots);
+        for &cid in &ivf.cluster_map {
+            assert!(
+                (cid as usize) < ivf.k,
+                "cluster id {cid} out of bounds (k={})",
+                ivf.k
+            );
+        }
+
+        // Every assigned slot appears in exactly one cluster's slot list.
+        let total: usize = ivf.cluster_index.iter().map(|c| c.len()).sum();
+        assert_eq!(
+            total, n_slots,
+            "every slot must appear in exactly one cluster"
+        );
+    }
+
+    /// C1: build with k > n_slots silently clamps k to n_slots.
+    #[test]
+    fn build_clamps_k_to_n_slots() {
+        let (bits, n, mse_len, stride, centroids) = fixture_params();
+        let n_slots = 5;
+        let codes = make_codes(n_slots, mse_len);
+        let active: Vec<u32> = (0..n_slots as u32).collect();
+        let ivf = IvfIndex::build(
+            &codes, &active, stride, mse_len, n, bits, &centroids, 100, 5, 42,
+        );
+        // k clamps to n_slots when k > n_slots.
+        assert!(
+            ivf.k <= n_slots,
+            "k must be clamped to n_slots; got k={}",
+            ivf.k
+        );
+    }
+
+    /// C1: empty active_slots returns a degenerate but non-panicking IVF.
+    #[test]
+    fn build_with_no_active_slots_returns_empty_clusters() {
+        let (bits, n, mse_len, stride, centroids) = fixture_params();
+        let codes: Vec<u8> = Vec::new();
+        let active: Vec<u32> = Vec::new();
+        let ivf = IvfIndex::build(
+            &codes, &active, stride, mse_len, n, bits, &centroids, 4, 5, 42,
+        );
+        assert!(ivf.cluster_map.is_empty());
+        assert_eq!(ivf.k, 4);
+    }
+
+    /// C1: probe results are unique and sorted.
+    #[test]
+    fn probe_returns_unique_sorted_slots() {
+        let (bits, n, mse_len, stride, centroids) = fixture_params();
+        let n_slots = 32;
+        // Vary codes per slot so clusters actually separate.
+        let mut codes = make_codes(n_slots, mse_len);
+        for slot in 0..n_slots {
+            codes[slot * mse_len] = (slot % 16) as u8;
+        }
+        let active: Vec<u32> = (0..n_slots as u32).collect();
+        let ivf = IvfIndex::build(
+            &codes, &active, stride, mse_len, n, bits, &centroids, 4, 10, 42,
+        );
+        let q = vec![1.0f32; n];
+        let probed = ivf.probe(&q, 2);
+
+        let mut sorted = probed.clone();
+        sorted.sort_unstable();
+        assert_eq!(probed, sorted, "probe results should be sorted ascending");
+
+        let mut deduped = probed.clone();
+        deduped.dedup();
+        assert_eq!(probed.len(), deduped.len(), "probe results must be unique");
+    }
+
+    /// C1: probe with nprobe == k returns all slots in some order.
+    #[test]
+    fn probe_nprobe_at_k_returns_all_slots() {
+        let (bits, n, mse_len, stride, centroids) = fixture_params();
+        let n_slots = 16;
+        let codes = make_codes(n_slots, mse_len);
+        let active: Vec<u32> = (0..n_slots as u32).collect();
+        let ivf = IvfIndex::build(
+            &codes, &active, stride, mse_len, n, bits, &centroids, 4, 10, 42,
+        );
+        let q = vec![1.0f32; n];
+        let probed = ivf.probe(&q, ivf.k);
+        assert_eq!(probed.len(), n_slots, "nprobe=k must return every slot");
+    }
+
+    /// C1: save/load round-trip preserves the index.
+    #[test]
+    fn save_load_roundtrip_preserves_index() {
+        let (bits, n, mse_len, stride, centroids) = fixture_params();
+        let n_slots = 16;
+        let codes = make_codes(n_slots, mse_len);
+        let active: Vec<u32> = (0..n_slots as u32).collect();
+        let ivf = IvfIndex::build(
+            &codes, &active, stride, mse_len, n, bits, &centroids, 4, 5, 42,
+        );
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ivf.bin");
+        ivf.save(&path).unwrap();
+        let loaded = IvfIndex::load(&path).unwrap();
+        assert_eq!(loaded.k, ivf.k);
+        assert_eq!(loaded.n, ivf.n);
+        assert_eq!(loaded.cluster_map, ivf.cluster_map);
+        assert_eq!(loaded.centroids, ivf.centroids);
+    }
+
+    /// C1: loading a file without IVF magic returns an error.
+    #[test]
+    fn load_rejects_bad_magic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ivf.bin");
+        std::fs::write(&path, b"NOTIVF__").unwrap();
+        let result = IvfIndex::load(&path);
+        assert!(result.is_err(), "bad magic should be rejected");
+    }
 }

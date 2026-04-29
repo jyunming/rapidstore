@@ -3219,6 +3219,11 @@ impl TurboQuantEngine {
         &mut self,
         n_clusters: usize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // A4 (v0.8.2 audit): n_clusters=0 produces a degenerate empty IVF
+        // index that probe() can't use; reject early with a clear message.
+        if n_clusters == 0 {
+            return Err("create_coarse_index requires n_clusters >= 1".into());
+        }
         let active_slots = self.id_pool.iter_active_slots();
         if active_slots.is_empty() {
             return Ok(());

@@ -461,4 +461,25 @@ mod tests {
             assert!(s == 1.0 || s == -1.0, "sign should be ±1, got {}", s);
         }
     }
+
+    /// C4 (v0.8.2 audit): b=1 produces 2 centroids and quantize/dequantize is
+    /// stable (no panic, finite output). The 1-bit path is rarely exercised
+    /// in production but is supported.
+    #[test]
+    fn quantize_dequantize_with_b1_is_stable() {
+        let d = 16;
+        let q = MseQuantizer::new(d, 1, 7);
+        assert_eq!(q.centroids.len(), 2, "b=1 → 2 centroids");
+
+        let x: Vec<f32> = (0..d).map(|i| (i as f32 * 0.05) - 0.4).collect();
+        let indices = q.quantize(&x);
+        assert_eq!(indices.len(), q.n);
+        for &idx in &indices {
+            assert!((idx as usize) < q.centroids.len(), "b=1 idx in {{0,1}}");
+        }
+        let recon = q.dequantize(&indices);
+        for v in recon.iter() {
+            assert!(v.is_finite(), "b=1 dequantize must stay finite, got {v}");
+        }
+    }
 }

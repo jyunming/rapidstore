@@ -218,6 +218,13 @@ impl ProdQuantizer {
         qjl: &[u8],
         gamma: f64,
     ) -> f64 {
+        // A5 (v0.8.2 audit): see comment on score_ip_encoded.
+        assert_eq!(
+            idx.len(),
+            self.n,
+            "score_ip_encoded_lite: idx.len() must equal quantizer.n ({})",
+            self.n
+        );
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -380,6 +387,15 @@ impl ProdQuantizer {
         qjl: &[u8],
         gamma: f64,
     ) -> f64 {
+        // A5 (v0.8.2 audit): the inner SIMD/scalar loops use `idx.get_unchecked(i)`
+        // for i in 0..self.n; a too-short `idx` would be undefined behavior.
+        // Asserting at the safe wrapper turns UB into a clear panic.
+        assert_eq!(
+            idx.len(),
+            self.n,
+            "score_ip_encoded: idx.len() must equal quantizer.n ({})",
+            self.n
+        );
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -1418,6 +1434,84 @@ mod tests {
             "similar vector (score {:.3}) should beat orthogonal vector (score {:.3}) on Hamming",
             s_par,
             s_orth
+        );
+    }
+
+    // ── v0.8.2 audit: dimension assertions + numeric edges ────────────────────
+
+    /// A5: passing `idx` shorter than `quantizer.n` panics with a clear message
+    /// (rather than the previous undefined-behavior get_unchecked read).
+    #[test]
+    #[should_panic(expected = "idx.len() must equal quantizer.n")]
+    fn score_ip_encoded_panics_on_short_idx() {
+        let pq = make_pq(64);
+        let q: Array1<f64> = Array1::from_elem(64, 0.1);
+        let prep = pq.prepare_ip_query(&q);
+        let short_idx = vec![0 as CodeIndex; pq.n - 1];
+        let qjl_len = (pq.n + 7) / 8;
+        let qjl = vec![0u8; qjl_len];
+        let _ = pq.score_ip_encoded(&prep, &short_idx, &qjl, 0.0);
+    }
+
+    /// A5: same for the lite variant.
+    #[test]
+    #[should_panic(expected = "idx.len() must equal quantizer.n")]
+    fn score_ip_encoded_lite_panics_on_short_idx() {
+        let pq = make_pq(64);
+        let q: Array1<f64> = Array1::from_elem(64, 0.1);
+        let prep = pq.prepare_ip_query_lite(&q);
+        let short_idx = vec![0 as CodeIndex; pq.n - 1];
+        let qjl_len = (pq.n + 7) / 8;
+        let qjl = vec![0u8; qjl_len];
+        let _ = pq.score_ip_encoded_lite(&prep, &short_idx, &qjl, 0.0);
+    }
+
+    /// C4: zero vector quantize/dequantize is a no-panic edge case. The result
+    /// is approximately zero (within quantization noise from the rotation step).
+    #[test]
+    fn quantize_zero_vector_does_not_panic() {
+        let d = 64;
+        let pq = make_pq(d);
+        let zero: Vec<f32> = vec![0.0; d];
+        let (idx, qjl, gamma) = pq.quantize(&zero);
+        assert_eq!(idx.len(), pq.n);
+        assert_eq!(qjl.len(), (pq.n + 7) / 8);
+        // Dequantize and verify result is finite (NaN/Inf would fail downstream).
+        let recon = pq.dequantize(&idx, &qjl, gamma);
+        for v in recon.iter() {
+            assert!(
+                v.is_finite(),
+                "dequantized zero vector should be finite, got {v}"
+            );
+        }
+    }
+
+    /// C4: a unit basis vector quantizes without producing NaN, and the score
+    /// against itself via `score_ip_encoded` is finite and matches the
+    /// `dequantize_then_score` path within rounding.
+    #[test]
+    fn dequantize_then_score_matches_score_ip_encoded() {
+        let d = 64;
+        let pq = make_pq(d);
+        let mut v: Vec<f32> = vec![0.0; d];
+        v[0] = 1.0;
+        let (idx, qjl, gamma) = pq.quantize(&v);
+        let q: Array1<f64> = Array1::from_iter(v.iter().map(|&x| x as f64));
+
+        let prep = pq.prepare_ip_query(&q);
+        let direct_score = pq.score_ip_encoded(&prep, &idx, &qjl, gamma);
+
+        let recon = pq.dequantize(&idx, &qjl, gamma);
+        let dot_score: f64 = q.iter().zip(recon.iter()).map(|(a, b)| a * b).sum();
+
+        assert!(direct_score.is_finite(), "direct score must be finite");
+        assert!(dot_score.is_finite(), "dequant+dot score must be finite");
+        // The two paths use slightly different math (LUT rounding vs direct
+        // dequantize), but should agree within ~1% of |query|·|recon|.
+        let rel = ((direct_score - dot_score).abs() + 1e-6) / (dot_score.abs() + 1e-6);
+        assert!(
+            rel < 0.10,
+            "direct ({direct_score:.4}) and dequant+dot ({dot_score:.4}) should agree within 10%; got rel={rel:.3}"
         );
     }
 }

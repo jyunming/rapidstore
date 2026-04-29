@@ -468,4 +468,82 @@ mod tests {
         let idx = Bm25Index::open(p).unwrap();
         assert_eq!(idx.n_docs(), 0);
     }
+
+    // ── v0.8.2 audit: BM25 numeric edge contracts ─────────────────────────────
+
+    /// B3 (v0.8.2 audit): documenting the contract — empty docs are NOT counted
+    /// in `n_docs` or `avg_doc_len`, by design (see `put` docstring). Pinning
+    /// here so future refactors don't change semantics silently.
+    #[test]
+    fn empty_corpus_avg_doc_len_is_zero() {
+        let d = tempdir().unwrap();
+        let idx = open_empty(d.path());
+        assert_eq!(idx.n_docs(), 0);
+        assert_eq!(
+            idx.avg_doc_len(),
+            0.0,
+            "empty corpus → 0.0 avgdl (consumers .max(1.0) for div-safety)"
+        );
+    }
+
+    #[test]
+    fn corpus_of_only_empty_docs_avg_is_zero() {
+        let d = tempdir().unwrap();
+        let mut idx = open_empty(d.path());
+        idx.put(0, "");
+        idx.put(1, "   "); // whitespace-only also tokenizes to empty
+        idx.put(2, "");
+        assert_eq!(idx.n_docs(), 0, "all-empty corpus has n_docs=0");
+        assert_eq!(idx.avg_doc_len(), 0.0);
+        // search over empty corpus returns empty (not a panic).
+        let r = idx.search("anything", 10, None);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn mixed_empty_and_real_docs_avg_excludes_empties() {
+        let d = tempdir().unwrap();
+        let mut idx = open_empty(d.path());
+        idx.put(0, ""); // not counted
+        idx.put(1, "two words"); // 2 tokens
+        idx.put(2, "four short words here"); // 4 tokens
+        assert_eq!(idx.n_docs(), 2, "empty docs excluded from n_docs");
+        // avg_doc_len = (2 + 4) / 2 = 3.0 (empties not in numerator OR denominator)
+        assert!(
+            (idx.avg_doc_len() - 3.0).abs() < 1e-5,
+            "expected avgdl=3.0 (2+4)/2, got {}",
+            idx.avg_doc_len()
+        );
+    }
+
+    #[test]
+    fn search_with_top_k_zero_returns_empty() {
+        let d = tempdir().unwrap();
+        let mut idx = open_empty(d.path());
+        idx.put(0, "hello world");
+        idx.put(1, "hello there");
+        let r = idx.search("hello", 0, None);
+        assert!(r.is_empty(), "top_k=0 must return empty");
+    }
+
+    #[test]
+    fn search_with_empty_query_returns_empty() {
+        let d = tempdir().unwrap();
+        let mut idx = open_empty(d.path());
+        idx.put(0, "hello world");
+        let r = idx.search("", 10, None);
+        assert!(r.is_empty(), "empty query must return empty");
+    }
+
+    /// Single-document corpus must not div-by-zero (avgdl == doc_len, IDF
+    /// computed against n=1).
+    #[test]
+    fn single_document_corpus_search_does_not_panic() {
+        let d = tempdir().unwrap();
+        let mut idx = open_empty(d.path());
+        idx.put(0, "alpha beta gamma");
+        let r = idx.search("alpha", 10, None);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].1.is_finite(), "score must be finite, got {}", r[0].1);
+    }
 }
