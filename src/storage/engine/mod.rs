@@ -2012,13 +2012,18 @@ impl TurboQuantEngine {
             // Expand candidate pool for ANN: always fetch at least sls candidates so the
             // beam search has a sufficient buffer to recover from approximate navigation.
             // Without reranking, internal_k=top_k leaves no buffer → recall collapses.
+            // Use `saturating_mul` so a pathological top_k can't wrap; the cap below
+            // (active count + index_ids.len()) keeps the candidate buffer bounded
+            // even when the user passes a huge top_k.
             let internal_k = if self.rerank_enabled {
                 let factor =
                     rerank_factor.unwrap_or_else(|| default_rerank_factor(self.quantizer.d, true));
-                (top_k * factor).max(top_k + 1)
+                let raw = top_k.saturating_mul(factor).max(top_k.saturating_add(1));
+                let cap = self.index_ids.len().max(1);
+                raw.min(cap)
             } else {
                 // Fetch sls candidates, re-score by full LUT, return top_k.
-                sls.max(top_k)
+                sls.max(top_k).min(self.index_ids.len().max(1))
             };
 
             // Shared references captured by search closures.
@@ -2319,10 +2324,14 @@ impl TurboQuantEngine {
         include_metadata: bool,
         include_document: bool,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+        // saturating_mul guards against overflow when top_k or factor is huge;
+        // the cap to active_count keeps the rerank candidate pool bounded.
         let internal_k = if self.rerank_enabled {
             let factor =
                 rerank_factor.unwrap_or_else(|| default_rerank_factor(self.quantizer.d, false));
-            (top_k * factor).max(top_k + 1)
+            let raw = top_k.saturating_mul(factor).max(top_k.saturating_add(1));
+            let cap = self.id_pool.active_count().max(1);
+            raw.min(cap)
         } else {
             top_k
         };
