@@ -6,6 +6,26 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
+## [0.8.1] — 2026-04-29
+
+### Performance
+
+- **Dimension-aware default `rerank_factor`** — at high `d`, the prior fixed default of 20 (ANN) / 10 (brute) caused the level-0 HNSW search to bloat its candidate pool and visit far more nodes than needed, making ANN actively slower than brute-force at d=1536 (~90 ms vs ~56 ms p50 on the private bench). Defaults now step down with vector dimension: ANN uses **20 / 8 / 4** for `d ≤ 384` / `d ≤ 1024` / `d > 1024` respectively; brute uses **10 / 6 / 4**. User-supplied `rerank_factor=` continues to override. No API change; pure default tuning. Results on the private bench at n=100k (ANN, rerank=True):
+
+  | Dataset (dim) | b=2 p50 before → after | b=2 R@1 before → after | b=4 p50 before → after | b=4 R@1 before → after |
+  |---|---|---|---|---|
+  | GloVe-200 | 19.5 ms → **2.4 ms** | 0.211 → **0.403** | 21.6 ms → **1.3 ms** | 0.366 → **0.422** |
+  | DBpedia-1536 | 90.0 ms → **13.3 ms** | 0.738 → **0.836** | 97.9 ms → **8.5 ms** | 0.822 → **0.850** |
+  | DBpedia-3072 | 43.2 ms → **23.8 ms** | 0.766 → **0.849** | 51.0 ms → **15.4 ms** | 0.816 → **0.861** |
+
+  Speed improved 1.8–17× and recall improved 2–19% across all dims. The recall gain is from a tighter `search_list_size`: the prior factor of 20 inflated `ef_search` to ~200 nodes which over-spread the level-0 beam; the smaller pool keeps the search focused on better-scoring candidates.
+
+### Tests
+
+- Two new unit tests in `src/storage/engine/tests.rs` cover the `default_rerank_factor` helper across the dimension cutoffs for both ANN and brute paths.
+
+---
+
 ## [0.8.0] — 2026-04-28
 
 > Release overview + upgrade notes: [`docs/WHAT_S_NEW_0_8.md`](docs/WHAT_S_NEW_0_8.md).

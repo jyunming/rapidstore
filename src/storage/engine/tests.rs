@@ -3060,3 +3060,27 @@ fn prepared_compaction_state_on_disk_is_recovered_on_reopen() {
         "all vectors must survive aborted compaction recovery"
     );
 }
+
+// ── default_rerank_factor: dimension-aware oversampling defaults ───────
+
+#[test]
+fn default_rerank_factor_ann_steps_down_with_dimension() {
+    assert_eq!(default_rerank_factor(128, true), 20);
+    assert_eq!(default_rerank_factor(384, true), 20);
+    assert_eq!(default_rerank_factor(385, true), 8);
+    assert_eq!(default_rerank_factor(768, true), 8);
+    assert_eq!(default_rerank_factor(1024, true), 8);
+    assert_eq!(default_rerank_factor(1025, true), 4);
+    assert_eq!(default_rerank_factor(1536, true), 4);
+    assert_eq!(default_rerank_factor(3072, true), 4);
+}
+
+#[test]
+fn default_rerank_factor_brute_steps_down_with_dimension() {
+    assert_eq!(default_rerank_factor(128, false), 10);
+    assert_eq!(default_rerank_factor(384, false), 10);
+    assert_eq!(default_rerank_factor(385, false), 6);
+    assert_eq!(default_rerank_factor(1024, false), 6);
+    assert_eq!(default_rerank_factor(1025, false), 4);
+    assert_eq!(default_rerank_factor(3072, false), 4);
+}
