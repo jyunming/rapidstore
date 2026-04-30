@@ -2443,7 +2443,7 @@ impl TurboQuantEngine {
         // amortised cost is dwarfed by the savings on the full scoring pass.
         const HAMMING_PREFILTER_MIN_CANDIDATES: usize = 5_000;
         const HAMMING_PREFILTER_MIN_DIM: usize = 512;
-        const HAMMING_PREFILTER_RETAIN_RATIO: usize = 8; // keep top 1/8 of candidates
+        const HAMMING_PREFILTER_RETAIN_RATIO: usize = 16; // P4: tightened from 8 -> 16
         let use_sign_prefilter = qjl_len == 0
             && quantizer.b == 4
             && quantizer.d >= HAMMING_PREFILTER_MIN_DIM
