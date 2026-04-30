@@ -6,6 +6,24 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
+## [0.8.2] — 2026-04-30
+
+Audit-driven follow-up to v0.8.1: a deeper scan surfaced three real bugs in compaction and snapshot paths. All three are fixed here, each with a regression test pinning the contract.
+
+### Fixed
+
+- **IVF coarse index becomes stale after compaction** (`src/storage/engine/mod.rs`). `live_compact_slab()` renumbers the `id_pool` from scratch, so the IVF `cluster_index` and `cluster_map` (which reference the OLD slot numbers) silently point to wrong vectors. `search_with_ivf` would return garbage results — both score-wise and identity-wise — until the user manually rebuilt the IVF index. Compaction now drops `self.ivf` and removes `ivf.bin` from disk + backend; subsequent IVF searches fall back to brute-force until `create_coarse_index()` is called again. Pinned by `tests::ivf_invalidated_after_compaction`.
+
+- **`delta_slots` not cleared during compaction** (`src/storage/engine/mod.rs`). The "delta overlay" of slots inserted after the last `create_index()` holds slot numbers from the pre-compaction `id_pool`. After renumbering they're stale, which (a) corrupts `auto_use_ann()`'s ratio check by counting non-existent slots and (b) causes the delta-overlay scoring path to read wrong slots from `live_codes`. Compaction now clears `delta_slots` and marks state dirty for persistence. Pinned by `tests::delta_slots_cleared_after_compaction`.
+
+- **Snapshot/restore path traversal** (`server/src/main.rs`). `snapshot_name` from the request body was joined into the snapshots directory tree without `validate_path_component`, unlike `tenant`/`database`/`collection`. A malicious request with `snapshot_name="../../etc/passwd"` could write outside the snapshots subtree on CREATE, or read from arbitrary paths on RESTORE. Both handlers now validate `snapshot_name` rejecting `..`, `.`, empty strings, slashes, backslashes, and null bytes. Pinned by `tests::validate_path_component_rejects_traversal_sequences`. Embedded mode is unaffected; this is a server-only fix.
+
+### Tests
+
+- 3 new tests covering the regressions above. Test count: 425 → **428** (+3; 2 ignored long-running boundary tests carried forward).
+
+---
+
 ## [0.8.1] — 2026-04-30
 
 Combined performance + audit-driven bug-fix release.

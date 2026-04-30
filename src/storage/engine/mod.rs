@@ -3914,6 +3914,31 @@ impl TurboQuantEngine {
         for (slot, doc) in self.metadata.iter_docs() {
             self.bm25.put(slot, doc);
         }
+
+        // v0.8.2 audit fix #1: invalidate the IVF coarse index. Its
+        // `cluster_index` and `cluster_map` reference the OLD slot numbers
+        // from before compaction; using them after this point would silently
+        // return wrong vectors. Drop both the in-memory state and the on-disk
+        // file so a reopen doesn't reload stale data. The user can rebuild
+        // with `create_coarse_index()`; until then `search_with_ivf` falls
+        // back to brute-force.
+        if self.ivf.is_some() {
+            self.ivf = None;
+            let ivf_path = Path::new(&self.local_dir).join("ivf.bin");
+            let _ = std::fs::remove_file(&ivf_path); // best-effort
+            let _ = self.backend.delete("ivf.bin"); // best-effort
+        }
+
+        // v0.8.2 audit fix #2: `delta_slots` holds slot numbers from the
+        // pre-compaction id_pool. After renumbering they're meaningless and
+        // would steer auto_use_ann() toward wrong fallback decisions and
+        // corrupt the delta-overlay scoring path. Clear them; subsequent
+        // inserts will repopulate against the new id_pool.
+        if !self.delta_slots.is_empty() {
+            self.delta_slots.clear();
+            self.delta_slots_dirty = true;
+        }
+
         Ok(())
     }
 
