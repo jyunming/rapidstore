@@ -2553,10 +2553,10 @@ impl TurboQuantEngine {
             match metric {
                 DistanceMetric::Ip => {
                     let prep = quantizer.prepare_ip_query(query);
+                    let b4 = quantizer.mse_bits_per_idx() == 4;
                     for &slot in &candidate_slots {
                         let rec =
                             &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
-                        quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
                         let gamma = f32::from_le_bytes(
                             rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                 .try_into()
@@ -2567,12 +2567,23 @@ impl TurboQuantEngine {
                                 .try_into()
                                 .expect("live_codes norm field is always 4 bytes"),
                         );
-                        let score = quantizer.score_ip_encoded(
-                            &prep,
-                            &idx,
-                            &rec[mse_len..mse_len + qjl_len],
-                            gamma as f64,
-                        ) * doc_norm as f64;
+                        let raw_ip = if b4 {
+                            quantizer.score_ip_encoded_packed(
+                                &prep,
+                                &rec[..mse_len],
+                                &rec[mse_len..mse_len + qjl_len],
+                                gamma as f64,
+                            )
+                        } else {
+                            quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
+                            quantizer.score_ip_encoded(
+                                &prep,
+                                &idx,
+                                &rec[mse_len..mse_len + qjl_len],
+                                gamma as f64,
+                            )
+                        };
+                        let score = raw_ip * doc_norm as f64;
                         if use_small_topk {
                             push_small_topk(&mut out, slot, score, internal_k);
                         } else {
@@ -2582,21 +2593,31 @@ impl TurboQuantEngine {
                 }
                 DistanceMetric::Cosine => {
                     let prep = quantizer.prepare_ip_query(query);
+                    let b4 = quantizer.mse_bits_per_idx() == 4;
                     for &slot in &candidate_slots {
                         let rec =
                             &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
-                        quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
                         let gamma = f32::from_le_bytes(
                             rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                 .try_into()
                                 .expect("live_codes gamma field is always 4 bytes"),
                         );
-                        let ip = quantizer.score_ip_encoded(
-                            &prep,
-                            &idx,
-                            &rec[mse_len..mse_len + qjl_len],
-                            gamma as f64,
-                        );
+                        let ip = if b4 {
+                            quantizer.score_ip_encoded_packed(
+                                &prep,
+                                &rec[..mse_len],
+                                &rec[mse_len..mse_len + qjl_len],
+                                gamma as f64,
+                            )
+                        } else {
+                            quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
+                            quantizer.score_ip_encoded(
+                                &prep,
+                                &idx,
+                                &rec[mse_len..mse_len + qjl_len],
+                                gamma as f64,
+                            )
+                        };
                         let score = ip * q_norm_inv;
                         if use_small_topk {
                             push_small_topk(&mut out, slot, score, internal_k);
@@ -2642,6 +2663,7 @@ impl TurboQuantEngine {
             match metric {
                 DistanceMetric::Ip => {
                     let prep = quantizer.prepare_ip_query(query);
+                    let b4 = quantizer.mse_bits_per_idx() == 4;
                     candidate_slots
                         .par_chunks(par_chunk)
                         .map(|chunk| {
@@ -2654,7 +2676,6 @@ impl TurboQuantEngine {
                             for &slot in chunk {
                                 let rec = &codes_bytes
                                     [slot as usize * stride..(slot as usize + 1) * stride];
-                                quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
                                 let gamma = f32::from_le_bytes(
                                     rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                         .try_into()
@@ -2666,12 +2687,23 @@ impl TurboQuantEngine {
                                         .expect("live_codes norm field is always 4 bytes"),
                                 );
                                 // Vectors stored unit-normalized; scale back to recover <q, doc>.
-                                let score = quantizer.score_ip_encoded(
-                                    &prep,
-                                    &idx,
-                                    &rec[mse_len..mse_len + qjl_len],
-                                    gamma as f64,
-                                ) * doc_norm as f64;
+                                let raw_ip = if b4 {
+                                    quantizer.score_ip_encoded_packed(
+                                        &prep,
+                                        &rec[..mse_len],
+                                        &rec[mse_len..mse_len + qjl_len],
+                                        gamma as f64,
+                                    )
+                                } else {
+                                    quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
+                                    quantizer.score_ip_encoded(
+                                        &prep,
+                                        &idx,
+                                        &rec[mse_len..mse_len + qjl_len],
+                                        gamma as f64,
+                                    )
+                                };
+                                let score = raw_ip * doc_norm as f64;
                                 if use_small_topk {
                                     push_small_topk(&mut out, slot, score, internal_k);
                                 } else {
@@ -2690,6 +2722,7 @@ impl TurboQuantEngine {
                 }
                 DistanceMetric::Cosine => {
                     let prep = quantizer.prepare_ip_query(query);
+                    let b4 = quantizer.mse_bits_per_idx() == 4;
                     candidate_slots
                         .par_chunks(par_chunk)
                         .map(|chunk| {
@@ -2702,7 +2735,6 @@ impl TurboQuantEngine {
                             for &slot in chunk {
                                 let rec = &codes_bytes
                                     [slot as usize * stride..(slot as usize + 1) * stride];
-                                quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
                                 let gamma = f32::from_le_bytes(
                                     rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                         .try_into()
@@ -2710,12 +2742,22 @@ impl TurboQuantEngine {
                                 );
                                 // Vectors stored unit-normalized; ip estimates <query, unit_doc>.
                                 // cosine(query, doc) = <query, unit_doc> / ||query||
-                                let ip = quantizer.score_ip_encoded(
-                                    &prep,
-                                    &idx,
-                                    &rec[mse_len..mse_len + qjl_len],
-                                    gamma as f64,
-                                );
+                                let ip = if b4 {
+                                    quantizer.score_ip_encoded_packed(
+                                        &prep,
+                                        &rec[..mse_len],
+                                        &rec[mse_len..mse_len + qjl_len],
+                                        gamma as f64,
+                                    )
+                                } else {
+                                    quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
+                                    quantizer.score_ip_encoded(
+                                        &prep,
+                                        &idx,
+                                        &rec[mse_len..mse_len + qjl_len],
+                                        gamma as f64,
+                                    )
+                                };
                                 let score = ip * q_norm_inv;
                                 if use_small_topk {
                                     push_small_topk(&mut out, slot, score, internal_k);

@@ -536,6 +536,164 @@ impl ProdQuantizer {
         (mse_sum + (gamma as f32) * prep.qjl_scale * qjl_sum) as f64
     }
 
+    /// Fused nibble-unpack + LUT-gather scoring for b=4 (production fast path).
+    ///
+    /// Reads the raw packed MSE bytes directly and extracts nibbles inline,
+    /// avoiding the intermediate `idx_buf: Vec<u16>` materialization (~4-8KB
+    /// of L1 traffic per slot at d=2048). Falls back to the unpack+score path
+    /// for b != 4.
+    pub fn score_ip_encoded_packed(
+        &self,
+        prep: &PreparedIpQuery,
+        packed_mse: &[u8],
+        qjl: &[u8],
+        gamma: f64,
+    ) -> f64 {
+        if self.mse_quantizer.b == 4 {
+            debug_assert_eq!(
+                packed_mse.len(),
+                self.n / 2,
+                "score_ip_encoded_packed: packed_mse.len() must equal n/2 ({})",
+                self.n / 2
+            );
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                    return unsafe {
+                        self.score_ip_encoded_packed_b4_simd(prep, packed_mse, qjl, gamma)
+                    };
+                }
+            }
+        }
+        // b != 4 (or no AVX2): fall back to two-step path with a temporary buffer.
+        let mut idx = vec![0 as CodeIndex; self.n];
+        self.unpack_mse_indices(packed_mse, &mut idx);
+        self.score_ip_encoded(prep, &idx, qjl, gamma)
+    }
+
+    /// AVX2/FMA fused path: 16 indices per outer iteration (= 8 packed bytes).
+    /// Nibbles are kept in registers / a tiny stack buffer instead of being
+    /// materialized into a heap-backed Vec.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn score_ip_encoded_packed_b4_simd(
+        &self,
+        prep: &PreparedIpQuery,
+        packed_mse: &[u8],
+        qjl: &[u8],
+        gamma: f64,
+    ) -> f64 {
+        use std::arch::x86_64::*;
+
+        let mut mse_acc = _mm256_setzero_ps();
+        let lut = prep.mse_lut.as_ptr();
+        let lut_width = prep.mse_lut_width;
+        let n = self.n;
+        let packed_ptr = packed_mse.as_ptr();
+
+        let mut i = 0usize;
+        let mut byte_i = 0usize;
+
+        // Process 16 indices = 8 packed bytes per iteration.
+        while i + 16 <= n {
+            let p64 = unsafe { std::ptr::read_unaligned(packed_ptr.add(byte_i) as *const u64) };
+            // Extract 16 nibbles via bit math.
+            let mut nibs = [0u8; 16];
+            let mut bits = p64;
+            for k in 0..8 {
+                nibs[2 * k] = (bits & 0x0f) as u8;
+                nibs[2 * k + 1] = ((bits >> 4) & 0x0f) as u8;
+                bits >>= 8;
+            }
+
+            // First 8 lanes
+            let mut vals = [0.0f32; 8];
+            for j in 0..8 {
+                unsafe {
+                    vals[j] = *lut.add((i + j) * lut_width + nibs[j] as usize);
+                }
+            }
+            mse_acc = _mm256_add_ps(mse_acc, _mm256_loadu_ps(vals.as_ptr()));
+
+            // Second 8 lanes
+            for j in 0..8 {
+                unsafe {
+                    vals[j] = *lut.add((i + 8 + j) * lut_width + nibs[8 + j] as usize);
+                }
+            }
+            mse_acc = _mm256_add_ps(mse_acc, _mm256_loadu_ps(vals.as_ptr()));
+
+            i += 16;
+            byte_i += 8;
+        }
+
+        // Reduce mse_acc.
+        let mut res = [0.0f32; 8];
+        _mm256_storeu_ps(res.as_mut_ptr(), mse_acc);
+        let mut mse_sum = 0.0f32;
+        for v in res {
+            mse_sum += v;
+        }
+
+        // Scalar tail for any remaining indices (n not multiple of 16).
+        while i < n {
+            let b = unsafe { *packed_ptr.add(byte_i) };
+            let nib = if i % 2 == 0 { b & 0x0f } else { b >> 4 };
+            unsafe {
+                mse_sum += *lut.add(i * lut_width + nib as usize);
+            }
+            i += 1;
+            if i % 2 == 0 {
+                byte_i += 1;
+            }
+        }
+
+        // QJL portion: identical to score_ip_encoded_simd.
+        let mut qjl_acc = _mm256_setzero_ps();
+        let sq = prep.sq.as_ptr();
+        let qjl_ptr = qjl.as_ptr();
+        let qjl_len = qjl.len();
+        let bit_masks = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+        let zero_si = _mm256_setzero_si256();
+        let pos_one = _mm256_set1_ps(1.0f32);
+        let neg_one = _mm256_set1_ps(-1.0f32);
+
+        let mut b = 0;
+        while b < qjl_len {
+            let byte = unsafe { *qjl_ptr.add(b) as i32 };
+            let base_i = b << 3;
+            if base_i + 7 < n {
+                let s_vec = _mm256_loadu_ps(unsafe { sq.add(base_i) });
+                let byte_broadcast = _mm256_set1_epi32(byte);
+                let masked = _mm256_and_si256(byte_broadcast, bit_masks);
+                let is_zero = _mm256_cmpeq_epi32(masked, zero_si);
+                let signs = _mm256_blendv_ps(pos_one, neg_one, _mm256_castsi256_ps(is_zero));
+                qjl_acc = _mm256_fmadd_ps(signs, s_vec, qjl_acc);
+            } else {
+                let mut qs = 0.0f32;
+                for bit in 0..8 {
+                    let idx = base_i + bit;
+                    if idx >= n {
+                        break;
+                    }
+                    let s = unsafe { *sq.add(idx) };
+                    qs += if (byte & (1 << bit)) != 0 { s } else { -s };
+                }
+                mse_sum += (gamma as f32) * prep.qjl_scale * qs;
+            }
+            b += 1;
+        }
+
+        _mm256_storeu_ps(res.as_mut_ptr(), qjl_acc);
+        let mut qjl_sum = 0.0f32;
+        for v in res {
+            qjl_sum += v;
+        }
+
+        (mse_sum + (gamma as f32) * prep.qjl_scale * qjl_sum) as f64
+    }
+
     pub fn quantize(&self, x: &[f32]) -> (Vec<CodeIndex>, Vec<u8>, f64) {
         let idx = self.mse_quantizer.quantize(x);
 
