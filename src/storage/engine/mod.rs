@@ -650,10 +650,30 @@ impl TurboQuantEngine {
                 "live_ids.bin missing and WAL is empty; database state appears corrupt".into(),
             );
         }
-        // Load IVF index if present.
+        // Load IVF index if present. Defense-in-depth for v0.8.2 fix #1:
+        // even though `live_compact_slab` removes `ivf.bin` on compaction,
+        // a Windows file-lock or permission error could leave a stale file
+        // on disk. Validate the loaded IVF's cluster_map length against the
+        // current id_pool slot count; if they disagree, the IVF references
+        // the pre-compaction slot space and we must drop it (and clean up
+        // the file so the next reopen is fast).
         let ivf_path = Path::new(local_dir).join("ivf.bin");
         if ivf_path.exists() {
-            engine.ivf = IvfIndex::load(&ivf_path).ok();
+            if let Some(ivf) = IvfIndex::load(&ivf_path).ok() {
+                let expected = engine.id_pool.slot_count();
+                if !ivf.cluster_map.is_empty() && ivf.cluster_map.len() != expected {
+                    eprintln!(
+                        "WARNING: ivf.bin references {} slots but id_pool has {}; \
+                         dropping stale IVF index from a previous compaction.",
+                        ivf.cluster_map.len(),
+                        expected
+                    );
+                    let _ = std::fs::remove_file(&ivf_path);
+                    let _ = engine.backend.delete("ivf.bin");
+                } else {
+                    engine.ivf = Some(ivf);
+                }
+            }
         }
         Ok(engine)
     }
@@ -3922,11 +3942,35 @@ impl TurboQuantEngine {
         // file so a reopen doesn't reload stale data. The user can rebuild
         // with `create_coarse_index()`; until then `search_with_ivf` falls
         // back to brute-force.
+        //
+        // We log warnings on removal failure (e.g. permission denied, file
+        // locked on Windows) rather than failing compaction outright — the
+        // engine state is already consistent in memory at this point, and a
+        // belt-and-suspenders consistency check at `open()` (see the IVF
+        // load path) catches a stale `ivf.bin` if removal here ever fails
+        // silently.
         if self.ivf.is_some() {
             self.ivf = None;
             let ivf_path = Path::new(&self.local_dir).join("ivf.bin");
-            let _ = std::fs::remove_file(&ivf_path); // best-effort
-            let _ = self.backend.delete("ivf.bin"); // best-effort
+            if let Err(e) = std::fs::remove_file(&ivf_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "WARNING: failed to remove stale ivf.bin during compaction \
+                         ({}); reopen will detect the staleness and drop it.",
+                        e
+                    );
+                }
+            }
+            if let Err(e) = self.backend.delete("ivf.bin") {
+                let msg = e.to_string();
+                if !msg.contains("not found") && !msg.contains("NotFound") {
+                    eprintln!(
+                        "WARNING: failed to remove stale ivf.bin from backend during \
+                         compaction ({}); reopen will detect the staleness and drop it.",
+                        msg
+                    );
+                }
+            }
         }
 
         // v0.8.2 audit fix #2: `delta_slots` holds slot numbers from the
