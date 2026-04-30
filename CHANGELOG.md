@@ -6,6 +6,62 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
+## [0.8.1] — 2026-04-30
+
+Combined performance + audit-driven bug-fix release.
+
+**Headline:** at high embedding dimension (d=1536, the OpenAI `text-embedding-3` size), ANN search was previously ~90 ms p50 vs brute-force ~56 ms — ANN was *slower* than brute. Dimension-aware oversampling defaults bring it down to **~13 ms** with **better recall**. Layered on top: a 3-agent code audit produced ~80 findings; the 9 verified critical/high items are fixed here, and 5 previously untested modules get unit-test suites.
+
+No API changes; all behavior is either an opt-in safety improvement or a contract pin. Test count 387 → **425** (+38 new; 2 ignored long-running boundary tests).
+
+### Performance
+
+- **Dimension-aware default `rerank_factor`** — the prior fixed default of 20 (ANN) / 10 (brute) caused the level-0 HNSW search to bloat its candidate pool and visit far more nodes than needed. Defaults now step down with vector dimension:
+
+  | Dimension `d` | ANN factor | Brute factor |
+  |---------------|-----------:|-------------:|
+  | d ≤ 384       |         20 |           10 |
+  | 384 < d ≤ 1024|          8 |            6 |
+  | d > 1024      |          4 |            4 |
+
+  User-supplied `rerank_factor=` continues to override. Pure default tuning; no API change. Private bench at n=100k (ANN, rerank=True):
+
+  | Dataset (dim) | b=2 p50 before → after | b=2 R@1 before → after | b=4 p50 before → after | b=4 R@1 before → after |
+  |---|---|---|---|---|
+  | GloVe-200 | 19.5 ms → **2.4 ms** | 0.211 → **0.403** | 21.6 ms → **1.3 ms** | 0.366 → **0.422** |
+  | DBpedia-1536 | 90.0 ms → **13.3 ms** | 0.738 → **0.836** | 97.9 ms → **8.5 ms** | 0.822 → **0.850** |
+  | DBpedia-3072 | 43.2 ms → **23.8 ms** | 0.766 → **0.849** | 51.0 ms → **15.4 ms** | 0.816 → **0.861** |
+
+  Speed improved 1.8–17× and recall improved 2–19% across all dims. The recall gain is from a tighter `search_list_size`: the prior factor of 20 inflated `ef_search` to ~200 nodes which over-spread the level-0 beam; the smaller pool keeps the search focused on better-scoring candidates.
+
+### Fixed
+
+- **`internal_k` overflow guard** — `top_k * factor` could wrap on pathological `top_k`. Both ANN (`engine/mod.rs:2018`) and brute (`engine/mod.rs:2325`) paths now use `saturating_mul` and cap the candidate buffer at active count.
+- **WAL truncation logging** — `wal::replay()` previously dropped truncated payloads and missing CRC bytes silently (only CRC *mismatch* logged). Now emits `eprintln!` warnings at every truncation point with the entry index, so partial writes are observable in production logs.
+- **WAL oversized-payload guard** — corrupted length field claiming a multi-GB payload no longer triggers a giant `vec![0u8; len]` allocation. New `MAX_REASONABLE_PAYLOAD = 10 MiB` cap stops replay with a clear log message instead of OOM.
+- **Graph NaN-score sanitization** — a user-supplied scorer returning `f64::NAN` previously yielded undefined HNSW ranking via the `partial_cmp().unwrap_or(Equal)` fallback. Non-finite scores are now coerced to `f64::NEG_INFINITY` at every `scorer()` call site — those nodes effectively rank last and ranking is deterministic.
+- **Filter recursion-depth DoS guard** — `metadata_matches_filter` previously recursed without bound on `{"$and": [{"$and": [...]}]}` nesting, risking stack overflow on adversarial input. New `MAX_FILTER_DEPTH = 32` is enforced both at validation time (`validate_filter_operators`) and at evaluation time (defense-in-depth).
+- **IVF zero-cluster / zero-nprobe validation** — `create_coarse_index(n_clusters=0)` now errors early with a clear message. `IvfIndex::probe(query, nprobe=0)` now clamps nprobe to at least 1 (was: called `select_nth_unstable_by(0, ...)` which is defined but useless).
+- **Quantizer dimension assertions** — `score_ip_encoded` and `score_ip_encoded_lite` previously called `idx.get_unchecked(i)` for `i in 0..self.n` with no length check; a too-short `idx` was undefined behavior. Now panics with a clear message at the safe wrapper.
+- **Bench version detection** — `paper_recall_bench.py` queried `importlib.metadata.version("tqdb")`, which returns stale data when `maturin develop --release` re-installs the package as editable (the .pyd binary updates but dist-info can be left at the prior version, recording wrong version in `perf_history.json`). Now reads `pyproject.toml` directly (the documented source-of-truth per CLAUDE.md).
+
+### Documentation
+
+- **Python `Database.search` docstring** — was still documenting the pre-tuning fixed `10×/20×` defaults. Updated with the new dimension-aware table and an explanation of why the smaller defaults at high `d` prevent level-0 HNSW search bloat.
+
+### Tests
+
+- **Boundary E2E recall continuity** — new `#[ignore]`'d tests at d=384/385 and d=1024/1025 verify recall doesn't cliff across the dimension cutoffs. Run with `cargo test -- --ignored boundary` (~30s each).
+- **`default_rerank_factor` unit tests** — cover the dimension cutoffs for both ANN and brute paths.
+- **WAL replay edge cases** — oversized length field, truncated payload, truncated CRC, duplicate id entries, corrupted middle entry.
+- **Graph beam-search edge cases** — top_k=0, single-node graph, NaN/+Inf scorer determinism.
+- **Filter operator coverage** — empty `$and`/`$or` arrays (vacuous truth), `$contains` on non-string, `$exists` null vs missing, single-bound range extraction, big-int NaN-coercion behavior pin.
+- **IVF unit-test suite** — 9 tests for the previously untested `ivf.rs` module: build assigns all slots, probe is unique+sorted, save/load roundtrip, magic validation.
+- **Quantizer numeric edges** — zero-vector quantize, b=1 (1-bit) round-trip, `dequantize_then_score` consistency with `score_ip_encoded`.
+- **BM25 empty-document contract** — audit flagged this as a bug; verified it's intentional (per `put` docstring). Added 5 tests pinning the contract: empty docs are excluded from `n_docs`/`avgdl`, mixed empty+real corpora compute correctly, single-doc corpora don't div-by-zero, empty queries return empty.
+
+---
+
 ## [0.8.0] — 2026-04-28
 
 > Release overview + upgrade notes: [`docs/WHAT_S_NEW_0_8.md`](docs/WHAT_S_NEW_0_8.md).

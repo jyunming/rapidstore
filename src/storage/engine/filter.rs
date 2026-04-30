@@ -2,10 +2,33 @@ use super::DistanceMetric;
 use ndarray::Array1;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+
+/// Maximum nesting depth for `$and` / `$or` filter expressions. A user-supplied
+/// `{"$and": [{"$and": [...]}]}` with thousands of levels would otherwise
+/// recurse without bound and overflow the stack (~8 MB default ≈ 10k frames).
+/// 32 is far above any sane query and is checked at validation time, so users
+/// see a clear error instead of a crash.
+pub(crate) const MAX_FILTER_DEPTH: u32 = 32;
+
 pub(crate) fn metadata_matches_filter(
     meta: &HashMap<String, JsonValue>,
     filter: &HashMap<String, JsonValue>,
 ) -> bool {
+    metadata_matches_filter_with_depth(meta, filter, 0)
+}
+
+/// Internal recursive evaluator. `depth` increments on each `$and` / `$or`
+/// dive; if it exceeds `MAX_FILTER_DEPTH` the filter is treated as
+/// non-matching (defense-in-depth — `validate_filter_operators` should have
+/// already rejected the filter, but we don't trust the caller to have called it).
+fn metadata_matches_filter_with_depth(
+    meta: &HashMap<String, JsonValue>,
+    filter: &HashMap<String, JsonValue>,
+    depth: u32,
+) -> bool {
+    if depth > MAX_FILTER_DEPTH {
+        return false;
+    }
     filter.iter().all(|(k, v)| match k.as_str() {
         "$and" => {
             if let JsonValue::Array(conditions) = v {
@@ -13,7 +36,7 @@ pub(crate) fn metadata_matches_filter(
                     if let JsonValue::Object(map) = cond {
                         let as_hm: HashMap<String, JsonValue> =
                             map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                        metadata_matches_filter(meta, &as_hm)
+                        metadata_matches_filter_with_depth(meta, &as_hm, depth + 1)
                     } else {
                         false
                     }
@@ -28,7 +51,7 @@ pub(crate) fn metadata_matches_filter(
                     if let JsonValue::Object(map) = cond {
                         let as_hm: HashMap<String, JsonValue> =
                             map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                        metadata_matches_filter(meta, &as_hm)
+                        metadata_matches_filter_with_depth(meta, &as_hm, depth + 1)
                     } else {
                         false
                     }
@@ -100,6 +123,12 @@ pub(crate) fn apply_comparison_op(field: Option<&JsonValue>, op: &str, op_val: &
             let Some(f) = field else { return false };
             match (f, op_val) {
                 (JsonValue::Number(a), JsonValue::Number(b)) => {
+                    // B2 (v0.8.1 audit): If either side is a JSON integer too
+                    // large for exact f64 representation (|n| > 2^53), as_f64()
+                    // lossily converts to the nearest f64 (or returns None for
+                    // out-of-f64-range, in which case we fall back to NaN and
+                    // the filter excludes). Pinned by
+                    // `audit_tests::big_int_metadata_with_numeric_op_compares_lossily`.
                     let av = a.as_f64().unwrap_or(f64::NAN);
                     let bv = b.as_f64().unwrap_or(f64::NAN);
                     match op {
@@ -165,30 +194,41 @@ const KNOWN_COMPARISON_OPS: &[&str] = &[
     "$contains",
 ];
 
-/// Recursively validate that all operator keys in `filter` are known.
-/// Returns `Err(message)` on the first unknown operator encountered.
+/// Recursively validate that all operator keys in `filter` are known and that
+/// `$and` / `$or` nesting does not exceed [`MAX_FILTER_DEPTH`]. Returns
+/// `Err(message)` on the first unknown operator or depth violation.
 #[allow(dead_code)]
 pub(crate) fn validate_filter_operators(filter: &HashMap<String, JsonValue>) -> Result<(), String> {
-    validate_filter_operators_obj(filter.iter().map(|(k, v)| (k.as_str(), v)))
+    validate_filter_operators_obj(filter.iter().map(|(k, v)| (k.as_str(), v)), 0)
 }
 
 /// Internal helper that accepts a `serde_json::Map` reference to avoid cloning.
 #[allow(dead_code)]
-fn validate_filter_operators_inner(map: &serde_json::Map<String, JsonValue>) -> Result<(), String> {
-    validate_filter_operators_obj(map.iter().map(|(k, v)| (k.as_str(), v)))
+fn validate_filter_operators_inner(
+    map: &serde_json::Map<String, JsonValue>,
+    depth: u32,
+) -> Result<(), String> {
+    validate_filter_operators_obj(map.iter().map(|(k, v)| (k.as_str(), v)), depth)
 }
 
 #[allow(dead_code)]
 fn validate_filter_operators_obj<'a>(
     iter: impl Iterator<Item = (&'a str, &'a JsonValue)>,
+    depth: u32,
 ) -> Result<(), String> {
+    if depth > MAX_FILTER_DEPTH {
+        return Err(format!(
+            "filter nesting exceeds MAX_FILTER_DEPTH ({MAX_FILTER_DEPTH}); \
+             reduce $and/$or nesting"
+        ));
+    }
     for (k, v) in iter {
         match k {
             "$and" | "$or" => {
                 if let JsonValue::Array(conditions) = v {
                     for cond in conditions {
                         if let JsonValue::Object(map) = cond {
-                            validate_filter_operators_inner(map)?;
+                            validate_filter_operators_inner(map, depth + 1)?;
                         }
                     }
                 }
@@ -688,5 +728,194 @@ mod or_fast_path_test {
         let (field, vals) = result.unwrap();
         assert_eq!(field, "cat");
         assert_eq!(vals.len(), 2);
+    }
+}
+
+// ── v0.8.2 audit: depth limit + operator coverage ────────────────────────────
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+
+    fn meta_one(k: &str, v: Value) -> HashMap<String, Value> {
+        let mut m = HashMap::new();
+        m.insert(k.to_string(), v);
+        m
+    }
+
+    fn nested_and_filter(depth: u32) -> HashMap<String, Value> {
+        // {"$and": [{"$and": [{"$and": [...{"x": 1}]}]}]} with `depth` levels
+        let mut current: Value = json!({"x": 1});
+        for _ in 0..depth {
+            current = json!({"$and": [current]});
+        }
+        let JsonValue::Object(map) = current else {
+            panic!("expected object")
+        };
+        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    /// A3: a deeply nested filter is rejected at validation time with a clear
+    /// error — must not crash the process via stack overflow.
+    #[test]
+    fn deeply_nested_filter_rejected_at_validation() {
+        // 50 levels of $and-of-$and is well above MAX_FILTER_DEPTH=32.
+        let f = nested_and_filter(50);
+        let result = validate_filter_operators(&f);
+        assert!(result.is_err(), "deeply nested filter should be rejected");
+        let msg = result.err().unwrap();
+        assert!(
+            msg.contains("MAX_FILTER_DEPTH") || msg.contains("nesting"),
+            "error should mention depth limit; got: {msg}"
+        );
+    }
+
+    /// A3: a filter exactly at MAX_FILTER_DEPTH validates and evaluates.
+    #[test]
+    fn filter_at_max_depth_validates_and_evaluates() {
+        // Exactly MAX_FILTER_DEPTH levels of nesting must validate.
+        let f = nested_and_filter(MAX_FILTER_DEPTH);
+        assert!(
+            validate_filter_operators(&f).is_ok(),
+            "filter at max depth must validate"
+        );
+        // And evaluating it against matching metadata returns true.
+        let meta = meta_one("x", json!(1));
+        // Evaluate with depth-bounded helper so we exercise the runtime guard too.
+        let eval = metadata_matches_filter(&meta, &f);
+        // Depth-tracking starts at 0 in the public function; after 32 dives the
+        // helper returns false defensively. 33 levels → first $and dive at
+        // depth=1, …, 33rd dive at depth=33 > MAX_FILTER_DEPTH → false.
+        // 32 levels → max dive at depth=32 == MAX_FILTER_DEPTH → still evaluates.
+        assert!(
+            eval,
+            "filter exactly at max depth should still evaluate to true on matching metadata"
+        );
+    }
+
+    /// A3: 33 levels (one over the cap) must not panic; either rejected at
+    /// validation or returns false at evaluation time.
+    #[test]
+    fn filter_one_over_max_depth_safely_rejected() {
+        let f = nested_and_filter(MAX_FILTER_DEPTH + 1);
+        let validation = validate_filter_operators(&f);
+        let meta = meta_one("x", json!(1));
+        let evaluation = metadata_matches_filter(&meta, &f);
+        // Either path is acceptable — the contract is "no stack overflow".
+        assert!(
+            validation.is_err() || !evaluation,
+            "filter beyond max depth must be rejected somewhere in the pipeline"
+        );
+    }
+
+    /// B2: pin behavior of numeric comparison when the metadata is a JSON
+    /// integer too large to represent exactly in f64 (|n| > 2^53).
+    /// `serde_json::Number::as_f64()` lossily converts to the nearest f64;
+    /// the comparison still succeeds (approximately) and does NOT panic.
+    /// Pinning the actual contract here so future refactors don't change it.
+    #[test]
+    fn big_int_metadata_with_numeric_op_compares_lossily() {
+        // u64::MAX is well above 2^53 — f64 conversion loses precision but
+        // returns a value (~1.844e19). So `count > 100` is TRUE despite the
+        // precision loss.
+        let huge = json!(u64::MAX);
+        let meta = meta_one("count", huge);
+        let mut gt_100: HashMap<String, Value> = HashMap::new();
+        gt_100.insert("count".to_string(), json!({"$gt": 100}));
+        assert!(
+            metadata_matches_filter(&meta, &gt_100),
+            "u64::MAX > 100 should be true even after lossy f64 conversion"
+        );
+
+        // The OTHER direction also works (u64::MAX is not less than 100).
+        let mut lt_100: HashMap<String, Value> = HashMap::new();
+        lt_100.insert("count".to_string(), json!({"$lt": 100}));
+        assert!(
+            !metadata_matches_filter(&meta, &lt_100),
+            "u64::MAX < 100 should be false"
+        );
+
+        // Subtle case: comparing two huge numbers that differ only in the
+        // low bits (below f64 precision). serde_json maps both to the same
+        // f64, so they compare as EQUAL — i.e. $gt with adjacent huge values
+        // returns false. This is the precision-loss footgun documented in
+        // the inline comment in `apply_comparison_op`.
+        let huge2 = u64::MAX - 1; // adjacent integer
+        let mut gt_adjacent: HashMap<String, Value> = HashMap::new();
+        gt_adjacent.insert("count".to_string(), json!({"$gt": huge2}));
+        // Whether this is true or false depends on f64 rounding — pin that
+        // it doesn't panic and returns SOME boolean.
+        let _ = metadata_matches_filter(&meta, &gt_adjacent);
+    }
+
+    /// C3: empty `$and` array — vacuously true.
+    #[test]
+    fn empty_and_array_evaluates_true_vacuously() {
+        let mut f: HashMap<String, Value> = HashMap::new();
+        f.insert("$and".to_string(), json!([]));
+        let meta = meta_one("anything", json!("here"));
+        assert!(
+            metadata_matches_filter(&meta, &f),
+            "empty $and is vacuously true (matches everything)"
+        );
+    }
+
+    /// C3: empty `$or` array — vacuously false.
+    #[test]
+    fn empty_or_array_evaluates_false_vacuously() {
+        let mut f: HashMap<String, Value> = HashMap::new();
+        f.insert("$or".to_string(), json!([]));
+        let meta = meta_one("anything", json!("here"));
+        assert!(
+            !metadata_matches_filter(&meta, &f),
+            "empty $or is vacuously false (matches nothing)"
+        );
+    }
+
+    /// C3: `$contains` on a non-string field silently returns false (does not
+    /// error). Pin this contract — it's the current behavior and changing it
+    /// would break existing queries.
+    #[test]
+    fn contains_on_non_string_field_returns_false() {
+        let meta = meta_one("count", json!(42));
+        let mut f: HashMap<String, Value> = HashMap::new();
+        f.insert("count".to_string(), json!({"$contains": "4"}));
+        assert!(
+            !metadata_matches_filter(&meta, &f),
+            "$contains on numeric field returns false, not an error"
+        );
+    }
+
+    /// C3: `$exists: true` distinguishes null from missing in a meaningful way.
+    /// Pin the current contract: a present-but-null value SATISFIES $exists:true.
+    #[test]
+    fn exists_with_null_vs_missing_distinguished() {
+        let null_meta = meta_one("k", json!(null));
+        let empty_meta: HashMap<String, Value> = HashMap::new();
+
+        let mut f_exists: HashMap<String, Value> = HashMap::new();
+        f_exists.insert("k".to_string(), json!({"$exists": true}));
+
+        let null_match = metadata_matches_filter(&null_meta, &f_exists);
+        let missing_match = metadata_matches_filter(&empty_meta, &f_exists);
+        // Pin: null is "present" → $exists:true matches; missing → does not.
+        assert!(null_match, "null value should match $exists:true");
+        assert!(!missing_match, "missing key should not match $exists:true");
+    }
+
+    /// C3: range_extract with only `$gt` (no upper bound) returns lo=Some,
+    /// hi=None — verifies single-side range extraction.
+    #[test]
+    fn range_extract_handles_unmatched_bounds() {
+        let mut f: HashMap<String, Value> = HashMap::new();
+        f.insert("score".to_string(), json!({"$gt": 0.5}));
+        let result = extract_range_condition(&f);
+        assert!(result.is_some(), "single-bound range should extract");
+        let (field, lo, hi) = result.unwrap();
+        assert_eq!(field, "score");
+        assert!(lo.is_some(), "lo bound should be set");
+        assert!(hi.is_none(), "hi bound should be None when only $gt given");
     }
 }

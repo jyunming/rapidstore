@@ -56,6 +56,36 @@ const AUTO_ANN_THRESHOLD: usize = 10_000;
 const AUTO_ANN_MAX_DELTA_NUM: usize = 1;
 const AUTO_ANN_MAX_DELTA_DEN: usize = 5; // 20%
 
+/// Default rerank-candidate oversampling factor as a function of vector dimension.
+///
+/// Per-candidate dequantize+score cost scales with `d`, and the level-0 HNSW search
+/// loop visits roughly proportional to its `search_list_size`. At high `d`, a factor
+/// of 20 makes ANN slower than brute-force (e.g. at d=1536 the level-0 search bloats
+/// to ~200 visits × ~µs each before any rerank). Stepping the factor down at high `d`
+/// keeps latency bounded with negligible recall loss because the full-LUT navigation
+/// score is already accurate; the candidate buffer only insulates against beam misses.
+///
+/// `is_ann=true` returns ANN defaults; `false` returns brute-force defaults (which
+/// don't have the level-0 traversal blow-up but still benefit from a dimension cap
+/// on the rerank pool).
+pub(crate) fn default_rerank_factor(d: usize, is_ann: bool) -> usize {
+    if is_ann {
+        if d <= 384 {
+            20
+        } else if d <= 1024 {
+            8
+        } else {
+            4
+        }
+    } else if d <= 384 {
+        10
+    } else if d <= 1024 {
+        6
+    } else {
+        4
+    }
+}
+
 /// Controls the precision used to store raw vectors in `live_vectors.bin` for reranking.
 ///
 /// All options except `Disabled` enable exact second-pass rescoring: after the quantized pass
@@ -1982,12 +2012,18 @@ impl TurboQuantEngine {
             // Expand candidate pool for ANN: always fetch at least sls candidates so the
             // beam search has a sufficient buffer to recover from approximate navigation.
             // Without reranking, internal_k=top_k leaves no buffer → recall collapses.
+            // Use `saturating_mul` so a pathological top_k can't wrap; the cap below
+            // (active count + index_ids.len()) keeps the candidate buffer bounded
+            // even when the user passes a huge top_k.
             let internal_k = if self.rerank_enabled {
-                let factor = rerank_factor.unwrap_or(20);
-                (top_k * factor).max(top_k + 1)
+                let factor =
+                    rerank_factor.unwrap_or_else(|| default_rerank_factor(self.quantizer.d, true));
+                let raw = top_k.saturating_mul(factor).max(top_k.saturating_add(1));
+                let cap = self.index_ids.len().max(1);
+                raw.min(cap)
             } else {
                 // Fetch sls candidates, re-score by full LUT, return top_k.
-                sls.max(top_k)
+                sls.max(top_k).min(self.index_ids.len().max(1))
             };
 
             // Shared references captured by search closures.
@@ -2288,9 +2324,14 @@ impl TurboQuantEngine {
         include_metadata: bool,
         include_document: bool,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+        // saturating_mul guards against overflow when top_k or factor is huge;
+        // the cap to active_count keeps the rerank candidate pool bounded.
         let internal_k = if self.rerank_enabled {
-            let factor = rerank_factor.unwrap_or(10);
-            (top_k * factor).max(top_k + 1)
+            let factor =
+                rerank_factor.unwrap_or_else(|| default_rerank_factor(self.quantizer.d, false));
+            let raw = top_k.saturating_mul(factor).max(top_k.saturating_add(1));
+            let cap = self.id_pool.active_count().max(1);
+            raw.min(cap)
         } else {
             top_k
         };
@@ -3187,6 +3228,11 @@ impl TurboQuantEngine {
         &mut self,
         n_clusters: usize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // A4 (v0.8.2 audit): n_clusters=0 produces a degenerate empty IVF
+        // index that probe() can't use; reject early with a clear message.
+        if n_clusters == 0 {
+            return Err("create_coarse_index requires n_clusters >= 1".into());
+        }
         let active_slots = self.id_pool.iter_active_slots();
         if active_slots.is_empty() {
             return Ok(());

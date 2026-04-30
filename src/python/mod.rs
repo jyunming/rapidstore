@@ -548,9 +548,19 @@ impl Database {
     ///     rerank_factor: Oversampling multiplier for the rerank candidate pool.
     ///         When ``rerank=True``, the engine scores ``top_k * rerank_factor`` candidates
     ///         with the quantized scorer then re-scores with exact raw vectors.
-    ///         Higher values improve recall at the cost of latency. Default ``None`` uses
-    ///         built-in defaults (10× brute-force, 20× ANN). Range: 1–100.
-    ///         Ignored when ``rerank=False``.
+    ///         Higher values improve recall at the cost of latency.
+    ///         Default ``None`` uses dimension-aware built-in defaults (since v0.8.1):
+    ///
+    ///         | Dimension `d` | ANN factor | Brute factor |
+    ///         |---------------|-----------:|-------------:|
+    ///         | d ≤ 384       |         20 |           10 |
+    ///         | 384 < d ≤ 1024|          8 |            6 |
+    ///         | d > 1024      |          4 |            4 |
+    ///
+    ///         The smaller defaults at high d prevent the level-0 HNSW search from
+    ///         visiting an excessive number of nodes (the loop visits ~`search_list_size`
+    ///         nodes, each costing a full-LUT score that scales with d). User-supplied
+    ///         values still override; range 1–100. Ignored when ``rerank=False``.
     ///     include: Subset of fields to return — ``["id", "score", "metadata", "document"]``.
     ///              Defaults to all four.
     ///

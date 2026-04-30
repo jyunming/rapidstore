@@ -3060,3 +3060,120 @@ fn prepared_compaction_state_on_disk_is_recovered_on_reopen() {
         "all vectors must survive aborted compaction recovery"
     );
 }
+
+// ── default_rerank_factor: dimension-aware oversampling defaults ───────
+
+#[test]
+fn default_rerank_factor_ann_steps_down_with_dimension() {
+    assert_eq!(default_rerank_factor(128, true), 20);
+    assert_eq!(default_rerank_factor(384, true), 20);
+    assert_eq!(default_rerank_factor(385, true), 8);
+    assert_eq!(default_rerank_factor(768, true), 8);
+    assert_eq!(default_rerank_factor(1024, true), 8);
+    assert_eq!(default_rerank_factor(1025, true), 4);
+    assert_eq!(default_rerank_factor(1536, true), 4);
+    assert_eq!(default_rerank_factor(3072, true), 4);
+}
+
+#[test]
+fn default_rerank_factor_brute_steps_down_with_dimension() {
+    assert_eq!(default_rerank_factor(128, false), 10);
+    assert_eq!(default_rerank_factor(384, false), 10);
+    assert_eq!(default_rerank_factor(385, false), 6);
+    assert_eq!(default_rerank_factor(1024, false), 6);
+    assert_eq!(default_rerank_factor(1025, false), 4);
+    assert_eq!(default_rerank_factor(3072, false), 4);
+}
+
+// ── B4 (v0.8.2 audit): rerank_factor boundary recall continuity ───────────
+
+/// Generate a deterministic pseudo-random vector for boundary recall tests.
+/// Cheap LCG-based; not suitable for general use but reproducible across runs.
+fn rand_vec(d: usize, seed: u64) -> Array1<f64> {
+    let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15);
+    let mut v = Vec::with_capacity(d);
+    for _ in 0..d {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        // Map to [-1, 1] via top 16 bits → [0, 65535] → normalize
+        let u = ((state >> 48) & 0xFFFF) as f64 / 65535.0;
+        v.push(u * 2.0 - 1.0);
+    }
+    Array1::from_vec(v)
+}
+
+/// Run the boundary search at one dimension; return R@1 vs ground-truth (the
+/// inserted vector's own ID — each vector is unique enough that brute-force
+/// argmax should hit it).
+fn boundary_recall(d: usize, n: usize, queries: usize) -> f64 {
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    // rerank=True with fast_mode=False exercises the v0.8.2 default-factor path.
+    let mut e = TurboQuantEngine::open_with_metric_and_rerank(
+        p,
+        p,
+        d,
+        4,
+        42,
+        DistanceMetric::Ip,
+        true,  // rerank
+        false, // fast_mode (use full MSE+QJL)
+    )
+    .unwrap();
+
+    // Insert n unique vectors with deterministic seeds.
+    let mut inserted = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = rand_vec(d, 1000 + i as u64);
+        let id = format!("v{i}");
+        e.insert(id.clone(), &v, no_meta()).unwrap();
+        inserted.push((id, v));
+    }
+    e.checkpoint().unwrap();
+    e.create_index(32, 200).unwrap();
+
+    // For each query, search top-5 and check if the original vector is the top hit.
+    let mut hits = 0;
+    for i in 0..queries.min(n) {
+        let (expected_id, query_vec) = &inserted[i];
+        let results = e
+            .search_with_filter_and_ann(query_vec, 5, None, None, true, None)
+            .unwrap();
+        if !results.is_empty() && &results[0].id == expected_id {
+            hits += 1;
+        }
+    }
+    hits as f64 / queries.min(n) as f64
+}
+
+/// B4: recall does not collapse across the d=384/385 boundary where ANN
+/// `rerank_factor` steps down 20 → 8.
+#[test]
+#[ignore] // ~30s — run with `cargo test -- --ignored boundary` for sprint verify
+fn rerank_factor_boundary_d384_recall_continuity() {
+    let r_under = boundary_recall(384, 500, 50);
+    let r_over = boundary_recall(385, 500, 50);
+    println!("d=384 R@1={r_under:.3}  d=385 R@1={r_over:.3}");
+    // Expect both > 0.7; if recall cliffs by > 20%, the factor step-down was too aggressive.
+    assert!(r_under >= 0.5, "d=384 recall too low: {r_under}");
+    assert!(r_over >= 0.5, "d=385 recall too low: {r_over}");
+    assert!(
+        (r_under - r_over).abs() < 0.30,
+        "recall cliff at 384/385 boundary: {r_under} vs {r_over}"
+    );
+}
+
+/// B4: recall does not collapse across the d=1024/1025 boundary where ANN
+/// `rerank_factor` steps down 8 → 4.
+#[test]
+#[ignore] // ~60s — run with `cargo test -- --ignored boundary` for sprint verify
+fn rerank_factor_boundary_d1024_recall_continuity() {
+    let r_under = boundary_recall(1024, 500, 50);
+    let r_over = boundary_recall(1025, 500, 50);
+    println!("d=1024 R@1={r_under:.3}  d=1025 R@1={r_over:.3}");
+    assert!(r_under >= 0.5, "d=1024 recall too low: {r_under}");
+    assert!(r_over >= 0.5, "d=1025 recall too low: {r_over}");
+    assert!(
+        (r_under - r_over).abs() < 0.30,
+        "recall cliff at 1024/1025 boundary: {r_under} vs {r_over}"
+    );
+}

@@ -12,6 +12,17 @@ use super::backend::StorageBackend;
 pub const MAX_DEGREE: usize = 127;
 const GRAPH_V3_MAGIC: &[u8; 4] = b"TQG3";
 
+/// Coerce a non-finite (NaN / ±Infinity) score to `f64::NEG_INFINITY` so the
+/// HNSW beam-search heap order is well-defined. A NaN score from a user-supplied
+/// `scorer` would otherwise compare as `Ordering::Equal` against everything via
+/// the `partial_cmp(...).unwrap_or(Equal)` fallback in `SearchCandidate::cmp`,
+/// producing nondeterministic top-k ordering. Mapping non-finite to NEG_INFINITY
+/// effectively "skips" the node in ranked output without changing loop control flow.
+#[inline]
+fn sanitize_score(s: f64) -> f64 {
+    if s.is_finite() { s } else { f64::NEG_INFINITY }
+}
+
 #[derive(Copy, Clone, PartialEq)]
 pub struct SearchCandidate {
     pub id: u32,
@@ -247,7 +258,7 @@ impl GraphManager {
         // A 32-wide beam is sufficient for greedy navigation to a good level-0 entry point.
         const EF_UPPER: usize = 32;
         let mut beam = BinaryHeap::new();
-        let start_score = scorer(self.entry_point);
+        let start_score = sanitize_score(scorer(self.entry_point));
         beam.push(OrderingWrapper(SearchCandidate {
             id: self.entry_point,
             score: start_score,
@@ -283,7 +294,7 @@ impl GraphManager {
                         }
                         visited.insert(nb);
 
-                        let score = scorer(nb);
+                        let score = sanitize_score(scorer(nb));
                         let cand = SearchCandidate { id: nb, score };
                         if layer_results.len() < EF_UPPER
                             || score
@@ -349,7 +360,7 @@ impl GraphManager {
                     }
                     visited[nb as usize] = true;
 
-                    let score = scorer(nb);
+                    let score = sanitize_score(scorer(nb));
                     let cand = SearchCandidate { id: nb, score };
                     candidates.push(cand);
 
@@ -1080,5 +1091,104 @@ mod tests {
             .unwrap();
         // Results may be non-empty (just the entry point), but must not panic
         let _ = results;
+    }
+
+    // ── v0.8.2 audit: NaN-score sanitization + edge cases ────────────────────
+
+    /// A2: a scorer returning NaN for some nodes must not produce a panic, an
+    /// infinite loop, or nondeterministic ordering. Non-finite scores are
+    /// coerced to NEG_INFINITY → those nodes effectively rank last.
+    #[test]
+    fn search_with_nan_scorer_returns_finite_results_only() {
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let cache = dir.path().to_str().unwrap();
+        let mut mgr = GraphManager::open(backend, cache).unwrap();
+        mgr.build(50, 8, 32, 0, 1.2, dot_scorer).unwrap();
+
+        // Scorer returns NaN for half the nodes, finite for the rest.
+        let scorer = |n: u32| -> f64 { if n % 2 == 0 { f64::NAN } else { -(n as f64) } };
+        let r1 = mgr
+            .search(mgr.entry_point, 10, 32, scorer, None::<fn(u32) -> bool>)
+            .unwrap();
+        let r2 = mgr
+            .search(mgr.entry_point, 10, 32, scorer, None::<fn(u32) -> bool>)
+            .unwrap();
+
+        // Determinism: two runs on the same input give identical ranking.
+        assert_eq!(
+            r1, r2,
+            "NaN-sanitized search must be deterministic across runs"
+        );
+        // No NaN scores in the output.
+        for (_id, score) in &r1 {
+            assert!(
+                score.is_finite(),
+                "result score {score} should be finite after NaN sanitization"
+            );
+        }
+    }
+
+    /// A2 corollary: scorer returning +Infinity for one node is sanitized to
+    /// `NEG_INFINITY` (because +Inf is not finite) → that node ranks LAST,
+    /// not first. The contract is "non-finite ⇒ deprioritized," even if the
+    /// non-finite value is +Inf. Pinning the behavior here.
+    #[test]
+    fn search_with_inf_scorer_handles_infinity() {
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let cache = dir.path().to_str().unwrap();
+        let mut mgr = GraphManager::open(backend, cache).unwrap();
+        mgr.build(20, 8, 32, 0, 1.2, dot_scorer).unwrap();
+
+        // Inf for node 5, finite descending elsewhere.
+        let scorer = |n: u32| -> f64 { if n == 5 { f64::INFINITY } else { -(n as f64) } };
+        let r = mgr
+            .search(mgr.entry_point, 5, 32, scorer, None::<fn(u32) -> bool>)
+            .unwrap();
+        // +Inf is non-finite → sanitized to NEG_INFINITY → node 5 ranks LAST,
+        // not first. Pin this behavior so future contracts are explicit.
+        let ids: Vec<u32> = r.iter().map(|(id, _)| *id).collect();
+        assert!(
+            !ids.iter().take(3).any(|&id| id == 5),
+            "+Inf-scoring node should not appear in top-3 (sanitized to NEG_INFINITY)"
+        );
+    }
+
+    /// C5: search with top_k=0 must return empty (degenerate but defined).
+    #[test]
+    fn search_top_k_zero_returns_empty() {
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let cache = dir.path().to_str().unwrap();
+        let mut mgr = GraphManager::open(backend, cache).unwrap();
+        mgr.build(20, 8, 32, 0, 1.2, dot_scorer).unwrap();
+
+        let r = mgr
+            .search(
+                mgr.entry_point,
+                0,
+                32,
+                |n| -(n as f64),
+                None::<fn(u32) -> bool>,
+            )
+            .unwrap();
+        assert!(r.is_empty(), "top_k=0 must return empty");
+    }
+
+    /// C5: search on a single-node graph returns just that node.
+    #[test]
+    fn search_single_node_graph_returns_that_node() {
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let cache = dir.path().to_str().unwrap();
+        let mut mgr = GraphManager::open(backend, cache).unwrap();
+        mgr.build(1, 8, 32, 0, 1.2, dot_scorer).unwrap();
+
+        let r = mgr
+            .search(mgr.entry_point, 5, 32, |_| 1.0, None::<fn(u32) -> bool>)
+            .unwrap();
+        assert_eq!(r.len(), 1, "single-node graph returns exactly one result");
+        assert_eq!(r[0].0, 0);
     }
 }

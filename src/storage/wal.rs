@@ -9,6 +9,14 @@ use std::path::{Path, PathBuf};
 const WAL_MAGIC: &[u8; 4] = b"TQWV";
 const WAL_VERSION: u32 = 5;
 
+/// Defensive upper bound on the per-entry payload length in `replay()`. A real
+/// `WalEntryPacked` is on the order of a few KB (id + packed MSE codes + QJL
+/// bits + small metadata); 10 MB is well above any plausible legitimate value
+/// and well below an OOM-risk allocation. A larger length almost certainly
+/// indicates WAL corruption (e.g. random bytes in the length field) and we
+/// stop replay rather than allocate `len` bytes blindly.
+const MAX_REASONABLE_PAYLOAD: usize = 10 * 1024 * 1024;
+
 /// On-disk V3 entry — MSE indices stored as bit-packed bytes.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct WalEntryPacked {
@@ -179,17 +187,40 @@ impl Wal {
                 Err(e) => return Err(e.into()),
             }
             let len = u64::from_le_bytes(len_buf) as usize;
+            if len > MAX_REASONABLE_PAYLOAD {
+                eprintln!(
+                    "WAL entry {} declares payload length {} bytes (> {} cap); \
+                     refusing to allocate and stopping replay. \
+                     File is likely corrupt.",
+                    entries.len(),
+                    len,
+                    MAX_REASONABLE_PAYLOAD,
+                );
+                break;
+            }
             let mut payload = vec![0u8; len];
             match file.read_exact(&mut payload) {
                 Ok(_) => {}
                 // Partial write at end of file — treat as truncated, stop here.
-                Err(_) => break,
+                Err(_) => {
+                    eprintln!(
+                        "WAL entry {} payload truncated (expected {} bytes, file ended early); \
+                         stopping replay at last good entry.",
+                        entries.len(),
+                        len,
+                    );
+                    break;
+                }
             }
 
             if use_crc {
                 let mut crc_buf = [0u8; 4];
                 if file.read_exact(&mut crc_buf).is_err() {
-                    // CRC bytes not fully written (truncated entry) — stop here.
+                    eprintln!(
+                        "WAL entry {} CRC truncated (entry payload read but CRC bytes missing); \
+                         stopping replay at last good entry.",
+                        entries.len(),
+                    );
                     break;
                 }
                 let stored = u32::from_le_bytes(crc_buf);
@@ -229,7 +260,14 @@ impl Wal {
                 }
                 // Decode failure on a complete payload means a schema mismatch or corruption —
                 // treat as a truncated final entry and stop replaying.
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!(
+                        "WAL entry {} bincode decode failed ({}); stopping replay at last good entry.",
+                        entries.len(),
+                        e,
+                    );
+                    break;
+                }
             }
         }
         Ok(entries)
@@ -641,5 +679,151 @@ mod tests {
             2,
             "two complete entries should survive despite truncated tail"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.8.2 audit: truncation logging + corruption guards
+    // -----------------------------------------------------------------------
+
+    /// B1: a corrupted length field claiming a multi-GB payload must NOT trigger
+    /// a giant allocation. Replay should stop cleanly at the last good entry.
+    #[test]
+    fn replay_rejects_oversized_len_field() {
+        let pq = make_pq();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.bin");
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.set_quantizer(Arc::clone(&pq));
+            wal.append(&real_entry("ok1", &pq), false).unwrap();
+        }
+        // Append a "next entry" header claiming an 8 GB payload.
+        let mut raw = std::fs::read(&path).unwrap();
+        raw.extend_from_slice(&(8u64 * 1024 * 1024 * 1024).to_le_bytes());
+        std::fs::write(&path, &raw).unwrap();
+
+        // Must not OOM-panic. The good entry survives; the bad one is rejected.
+        let replayed = Wal::replay(&path, Some(&pq)).unwrap();
+        assert_eq!(
+            replayed.len(),
+            1,
+            "oversized len field should stop replay without consuming gigabytes of RAM"
+        );
+    }
+
+    /// A1: truncated payload (file ends before the declared payload bytes) is
+    /// observable via behavior — earlier entries replay, the truncated one is
+    /// dropped. (Logging is best-effort and not directly captured here; covered
+    /// by stderr inspection in CI runs.)
+    #[test]
+    fn replay_truncated_payload_keeps_prior_entries() {
+        let pq = make_pq();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.bin");
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.set_quantizer(Arc::clone(&pq));
+            wal.append(&real_entry("a", &pq), false).unwrap();
+            wal.append(&real_entry("b", &pq), false).unwrap();
+        }
+        // Append `len=200` header followed by only 50 bytes of payload (no CRC).
+        let mut raw = std::fs::read(&path).unwrap();
+        raw.extend_from_slice(&200u64.to_le_bytes());
+        raw.extend_from_slice(&[0xAA; 50]);
+        std::fs::write(&path, &raw).unwrap();
+
+        let replayed = Wal::replay(&path, Some(&pq)).unwrap();
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[0].id, "a");
+        assert_eq!(replayed[1].id, "b");
+    }
+
+    /// A1: truncated CRC bytes (entire payload present, CRC bytes missing).
+    #[test]
+    fn replay_truncated_crc_keeps_prior_entries() {
+        let pq = make_pq();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.bin");
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.set_quantizer(Arc::clone(&pq));
+            wal.append(&real_entry("a", &pq), false).unwrap();
+        }
+        // Read the good entry, strip its CRC (last 4 bytes), so the file ends
+        // exactly at the payload boundary — replay should drop it as truncated.
+        let raw = std::fs::read(&path).unwrap();
+        // Header = 8 bytes (magic + version). First entry = 8-byte len + payload + 4-byte CRC.
+        // Strip the trailing 4 CRC bytes.
+        let truncated = &raw[..raw.len() - 4];
+        std::fs::write(&path, truncated).unwrap();
+
+        let replayed = Wal::replay(&path, Some(&pq)).unwrap();
+        assert_eq!(
+            replayed.len(),
+            0,
+            "the only entry has its CRC stripped → truncated entry dropped"
+        );
+    }
+
+    /// C2: replay should handle duplicate id entries by surfacing both — engine
+    /// owns the dedup contract, not the WAL.
+    #[test]
+    fn replay_handles_duplicate_id_entries() {
+        let pq = make_pq();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.bin");
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.set_quantizer(Arc::clone(&pq));
+            wal.append(&real_entry("dup", &pq), false).unwrap();
+            wal.append(&real_entry("dup", &pq), false).unwrap();
+            wal.append(&tombstone_entry("dup"), true).unwrap();
+        }
+        let replayed = Wal::replay(&path, Some(&pq)).unwrap();
+        assert_eq!(
+            replayed.len(),
+            3,
+            "WAL preserves all entries; engine dedups"
+        );
+        assert_eq!(replayed[0].id, "dup");
+        assert_eq!(replayed[1].id, "dup");
+        assert_eq!(replayed[2].id, "dup");
+        assert!(replayed[2].is_deleted);
+    }
+
+    /// C2: a corrupted middle entry should stop replay at the corruption (not
+    /// skip past it and surface later entries with mismatched offsets).
+    #[test]
+    fn replay_corrupted_middle_entry_stops_at_corruption() {
+        let pq = make_pq();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.bin");
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.set_quantizer(Arc::clone(&pq));
+            wal.append(&real_entry("a", &pq), false).unwrap();
+            wal.append(&real_entry("b", &pq), false).unwrap();
+            wal.append(&real_entry("c", &pq), false).unwrap();
+        }
+        // Flip the CRC of the second entry by overwriting bytes near the middle
+        // of the file. Find the file size, locate the rough middle, corrupt 4 bytes.
+        let mut raw = std::fs::read(&path).unwrap();
+        let mid = raw.len() / 2;
+        for i in 0..4 {
+            raw[mid + i] ^= 0xFF;
+        }
+        std::fs::write(&path, &raw).unwrap();
+
+        let replayed = Wal::replay(&path, Some(&pq)).unwrap();
+        // The first entry is intact; corruption at the second entry's CRC stops
+        // replay there. We must NOT see a desynced "c" entry.
+        assert!(
+            replayed.len() < 3,
+            "corruption in the middle must stop replay; got {} entries",
+            replayed.len()
+        );
+        if !replayed.is_empty() {
+            assert_eq!(replayed[0].id, "a");
+        }
     }
 }

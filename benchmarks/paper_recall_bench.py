@@ -582,6 +582,29 @@ def _git_info() -> tuple[str, str]:
 
 
 def _tqdb_version() -> str:
+    """Read the tqdb version from pyproject.toml (the documented source of truth).
+
+    Earlier versions queried `importlib.metadata.version("tqdb")` which can return
+    stale data when `maturin develop --release` re-installs the package as editable
+    — the .pyd binary updates but the dist-info metadata can be left at the prior
+    version, causing perf_history entries to record a wrong version. Reading
+    pyproject.toml directly avoids that drift; falls back to importlib.metadata
+    only if pyproject.toml can't be located.
+    """
+    try:
+        from pathlib import Path
+        # __file__ is benchmarks/paper_recall_bench.py → repo root is parents[1]
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        if pyproject.exists():
+            for line in pyproject.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if s.startswith("version") and "=" in s:
+                    # version = "0.8.2" → strip key, =, quotes, comments.
+                    val = s.split("=", 1)[1].strip()
+                    val = val.split("#", 1)[0].strip()
+                    return val.strip('"').strip("'")
+    except Exception:
+        pass
     try:
         import importlib.metadata
         for dist_name in ("tqdb", "turboquantdb"):
@@ -589,9 +612,9 @@ def _tqdb_version() -> str:
                 return importlib.metadata.version(dist_name)
             except Exception:
                 continue
-        return "unknown"
     except Exception:
-        return "unknown"
+        pass
+    return "unknown"
 
 
 def update_perf_history(all_results: dict[str, list[dict]]) -> None:
