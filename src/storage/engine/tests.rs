@@ -3177,3 +3177,108 @@ fn rerank_factor_boundary_d1024_recall_continuity() {
         "recall cliff at 1024/1025 boundary: {r_under} vs {r_over}"
     );
 }
+
+// ── v0.8.2 audit fixes: compaction invalidates derived indexes ────────────
+
+/// FIX #1: After deletes trigger `live_compact_slab`, the IVF index holds
+/// stale slot numbers and would return wrong vectors. The fix invalidates
+/// `self.ivf` (and the on-disk `ivf.bin`) post-compaction so search falls
+/// back to brute-force until the user explicitly rebuilds the index.
+#[test]
+fn ivf_invalidated_after_compaction() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let mut e = TurboQuantEngine::open_with_metric_and_rerank(
+        p,
+        p,
+        16,
+        4,
+        42,
+        DistanceMetric::Ip,
+        true,  // rerank
+        false, // fast_mode
+    )
+    .unwrap();
+
+    // Insert 50 vectors, build IVF.
+    for i in 0..50 {
+        let mut v = make_vec(16, 0.0);
+        v[i % 16] = 1.0; // distinct vectors
+        e.insert(format!("v{i}"), &v, no_meta()).unwrap();
+    }
+    e.checkpoint().unwrap();
+    e.create_coarse_index(4).unwrap();
+    assert!(e.ivf.is_some(), "IVF index must be present after build");
+
+    // Delete half → triggers has_pending_deletes; checkpoint → live_compact_slab.
+    for i in 0..25 {
+        e.delete(format!("v{i}")).unwrap();
+    }
+    e.checkpoint().unwrap();
+
+    // After compaction, IVF must be invalidated (stale slot refs would be unsafe).
+    assert!(
+        e.ivf.is_none(),
+        "live_compact_slab must invalidate self.ivf to prevent stale slot lookups"
+    );
+    // The on-disk ivf.bin must also be removed so reopen doesn't reload stale data.
+    let ivf_path = dir.path().join("ivf.bin");
+    assert!(
+        !ivf_path.exists(),
+        "ivf.bin must be deleted from disk to prevent stale reload"
+    );
+
+    // Search must still return correct results (falling back to brute-force is fine).
+    let q = make_vec(16, 0.0);
+    let results = e
+        .search_with_filter_and_ann(&q, 5, None, None, false, None)
+        .unwrap();
+    assert!(
+        !results.is_empty(),
+        "search after compaction should return results"
+    );
+}
+
+/// FIX #2: `delta_slots` (slots inserted after the last `create_index()`)
+/// holds slot numbers that become stale after `live_compact_slab` renumbers
+/// the id_pool. Must be cleared during compaction so the auto-planner and
+/// delta-overlay scoring don't reference invalid slots.
+#[test]
+fn delta_slots_cleared_after_compaction() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let mut e = open_default(p, 16);
+
+    // Insert vectors → delta_slots accumulates (no HNSW index built yet, but
+    // delta_slots is populated for future incremental indexing).
+    for i in 0..30 {
+        let mut v = make_vec(16, 0.0);
+        v[i % 16] = 1.0;
+        e.insert(format!("v{i}"), &v, no_meta()).unwrap();
+    }
+    e.checkpoint().unwrap();
+    e.create_index(8, 32).unwrap(); // builds HNSW, clears delta_slots
+
+    // Insert more → these are deltas relative to the built index.
+    for i in 30..50 {
+        let mut v = make_vec(16, 0.0);
+        v[i % 16] = 1.0;
+        e.insert(format!("v{i}"), &v, no_meta()).unwrap();
+    }
+    let pre_compaction_delta = e.delta_slots.len();
+    assert!(pre_compaction_delta > 0, "delta_slots should have entries");
+
+    // Delete some → triggers has_pending_deletes → next checkpoint compacts.
+    for i in 0..10 {
+        e.delete(format!("v{i}")).unwrap();
+    }
+    e.checkpoint().unwrap();
+
+    // After compaction, delta_slots must be cleared — the slot numbers it
+    // held are now meaningless because id_pool was renumbered.
+    assert!(
+        e.delta_slots.is_empty(),
+        "delta_slots must be cleared by live_compact_slab; was {} entries",
+        e.delta_slots.len()
+    );
+}

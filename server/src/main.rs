@@ -1776,6 +1776,12 @@ async fn start_snapshot_job(
     validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
     validate_path_component(&database, "database", ctx.request_id.clone())?;
     validate_path_component(&collection, "collection", ctx.request_id.clone())?;
+    // v0.8.2 audit fix #3: snapshot_name is joined into the snapshots/ path
+    // tree; without validation it could escape via "../../etc/passwd"
+    // (write side on snapshot, read side on restore).
+    if let Some(name) = body.snapshot_name.as_deref() {
+        validate_path_component(name, "snapshot_name", ctx.request_id.clone())?;
+    }
     enforce_job_enqueue_quota(
         &state,
         &tenant,
@@ -1822,6 +1828,10 @@ async fn start_restore_job(
     validate_path_component(&tenant, "tenant", ctx.request_id.clone())?;
     validate_path_component(&database, "database", ctx.request_id.clone())?;
     validate_path_component(&collection, "collection", ctx.request_id.clone())?;
+    // v0.8.2 audit fix #3: snapshot_name is joined into the snapshots/ path
+    // tree on restore; without validation it could read files outside the
+    // snapshot dir via "../../some_other_collection/snap_X".
+    validate_path_component(&body.snapshot_name, "snapshot_name", ctx.request_id.clone())?;
     enforce_job_enqueue_quota(
         &state,
         &tenant,
@@ -3277,5 +3287,45 @@ mod tests {
             .expect("body bytes");
         let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
         assert_eq!(payload["error"]["code"], "invalid_argument");
+    }
+
+    /// v0.8.2 audit fix #3: snapshot_name and path components must reject
+    /// traversal sequences. This pins the validation contract used by both
+    /// snapshot CREATE and RESTORE handlers so a malicious request body like
+    /// `{"snapshot_name": "../../etc/passwd"}` cannot escape the
+    /// snapshots/<tenant>/<database>/<collection>/ subtree.
+    #[test]
+    fn validate_path_component_rejects_traversal_sequences() {
+        // Bad inputs: each must error.
+        for bad in [
+            "..",
+            ".",
+            "",
+            "../etc/passwd",
+            "..\\windows",
+            "valid/with/slash",
+            "valid\\with\\backslash",
+            "with\0null",
+        ] {
+            let result = validate_path_component(bad, "snapshot_name", None);
+            assert!(
+                result.is_err(),
+                "snapshot_name {bad:?} should be rejected by validate_path_component"
+            );
+        }
+
+        // Good inputs: each must succeed.
+        for ok in [
+            "snap_2026_04_30",
+            "user-snapshot-1",
+            "snap.123",
+            "valid_name_with_underscores",
+        ] {
+            let result = validate_path_component(ok, "snapshot_name", None);
+            assert!(
+                result.is_ok(),
+                "snapshot_name {ok:?} should be accepted"
+            );
+        }
     }
 }
