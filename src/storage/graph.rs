@@ -1129,7 +1129,10 @@ mod tests {
         }
     }
 
-    /// A2 corollary: scorer returning +Infinity for one node ranks it first.
+    /// A2 corollary: scorer returning +Infinity for one node is sanitized to
+    /// `NEG_INFINITY` (because +Inf is not finite) → that node ranks LAST,
+    /// not first. The contract is "non-finite ⇒ deprioritized," even if the
+    /// non-finite value is +Inf. Pinning the behavior here.
     #[test]
     fn search_with_inf_scorer_handles_infinity() {
         let dir = tempdir().unwrap();

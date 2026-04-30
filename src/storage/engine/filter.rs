@@ -123,11 +123,12 @@ pub(crate) fn apply_comparison_op(field: Option<&JsonValue>, op: &str, op_val: &
             let Some(f) = field else { return false };
             match (f, op_val) {
                 (JsonValue::Number(a), JsonValue::Number(b)) => {
-                    // B2 (v0.8.2 audit): If either side is a JSON integer larger
-                    // than f64 can represent (|n| > 2^53), `as_f64()` returns
-                    // None and we fall back to NaN. NaN comparisons are always
-                    // false, so the filter excludes the document. Pinned by
-                    // `audit_tests::big_int_metadata_with_numeric_op_returns_false`.
+                    // B2 (v0.8.1 audit): If either side is a JSON integer too
+                    // large for exact f64 representation (|n| > 2^53), as_f64()
+                    // lossily converts to the nearest f64 (or returns None for
+                    // out-of-f64-range, in which case we fall back to NaN and
+                    // the filter excludes). Pinned by
+                    // `audit_tests::big_int_metadata_with_numeric_op_compares_lossily`.
                     let av = a.as_f64().unwrap_or(f64::NAN);
                     let bv = b.as_f64().unwrap_or(f64::NAN);
                     match op {
@@ -809,25 +810,44 @@ mod audit_tests {
         );
     }
 
-    /// B2: a JSON integer larger than f64 representation (|n| > 2^53) compared
-    /// with `$gt` against a numeric metadata value returns false. Pinned so
-    /// future refactors don't silently change semantics.
+    /// B2: pin behavior of numeric comparison when the metadata is a JSON
+    /// integer too large to represent exactly in f64 (|n| > 2^53).
+    /// `serde_json::Number::as_f64()` lossily converts to the nearest f64;
+    /// the comparison still succeeds (approximately) and does NOT panic.
+    /// Pinning the actual contract here so future refactors don't change it.
     #[test]
-    fn big_int_metadata_with_numeric_op_returns_false() {
-        // 2^60 is exactly representable in u64 but loses precision in f64.
-        // serde_json stores this as an i64; .as_f64() returns Some, but only
-        // approximately — comparing against a slightly-different threshold
-        // can yield surprising results. Pin behavior at the limit.
-        let huge = json!(u64::MAX); // not representable in f64 → as_f64 = None → NaN
+    fn big_int_metadata_with_numeric_op_compares_lossily() {
+        // u64::MAX is well above 2^53 — f64 conversion loses precision but
+        // returns a value (~1.844e19). So `count > 100` is TRUE despite the
+        // precision loss.
+        let huge = json!(u64::MAX);
         let meta = meta_one("count", huge);
-        let mut filter: HashMap<String, Value> = HashMap::new();
-        filter.insert("count".to_string(), json!({"$gt": 100}));
-        // u64::MAX as_f64() may return Some(huge_approx) on some serde_json
-        // versions; either way, the comparison must not panic.
-        let r = metadata_matches_filter(&meta, &filter);
-        // Expected behavior: either matches (because u64::MAX → f64 → > 100)
-        // or doesn't (NaN). Both are acceptable; pinning the no-panic contract.
-        let _ = r; // value not asserted — just must not crash.
+        let mut gt_100: HashMap<String, Value> = HashMap::new();
+        gt_100.insert("count".to_string(), json!({"$gt": 100}));
+        assert!(
+            metadata_matches_filter(&meta, &gt_100),
+            "u64::MAX > 100 should be true even after lossy f64 conversion"
+        );
+
+        // The OTHER direction also works (u64::MAX is not less than 100).
+        let mut lt_100: HashMap<String, Value> = HashMap::new();
+        lt_100.insert("count".to_string(), json!({"$lt": 100}));
+        assert!(
+            !metadata_matches_filter(&meta, &lt_100),
+            "u64::MAX < 100 should be false"
+        );
+
+        // Subtle case: comparing two huge numbers that differ only in the
+        // low bits (below f64 precision). serde_json maps both to the same
+        // f64, so they compare as EQUAL — i.e. $gt with adjacent huge values
+        // returns false. This is the precision-loss footgun documented in
+        // the inline comment in `apply_comparison_op`.
+        let huge2 = u64::MAX - 1; // adjacent integer
+        let mut gt_adjacent: HashMap<String, Value> = HashMap::new();
+        gt_adjacent.insert("count".to_string(), json!({"$gt": huge2}));
+        // Whether this is true or false depends on f64 rounding — pin that
+        // it doesn't panic and returns SOME boolean.
+        let _ = metadata_matches_filter(&meta, &gt_adjacent);
     }
 
     /// C3: empty `$and` array — vacuously true.
