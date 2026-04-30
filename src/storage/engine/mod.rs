@@ -2431,6 +2431,52 @@ impl TurboQuantEngine {
         let quantizer = &self.quantizer;
         let metric = &self.metric;
 
+        // Sign-bit Hamming prefilter (fast_mode + b=4 + IP/Cosine).
+        //
+        // In fast_mode there's no QJL stored, but the high bit of each MSE nibble is
+        // the sign of the corresponding rotated dimension (Lloyd-Max codebook is
+        // sorted around 0). We can therefore derive a 1-bit-per-dim sketch from the
+        // existing MSE bytes for free, and use Hamming disagreement as a cheap
+        // proxy for IP to shrink the candidate set before full LUT scoring.
+        //
+        // Only enabled for sufficiently large candidate pools, where the prefilter's
+        // amortised cost is dwarfed by the savings on the full scoring pass.
+        const HAMMING_PREFILTER_MIN_CANDIDATES: usize = 5_000;
+        const HAMMING_PREFILTER_MIN_DIM: usize = 512;
+        const HAMMING_PREFILTER_RETAIN_RATIO: usize = 8; // keep top 1/8 of candidates
+        let use_sign_prefilter = qjl_len == 0
+            && quantizer.b == 4
+            && quantizer.d >= HAMMING_PREFILTER_MIN_DIM
+            && matches!(metric, DistanceMetric::Ip | DistanceMetric::Cosine)
+            && candidate_slots.len() >= HAMMING_PREFILTER_MIN_CANDIDATES;
+        let candidate_slots: Vec<u32> = if use_sign_prefilter {
+            let target = (candidate_slots.len() / HAMMING_PREFILTER_RETAIN_RATIO)
+                .max(internal_k.saturating_mul(10))
+                .min(candidate_slots.len());
+            let q_signs = quantizer.prepare_query_sign_bits(query);
+            let q_signs_ref: &[u8] = &q_signs;
+            let mut scored: Vec<(u32, u32)> = candidate_slots
+                .par_iter()
+                .map(|&slot| {
+                    let rec =
+                        &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
+                    let dis =
+                        crate::quantizer::prod::hamming_disagree_b4_signs(
+                            q_signs_ref,
+                            &rec[..mse_len],
+                        );
+                    (slot, dis)
+                })
+                .collect();
+            if scored.len() > target {
+                scored.select_nth_unstable_by_key(target, |x| x.1);
+                scored.truncate(target);
+            }
+            scored.into_iter().map(|(s, _)| s).collect()
+        } else {
+            candidate_slots
+        };
+
         // Scoring: sequential for small N (avoids Rayon thread park/unpark on Windows
         // where scheduler granularity dominates the actual sub-millisecond work);
         // parallel chunk-based for large N where the work outweighs the thread overhead.

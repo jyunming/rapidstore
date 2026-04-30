@@ -803,6 +803,85 @@ impl ProdQuantizer {
         let (_, qjl_bits, _) = self.quantize(&query_f32);
         qjl_bits
     }
+
+    /// Compute query sign-bit sketch from the rotated query for fast Hamming
+    /// prefiltering when fast_mode + b=4 (no QJL stored). Output length = n/8 bytes,
+    /// where bit i of byte i/8 is 1 iff the i-th rotated dimension is non-negative.
+    ///
+    /// This matches the doc-side sketch derivable from the high bit of each MSE
+    /// nibble (Lloyd-Max codebook is symmetric around 0, so idx >= 1<<(b-1) ↔
+    /// centroid > 0).
+    pub(crate) fn prepare_query_sign_bits(&self, query: &Array1<f64>) -> Vec<u8> {
+        let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
+        let mut y = vec![0.0f32; self.n];
+        self.mse_quantizer.apply_rotation(&query_f32, &mut y);
+        let mut bits = vec![0u8; self.n.div_ceil(8)];
+        for i in 0..self.n {
+            if y[i] >= 0.0 {
+                bits[i >> 3] |= 1u8 << (i & 7);
+            }
+        }
+        bits
+    }
+}
+
+/// Hamming disagreement between a query sign sketch (`query_signs`) and the
+/// document's implicit sign sketch derivable from b=4 packed MSE nibbles.
+///
+/// For each MSE byte (= two 4-bit indices), bit 3 is the sign of the low-nibble
+/// index and bit 7 is the sign of the high-nibble index (since the Lloyd-Max
+/// codebook is sorted by centroid value with negatives in the lower half). We
+/// extract those 8 sign bits per 4 MSE bytes and XOR-popcount against the query.
+///
+/// Lower return value = closer in IP space. Caller is responsible for ensuring
+/// `query_signs.len() == mse_bytes.len() / 4` (i.e. b=4 stride).
+#[inline]
+pub(crate) fn hamming_disagree_b4_signs(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
+    debug_assert_eq!(query_signs.len() * 4, mse_bytes.len());
+    let mut disagree = 0u32;
+    let mut i = 0usize;
+    let mut q_i = 0usize;
+    // Process 8 mse bytes (16 nibbles, 16 sign bits = 2 sketch bytes) per iter.
+    while i + 8 <= mse_bytes.len() {
+        let chunk = u64::from_le_bytes(mse_bytes[i..i + 8].try_into().unwrap());
+        // Mask = 0x88 per byte: bit 3 (low-nibble sign) and bit 7 (high-nibble sign).
+        // Compress those 16 bits via shift/or into the low 16 bits of `packed`.
+        // For each byte k (0..8) at bit offset 8k, we want output bits 2k and 2k+1.
+        // Per byte: output bit 2k   = chunk bit (8k + 3)
+        //           output bit 2k+1 = chunk bit (8k + 7)
+        // Right-shift bit (8k+3) to position 2k => shift right by (8k+3) - 2k = 6k+3.
+        // Right-shift bit (8k+7) to position 2k+1 => shift right by (8k+7) - (2k+1) = 6k+6.
+        // Doing this per-bit is 16 shifts; cheaper to use scalar byte loop:
+        let mut packed: u16 = 0;
+        for k in 0..8 {
+            let byte = (chunk >> (8 * k)) as u8;
+            packed |= ((byte as u16 >> 3) & 0x01) << (2 * k);
+            packed |= ((byte as u16 >> 7) & 0x01) << (2 * k + 1);
+        }
+        let q = u16::from_le_bytes([query_signs[q_i], query_signs[q_i + 1]]);
+        disagree += (packed ^ q).count_ones();
+        i += 8;
+        q_i += 2;
+    }
+    // Tail: 4 mse bytes → 8 sign bits → 1 sketch byte.
+    while i + 4 <= mse_bytes.len() {
+        let m0 = mse_bytes[i];
+        let m1 = mse_bytes[i + 1];
+        let m2 = mse_bytes[i + 2];
+        let m3 = mse_bytes[i + 3];
+        let packed: u8 = ((m0 >> 3) & 0x01)
+            | ((m0 >> 6) & 0x02)
+            | ((m1 >> 1) & 0x04)
+            | ((m1 >> 4) & 0x08)
+            | ((m2 << 1) & 0x10)
+            | ((m2 >> 2) & 0x20)
+            | ((m3 << 3) & 0x40)
+            | (m3 & 0x80);
+        disagree += (packed ^ query_signs[q_i]).count_ones();
+        i += 4;
+        q_i += 1;
+    }
+    disagree
 }
 
 /// Normalized Hamming similarity between two bit-packed byte slices.
