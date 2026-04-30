@@ -6,39 +6,25 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
-## [0.8.2] — 2026-04-30
+## [0.8.1] — 2026-04-30
 
-Audit-driven bug-fix + test-coverage release. A 3-agent code audit surfaced ~80 candidate findings; the 9 verified critical/high items are fixed here, and 5 previously untested modules get unit-test suites. No API changes; all behavior is either an opt-in safety improvement or a contract pin.
+Combined performance + audit-driven bug-fix release.
 
-### Fixed
+**Headline:** at high embedding dimension (d=1536, the OpenAI `text-embedding-3` size), ANN search was previously ~90 ms p50 vs brute-force ~56 ms — ANN was *slower* than brute. Dimension-aware oversampling defaults bring it down to **~13 ms** with **better recall**. Layered on top: a 3-agent code audit produced ~80 findings; the 9 verified critical/high items are fixed here, and 5 previously untested modules get unit-test suites.
 
-- **WAL truncation logging (A1)** — `wal::replay()` previously dropped truncated payloads and missing CRC bytes silently (only CRC *mismatch* logged). Now emits `eprintln!` warnings at every truncation point with the entry index, so partial writes are observable in production logs.
-- **WAL oversized-payload guard (B1)** — corrupted length field claiming a multi-GB payload no longer triggers a giant `vec![0u8; len]` allocation. New `MAX_REASONABLE_PAYLOAD = 10 MiB` cap stops replay with a clear log message instead of OOM.
-- **Graph NaN-score sanitization (A2)** — a user-supplied scorer returning `f64::NAN` previously yielded undefined HNSW ranking via the `partial_cmp().unwrap_or(Equal)` fallback. Non-finite scores are now coerced to `f64::NEG_INFINITY` at every `scorer()` call site (entry point, upper-level beam, level-0 beam) — those nodes effectively rank last and ranking is deterministic.
-- **Filter recursion-depth DoS guard (A3)** — `metadata_matches_filter` previously recursed without bound on `{"$and": [{"$and": [...]}]}` nesting, risking stack overflow on adversarial input. New `MAX_FILTER_DEPTH = 32` is enforced both at validation time (`validate_filter_operators`) and at evaluation time (defense-in-depth).
-- **IVF zero-cluster / zero-nprobe validation (A4)** — `create_coarse_index(n_clusters=0)` now errors early with a clear message. `IvfIndex::probe(query, nprobe=0)` now clamps nprobe to at least 1 (was: called `select_nth_unstable_by(0, ...)` which is defined but useless).
-- **Quantizer dimension assertions (A5)** — `score_ip_encoded` and `score_ip_encoded_lite` previously called `idx.get_unchecked(i)` for `i in 0..self.n` with no length check; a too-short `idx` was undefined behavior. Now panics with a clear message at the safe wrapper.
-
-### Tests
-
-- **Filter NaN-coercion behavior pin (B2)** — pinned current behavior of `as_f64().unwrap_or(NAN)` for big-int metadata so future refactors don't silently change semantics. Documented inline.
-- **BM25 empty-document contract (B3)** — audit flagged this as a bug; verified it's intentional (per `put` docstring). Added 5 tests pinning the contract: empty docs are excluded from `n_docs`/`avgdl`, mixed empty+real corpora compute correctly, single-doc corpora don't div-by-zero, empty queries return empty.
-- **`rerank_factor` boundary recall continuity (B4)** — new E2E tests at d=384/385 and d=1024/1025 verify recall doesn't cliff across the v0.8.1 dimension cutoffs. Marked `#[ignore]` (~30s each) — run with `cargo test -- --ignored boundary`.
-- **IVF unit-test suite (C1)** — added 9 tests for the previously untested `ivf.rs` module: build assigns all slots, probe is unique+sorted, save/load roundtrip, magic validation, etc.
-- **WAL replay edge cases (C2)** — added tests for oversized length field, truncated payload, truncated CRC, duplicate id entries, corrupted middle entry.
-- **Filter operator coverage (C3)** — added tests for empty `$and`/`$or` arrays (vacuous truth), `$contains` on non-string, `$exists` null vs missing, single-bound range extraction.
-- **Quantizer numeric edges (C4)** — added tests for zero-vector quantize, b=1 (1-bit) round-trip, `dequantize_then_score` consistency with `score_ip_encoded`.
-- **Graph beam-search edge cases (C5)** — added tests for top_k=0, single-node graph, NaN/+Inf scorers (determinism + non-finite output rejection).
-
-Test count: 387 → **425** (+38 new; 2 ignored long-running boundary tests).
-
----
-
-## [0.8.1] — 2026-04-29
+No API changes; all behavior is either an opt-in safety improvement or a contract pin. Test count 387 → **425** (+38 new; 2 ignored long-running boundary tests).
 
 ### Performance
 
-- **Dimension-aware default `rerank_factor`** — at high `d`, the prior fixed default of 20 (ANN) / 10 (brute) caused the level-0 HNSW search to bloat its candidate pool and visit far more nodes than needed, making ANN actively slower than brute-force at d=1536 (~90 ms vs ~56 ms p50 on the private bench). Defaults now step down with vector dimension: ANN uses **20 / 8 / 4** for `d ≤ 384` / `d ≤ 1024` / `d > 1024` respectively; brute uses **10 / 6 / 4**. User-supplied `rerank_factor=` continues to override. No API change; pure default tuning. Results on the private bench at n=100k (ANN, rerank=True):
+- **Dimension-aware default `rerank_factor`** — the prior fixed default of 20 (ANN) / 10 (brute) caused the level-0 HNSW search to bloat its candidate pool and visit far more nodes than needed. Defaults now step down with vector dimension:
+
+  | Dimension `d` | ANN factor | Brute factor |
+  |---------------|-----------:|-------------:|
+  | d ≤ 384       |         20 |           10 |
+  | 384 < d ≤ 1024|          8 |            6 |
+  | d > 1024      |          4 |            4 |
+
+  User-supplied `rerank_factor=` continues to override. Pure default tuning; no API change. Private bench at n=100k (ANN, rerank=True):
 
   | Dataset (dim) | b=2 p50 before → after | b=2 R@1 before → after | b=4 p50 before → after | b=4 R@1 before → after |
   |---|---|---|---|---|
@@ -48,9 +34,31 @@ Test count: 387 → **425** (+38 new; 2 ignored long-running boundary tests).
 
   Speed improved 1.8–17× and recall improved 2–19% across all dims. The recall gain is from a tighter `search_list_size`: the prior factor of 20 inflated `ef_search` to ~200 nodes which over-spread the level-0 beam; the smaller pool keeps the search focused on better-scoring candidates.
 
+### Fixed
+
+- **`internal_k` overflow guard** — `top_k * factor` could wrap on pathological `top_k`. Both ANN (`engine/mod.rs:2018`) and brute (`engine/mod.rs:2325`) paths now use `saturating_mul` and cap the candidate buffer at active count.
+- **WAL truncation logging** — `wal::replay()` previously dropped truncated payloads and missing CRC bytes silently (only CRC *mismatch* logged). Now emits `eprintln!` warnings at every truncation point with the entry index, so partial writes are observable in production logs.
+- **WAL oversized-payload guard** — corrupted length field claiming a multi-GB payload no longer triggers a giant `vec![0u8; len]` allocation. New `MAX_REASONABLE_PAYLOAD = 10 MiB` cap stops replay with a clear log message instead of OOM.
+- **Graph NaN-score sanitization** — a user-supplied scorer returning `f64::NAN` previously yielded undefined HNSW ranking via the `partial_cmp().unwrap_or(Equal)` fallback. Non-finite scores are now coerced to `f64::NEG_INFINITY` at every `scorer()` call site — those nodes effectively rank last and ranking is deterministic.
+- **Filter recursion-depth DoS guard** — `metadata_matches_filter` previously recursed without bound on `{"$and": [{"$and": [...]}]}` nesting, risking stack overflow on adversarial input. New `MAX_FILTER_DEPTH = 32` is enforced both at validation time (`validate_filter_operators`) and at evaluation time (defense-in-depth).
+- **IVF zero-cluster / zero-nprobe validation** — `create_coarse_index(n_clusters=0)` now errors early with a clear message. `IvfIndex::probe(query, nprobe=0)` now clamps nprobe to at least 1 (was: called `select_nth_unstable_by(0, ...)` which is defined but useless).
+- **Quantizer dimension assertions** — `score_ip_encoded` and `score_ip_encoded_lite` previously called `idx.get_unchecked(i)` for `i in 0..self.n` with no length check; a too-short `idx` was undefined behavior. Now panics with a clear message at the safe wrapper.
+- **Bench version detection** — `paper_recall_bench.py` queried `importlib.metadata.version("tqdb")`, which returns stale data when `maturin develop --release` re-installs the package as editable (the .pyd binary updates but dist-info can be left at the prior version, recording wrong version in `perf_history.json`). Now reads `pyproject.toml` directly (the documented source-of-truth per CLAUDE.md).
+
+### Documentation
+
+- **Python `Database.search` docstring** — was still documenting the pre-tuning fixed `10×/20×` defaults. Updated with the new dimension-aware table and an explanation of why the smaller defaults at high `d` prevent level-0 HNSW search bloat.
+
 ### Tests
 
-- Two new unit tests in `src/storage/engine/tests.rs` cover the `default_rerank_factor` helper across the dimension cutoffs for both ANN and brute paths.
+- **Boundary E2E recall continuity** — new `#[ignore]`'d tests at d=384/385 and d=1024/1025 verify recall doesn't cliff across the dimension cutoffs. Run with `cargo test -- --ignored boundary` (~30s each).
+- **`default_rerank_factor` unit tests** — cover the dimension cutoffs for both ANN and brute paths.
+- **WAL replay edge cases** — oversized length field, truncated payload, truncated CRC, duplicate id entries, corrupted middle entry.
+- **Graph beam-search edge cases** — top_k=0, single-node graph, NaN/+Inf scorer determinism.
+- **Filter operator coverage** — empty `$and`/`$or` arrays (vacuous truth), `$contains` on non-string, `$exists` null vs missing, single-bound range extraction, big-int NaN-coercion behavior pin.
+- **IVF unit-test suite** — 9 tests for the previously untested `ivf.rs` module: build assigns all slots, probe is unique+sorted, save/load roundtrip, magic validation.
+- **Quantizer numeric edges** — zero-vector quantize, b=1 (1-bit) round-trip, `dequantize_then_score` consistency with `score_ip_encoded`.
+- **BM25 empty-document contract** — audit flagged this as a bug; verified it's intentional (per `put` docstring). Added 5 tests pinning the contract: empty docs are excluded from `n_docs`/`avgdl`, mixed empty+real corpora compute correctly, single-doc corpora don't div-by-zero, empty queries return empty.
 
 ---
 

@@ -11134,7 +11134,7 @@
     "timestamp": "2026-04-30T00:15:18.500578+00:00",
     "git_commit": "efcad63",
     "git_branch": "fix/v0.8.2-audit",
-    "version": "0.8.2",
+    "version": "0.8.1",
     "results": {
       "glove-200": {
         "b2_rerankF_brute_r1at1": 0.5108,
