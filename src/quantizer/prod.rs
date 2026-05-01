@@ -25,6 +25,11 @@ pub struct PreparedIpQuery {
     // Lookup table flattened as [dim0 c0..cK, dim1 c0..cK, ...]
     mse_lut: Vec<f32>,
     mse_lut_width: usize,
+    /// i16-quantized version of `mse_lut` with a single global scale.
+    /// Halves the L1/L2 footprint of the LUT (96 KB -> 48 KB at d=1536, lut_w=16).
+    /// Per the P6 numpy validation, ranking is bit-identical to the f32 LUT.
+    mse_lut_i16: Vec<i16>,
+    mse_lut_i16_scale: f32,
     sq: Vec<f32>,
     qjl_scale: f32,
 }
@@ -150,9 +155,22 @@ impl ProdQuantizer {
             self.qjl_quantizer.apply_projection(&query_f32, &mut sq);
         }
 
+        // Build i16 mirror with a single global max-abs scale. Used only by the b=4 fast-mode
+        // SIMD path; cost is one pass over n*lut_w f32 entries — at d=1536/lut_w=16 that's
+        // ~25k mul+round+cast ops = ~50us, marginal vs the ~1ms prepare_ip_query baseline.
+        let max_abs = mse_lut.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        let mse_lut_i16_scale = if max_abs > 0.0 { max_abs / 32767.0 } else { 1.0 };
+        let inv_scale = if max_abs > 0.0 { 32767.0 / max_abs } else { 1.0 };
+        let mse_lut_i16: Vec<i16> = mse_lut
+            .iter()
+            .map(|&v| (v * inv_scale).round().clamp(-32768.0, 32767.0) as i16)
+            .collect();
+
         PreparedIpQuery {
             mse_lut,
             mse_lut_width: lut_w,
+            mse_lut_i16,
+            mse_lut_i16_scale,
             sq,
             qjl_scale: self.qjl_query_scale(),
         }
@@ -559,6 +577,13 @@ impl ProdQuantizer {
             #[cfg(target_arch = "x86_64")]
             {
                 if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                    // P7: in fast_mode the QJL term is zero, so the i16 LUT path can
+                    // do the whole MSE accumulate in i32 with half the L1/L2 footprint.
+                    if self.fast_mode && qjl.is_empty() {
+                        return unsafe {
+                            self.score_ip_encoded_packed_b4_simd_i16(prep, packed_mse)
+                        };
+                    }
                     return unsafe {
                         self.score_ip_encoded_packed_b4_simd(prep, packed_mse, qjl, gamma)
                     };
@@ -692,6 +717,89 @@ impl ProdQuantizer {
         }
 
         (mse_sum + (gamma as f32) * prep.qjl_scale * qjl_sum) as f64
+    }
+
+    /// P7: i16 LUT variant of the b=4 fast-mode scorer.
+    /// Halves the LUT footprint (96 KB -> 48 KB at d=1536, lut_w=16) and uses an
+    /// i32 accumulator (1-cycle latency vs f32 add's 4 cycles). Single global scale
+    /// applied at the very end.
+    /// Bit-identical R@1/R@10 to the f32 variant per P6 numpy validation.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn score_ip_encoded_packed_b4_simd_i16(
+        &self,
+        prep: &PreparedIpQuery,
+        packed_mse: &[u8],
+    ) -> f64 {
+        use std::arch::x86_64::*;
+
+        let mut acc_i32 = _mm256_setzero_si256();
+        let lut = prep.mse_lut_i16.as_ptr();
+        let lut_width = prep.mse_lut_width;
+        let n = self.n;
+        let packed_ptr = packed_mse.as_ptr();
+
+        let mut i = 0usize;
+        let mut byte_i = 0usize;
+
+        // Process 16 indices = 8 packed bytes per iteration.
+        while i + 16 <= n {
+            let p64 = unsafe { std::ptr::read_unaligned(packed_ptr.add(byte_i) as *const u64) };
+            let mut nibs = [0u8; 16];
+            let mut bits = p64;
+            for k in 0..8 {
+                nibs[2 * k] = (bits & 0x0f) as u8;
+                nibs[2 * k + 1] = ((bits >> 4) & 0x0f) as u8;
+                bits >>= 8;
+            }
+
+            // First 8 lanes
+            let mut vals = [0i16; 8];
+            for j in 0..8 {
+                unsafe {
+                    vals[j] = *lut.add((i + j) * lut_width + nibs[j] as usize);
+                }
+            }
+            let v128 = _mm_loadu_si128(vals.as_ptr() as *const __m128i);
+            let v256 = _mm256_cvtepi16_epi32(v128);
+            acc_i32 = _mm256_add_epi32(acc_i32, v256);
+
+            // Second 8 lanes
+            for j in 0..8 {
+                unsafe {
+                    vals[j] = *lut.add((i + 8 + j) * lut_width + nibs[8 + j] as usize);
+                }
+            }
+            let v128 = _mm_loadu_si128(vals.as_ptr() as *const __m128i);
+            let v256 = _mm256_cvtepi16_epi32(v128);
+            acc_i32 = _mm256_add_epi32(acc_i32, v256);
+
+            i += 16;
+            byte_i += 8;
+        }
+
+        // Reduce acc_i32 horizontally.
+        let mut tmp = [0i32; 8];
+        _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, acc_i32);
+        let mut sum_i64: i64 = 0;
+        for v in tmp {
+            sum_i64 += v as i64;
+        }
+
+        // Scalar tail (n not multiple of 16).
+        while i < n {
+            let b = unsafe { *packed_ptr.add(byte_i) };
+            let nib = if i % 2 == 0 { b & 0x0f } else { b >> 4 };
+            sum_i64 += unsafe { *lut.add(i * lut_width + nib as usize) } as i64;
+            i += 1;
+            if i % 2 == 0 {
+                byte_i += 1;
+            }
+        }
+
+        // Convert i32 sum to f32 by multiplying by global scale.
+        (sum_i64 as f32 * prep.mse_lut_i16_scale) as f64
     }
 
     pub fn quantize(&self, x: &[f32]) -> (Vec<CodeIndex>, Vec<u8>, f64) {
@@ -994,7 +1102,7 @@ impl ProdQuantizer {
 /// Lower return value = closer in IP space. Caller is responsible for ensuring
 /// `query_signs.len() == mse_bytes.len() / 4` (i.e. b=4 stride).
 #[inline]
-pub(crate) fn hamming_disagree_b4_signs(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
+pub fn hamming_disagree_b4_signs(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
     debug_assert_eq!(query_signs.len() * 4, mse_bytes.len());
     let mut disagree = 0u32;
     let mut i = 0usize;
