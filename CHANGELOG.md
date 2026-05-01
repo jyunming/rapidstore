@@ -38,7 +38,7 @@ Brute-force search hot path optimization sprint. Three perf landings stack to **
 ### Tests
 
 - New `benches/score_kernel.rs` — Criterion microbench harness for `score_ip_encoded_packed_b4_simd`, `prepare_ip_query`, `hamming_disagree_b4_signs`, and a 4k-slot in-cache scan. Run with `cargo bench --bench score_kernel`. Used during the sprint to gate sub-5% kernel changes that the noisy end-to-end Python bench cannot reliably distinguish.
-- 427/427 cargo lib tests pass (425 from v0.8.2 + 2 new from the cosine batch + flush_for_close fix).
+- 425/425 cargo lib tests pass.
 - Full paper bench validated against `main` HEAD on the same machine: brute-force −21% p50 at d=1536; ANN R@1 actually improved by 0.8–0.9pp at d=1536 (recall not regressed despite ANN being unrelated to the sprint changes — likely run variance favouring v0.8.3).
 
 ---
