@@ -1220,13 +1220,14 @@ impl TurboQuantEngine {
             let qjl_bits = &rec[mse_len..mse_len + qjl_len];
 
             for q_idx in 0..nq {
-                let raw =
-                    quantizer.score_ip_encoded(&preps[q_idx], &idx_buf, qjl_bits, gamma as f64)
-                        * doc_norm as f64;
+                let ip =
+                    quantizer.score_ip_encoded(&preps[q_idx], &idx_buf, qjl_bits, gamma as f64);
+                // Cosine: vectors stored unit-normalised; ip = <q, d̂>; divide by ‖q‖.
+                // IP: multiply by doc_norm to recover the original inner product magnitude.
                 let score = if matches!(self.metric, DistanceMetric::Cosine) {
-                    raw * q_norms_inv[q_idx]
+                    ip * q_norms_inv[q_idx]
                 } else {
-                    raw
+                    ip * doc_norm as f64
                 };
                 let heap = &mut per_query[q_idx];
                 if use_small_topk {
@@ -3011,10 +3012,11 @@ impl TurboQuantEngine {
         self.bm25
             .flush()
             .map_err(|e| format!("flush_for_close: bm25.flush failed: {e}"))?;
-        self.persist_id_pool()
-            .map_err(|e| format!("flush_for_close: persist_id_pool failed: {e}"))?;
 
         // Sync live_codes.bin to the backend (required for cloud / remote backends).
+        // IMPORTANT: upload live codes *before* persisting the ID pool so that a crash
+        // between the two leaves a recoverable state (stale ID pool → WAL replay rebuilds
+        // it) rather than an ID pool that references codes that never reached the backend.
         self.live_codes.release_handles();
         let had_vraw = self.live_vraw.is_some();
         if had_vraw {
@@ -3037,6 +3039,11 @@ impl TurboQuantEngine {
                 self.backend.write("live_vectors.bin", &live_vraw_data)?;
             }
         }
+        // Persist ID pool last: for remote backends this uploads live_ids.bin after
+        // live_codes.bin is safely stored, ensuring the ID pool never gets ahead of
+        // the codes it references on the remote side.
+        self.persist_id_pool()
+            .map_err(|e| format!("flush_for_close: persist_id_pool failed: {e}"))?;
         // Reopen handles so truncate_to() in close() can operate on an open file.
         self.live_codes = LiveCodesFile::open(live_codes_path, self.live_stride())?;
         let slot_count = self.id_pool.slot_count();
