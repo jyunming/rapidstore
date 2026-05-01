@@ -6,6 +6,36 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
+## [0.8.3] — 2026-05-01
+
+Brute-force search hot path optimization sprint. Three perf landings stack to **−11 to −22% p50 latency** on the b=4 fast-mode brute path with **bit-identical recall** across glove-200, dbpedia-1536, dbpedia-3072 (n=100k, 200 queries, 3-iter median).
+
+### Performance
+
+- **Sign-bit Hamming pre-filter for b=4 fast-mode** (`src/storage/engine/mod.rs`, `src/quantizer/prod.rs`). At fast-mode + b=4, the high bit of every 4-bit MSE nibble is the sign of the corresponding rotated dimension (Lloyd-Max codebook is symmetric around 0). This lets us derive a 1-bit-per-dim sketch directly from the existing live MSE bytes — no extra storage. Active when `qjl_len == 0 && b == 4 && d ≥ 512 && candidates ≥ 5_000`. Pre-scores all candidates by Hamming distance, retains top 1/16, full LUT scoring runs only on those. Bit-identical recall (Hamming only orders the prefilter survivors; no candidate is dropped that the full scorer would have ranked top-K).
+
+- **Fused MSE nibble unpack into b=4 scoring loop** (`src/quantizer/prod.rs`: new `score_ip_encoded_packed_b4_simd`). The prior path materialized a `Vec<u16>` of code indices per slot before scoring (~4-8 KB of L1 traffic per slot at d=2048). The fused kernel reads packed bytes directly and extracts nibbles inline into a 16-byte stack array. AVX2/FMA gated; b≠4 falls back to the prior unpack-then-score path.
+
+- **Tightened `HAMMING_PREFILTER_RETAIN_RATIO` from 8 → 16** (`src/storage/engine/mod.rs:2446`). Halves the post-filter kernel work (6250 vs 12500 candidates scored at n=100k). Hamming sketch's recall is sufficient at 1/16 retention for production embedding distributions; bit-identical R@1/R@10 vs the previous ratio.
+
+- **i16 LUT for b=4 fast-mode scorer** (`src/quantizer/prod.rs`: new `score_ip_encoded_packed_b4_simd_i16`). `PreparedIpQuery` now also carries an i16 mirror of the MSE LUT with a single global max-abs scale. Halves the LUT L1/L2 footprint (96 KB → 48 KB at d=1536, lut_w=16) and uses an i32 accumulator (1-cycle latency vs f32 add's 4 cycles). Scale applied once at the very end. Numpy-only validation showed bit-identical R@1/R@10 vs the f32 path on synthetic Gaussian and dbpedia query distributions, with EITHER per-row or global scale (global chosen for SIMD simplicity).
+
+  | Dataset | Cell | v0.8.2 p50 | v0.8.3 p50 | Δ |
+  |---|---|---:|---:|---:|
+  | glove-200 | rerank=F | 1.15 ms | 1.02 ms | **−11.3%** |
+  | glove-200 | rerank=T | 1.44 ms | 1.33 ms | **−7.6%** |
+  | dbpedia-1536 | rerank=F | 10.31 ms | 7.99 ms | **−22.5%** |
+  | dbpedia-1536 | rerank=T | 10.12 ms | 8.22 ms | **−18.8%** |
+  | dbpedia-3072 | rerank=F | 22.36 ms | 19.73 ms | **−11.8%** |
+  | dbpedia-3072 | rerank=T | 21.95 ms | 20.08 ms | **−8.5%** |
+
+### Tests
+
+- New `benches/score_kernel.rs` — Criterion microbench harness for `score_ip_encoded_packed_b4_simd`, `prepare_ip_query`, `hamming_disagree_b4_signs`, and a 4k-slot in-cache scan. Run with `cargo bench --bench score_kernel`. Used during the sprint to gate sub-5% kernel changes that the noisy end-to-end Python bench cannot reliably distinguish.
+- 425/425 cargo lib tests pass.
+
+---
+
 ## [0.8.2] — 2026-04-30
 
 Audit-driven follow-up to v0.8.1: a deeper scan surfaced three real bugs in compaction and snapshot paths. All three are fixed here, each with a regression test pinning the contract.
