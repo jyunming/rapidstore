@@ -29,6 +29,12 @@ Brute-force search hot path optimization sprint. Three perf landings stack to **
   | dbpedia-3072 | rerank=F | 22.36 ms | 19.73 ms | **−11.8%** |
   | dbpedia-3072 | rerank=T | 21.95 ms | 20.08 ms | **−8.5%** |
 
+### Fixed
+
+- **`score_batch_brute` cosine path applied stale `doc_norm`** (`src/storage/engine/mod.rs`). Computing `score = ip * doc_norm * q_norm_inv` for the cosine metric — the sequential and parallel cosine paths correctly use only `score = ip * q_norm_inv`. Silent for the common normalize=True case (doc_norm == 1.0); returned wrong scores for normalize=False + cosine + multi-query batch. doc_norm is now applied only on the IP path.
+
+- **`flush_for_close` ordering crash window** (`src/storage/engine/mod.rs`). `persist_id_pool()` ran before the remote-backend upload of `live_codes.bin`. A crash between the two left `live_ids.bin` ahead of `live_codes` on the remote (ID pool referenced codes that never arrived) → corrupt reads on reopen. Flipped the order so codes upload first; stale ID pool is recoverable via WAL replay.
+
 ### Tests
 
 - New `benches/score_kernel.rs` — Criterion microbench harness for `score_ip_encoded_packed_b4_simd`, `prepare_ip_query`, `hamming_disagree_b4_signs`, and a 4k-slot in-cache scan. Run with `cargo bench --bench score_kernel`. Used during the sprint to gate sub-5% kernel changes that the noisy end-to-end Python bench cannot reliably distinguish.
