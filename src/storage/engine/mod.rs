@@ -2114,10 +2114,31 @@ impl TurboQuantEngine {
             // closure so it is allocated once and reused across all HNSW node visits.
             let mut idx_buf_ann = vec![0u16; qn];
 
+            // C2: prefetch upcoming neighbour's live_codes record while the current
+            // one is being scored. Hint to OS, no semantic change. No-op on non-x86_64.
+            let pf_index_ids = self.index_ids.clone();
+            let pf_live_codes = &self.live_codes;
+            let pf_stride = self.live_stride();
+            let prefetch_fn = move |node: u32| {
+                let slot = pf_index_ids[node as usize] as usize;
+                let off = slot.saturating_mul(pf_stride);
+                let bytes = pf_live_codes.as_bytes();
+                if off < bytes.len() {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        std::arch::x86_64::_mm_prefetch(
+                            bytes.as_ptr().add(off) as *const i8,
+                            std::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                    let _ = off;
+                }
+            };
+
             // HNSW beam search: collect internal_k candidates with accurate full-LUT scores.
             // internal_k = sls (≥ top_k) provides a candidate buffer to recover from any
             // graph navigation approximation errors before truncating to the final top_k.
-            let ann_nodes = self.graph.search(
+            let ann_nodes = self.graph.search_with_prefetch(
                 0,
                 internal_k,
                 sls.max(internal_k),
@@ -2155,6 +2176,7 @@ impl TurboQuantEngine {
                     }
                 },
                 slot_set.map(|ss| move |node_idx: u32| ss.contains(&index_ids[node_idx as usize])),
+                Some(prefetch_fn),
             )?;
 
             // Navigation scores from the full LUT are already accurate; no re-score pass
