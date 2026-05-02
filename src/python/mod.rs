@@ -738,10 +738,13 @@ impl Database {
     ) -> PyResult<()> {
         py.allow_threads(|| {
             let mut engine = self.write_engine()?;
+            let d = engine.quantizer.d;
+            let efc = ef_construction
+                .unwrap_or_else(|| crate::storage::engine::default_ann_ef_construction(d));
             engine
                 .create_index_with_params(
                     max_degree.unwrap_or(32),
-                    ef_construction.unwrap_or(200),
+                    efc,
                     search_list_size.unwrap_or(128),
                     alpha.unwrap_or(1.2),
                     n_refinements.unwrap_or(5),
@@ -767,10 +770,13 @@ impl Database {
     ) -> PyResult<()> {
         py.allow_threads(|| {
             let mut engine = self.write_engine()?;
+            let d = engine.quantizer.d;
+            let efc = ef_construction
+                .unwrap_or_else(|| crate::storage::engine::default_ann_ef_construction(d));
             engine
                 .create_index_incremental(
                     max_degree.unwrap_or(32),
-                    ef_construction.unwrap_or(200),
+                    efc,
                     search_list_size.unwrap_or(128),
                     alpha.unwrap_or(1.2),
                     n_refinements.unwrap_or(5),

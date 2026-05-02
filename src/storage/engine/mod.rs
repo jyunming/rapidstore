@@ -86,6 +86,25 @@ pub(crate) fn default_rerank_factor(d: usize, is_ann: bool) -> usize {
     }
 }
 
+/// C1 (Fix B): dim-aware default for HNSW `ef_construction`.
+/// Larger values produce higher-quality neighbour lists at build time, lifting
+/// the search-time recall ceiling. Build is one-shot (not on the query hot path)
+/// so we can afford a more thorough construction at low `d` where quantization
+/// noise is most damaging to graph topology. At high `d` per-node build cost
+/// is already significant; keep the historical default of 200.
+///
+/// Used only when the caller passes `ef_construction=None`. Explicit overrides
+/// are respected.
+pub fn default_ann_ef_construction(d: usize) -> usize {
+    if d <= 384 {
+        400
+    } else if d <= 1024 {
+        300
+    } else {
+        200
+    }
+}
+
 /// Controls the precision used to store raw vectors in `live_vectors.bin` for reranking.
 ///
 /// All options except `Disabled` enable exact second-pass rescoring: after the quantized pass
