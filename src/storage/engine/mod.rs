@@ -1206,10 +1206,17 @@ impl TurboQuantEngine {
             .map(|_| Vec::with_capacity(internal_k.min(256)))
             .collect();
         let mut idx_buf = vec![0u16; quantizer.n];
+        // A2: prefer the fused score_ip_encoded_packed kernel when we're in b=4
+        // (the production cell) — it skips the per-slot idx_buf write and routes
+        // through P7's i16 LUT in fast_mode. Fall back to the unpacked path when
+        // bits != 4 (no fused kernel for those).
+        let b4 = quantizer.mse_bits_per_idx() == 4;
 
         for &slot in &candidate_slots {
             let rec = &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
-            quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx_buf);
+            if !b4 {
+                quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx_buf);
+            }
             let gamma = f32::from_le_bytes(
                 rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                     .try_into()
@@ -1221,10 +1228,20 @@ impl TurboQuantEngine {
                     .expect("doc_norm field is 4 bytes"),
             );
             let qjl_bits = &rec[mse_len..mse_len + qjl_len];
+            let packed_mse = &rec[..mse_len];
 
             for q_idx in 0..nq {
-                let ip =
-                    quantizer.score_ip_encoded(&preps[q_idx], &idx_buf, qjl_bits, gamma as f64);
+                let ip = if b4 {
+                    quantizer.score_ip_encoded_packed(
+                        &preps[q_idx],
+                        packed_mse,
+                        qjl_bits,
+                        gamma as f64,
+                    )
+                } else {
+                    quantizer.score_ip_encoded(&preps[q_idx], &idx_buf, qjl_bits, gamma as f64)
+                };
+                let _ = packed_mse; // silence unused-var if b4=false at compile time
                 // Cosine: vectors stored unit-normalised; ip = <q, d̂>; divide by ‖q‖.
                 // IP: multiply by doc_norm to recover the original inner product magnitude.
                 let score = if matches!(self.metric, DistanceMetric::Cosine) {
