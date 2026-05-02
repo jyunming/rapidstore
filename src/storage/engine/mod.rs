@@ -566,6 +566,9 @@ impl TurboQuantEngine {
         let mse_len = (quantizer.n * quantizer.mse_bits_per_idx()).div_ceil(8);
         let stride = mse_len + qjl_len + LIVE_GAMMA_BYTES + LIVE_NORM_BYTES + LIVE_DELETED_BYTES;
         let live_codes = LiveCodesFile::open(Path::new(local_dir).join("live_codes.bin"), stride)?;
+        // A1: hint OS to prefetch live_codes.bin into page cache. Reduces cold-cache
+        // penalty on the first few queries after open. Unix-only (no-op on Windows).
+        live_codes.advise_willneed();
         let live_vraw_path = Path::new(local_dir).join("live_vectors.bin");
         let live_vraw = if manifest.rerank_enabled
             && live_vraw_path.exists()
