@@ -150,3 +150,5 @@ docs/SERVER_DESIGN.md
 /.venv-dev/
 /benchmarks/_smoke_v09.py
 /benchmarks/_verify_bf16_recall.py
+/benchmarks/_bench_identity_baseline.py
+/benchmarks/_bench_identity_results.json
