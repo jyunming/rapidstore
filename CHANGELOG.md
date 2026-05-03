@@ -4,6 +4,8 @@ All notable changes to TurboQuantDB are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ---
 
 ## [0.8.3] — 2026-05-03
@@ -304,4 +306,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## Notes
 
 - This project follows [Semantic Versioning](https://semver.org/) (`MAJOR.MINOR.PATCH`) and is pre-1.0; public API may change between minor versions.
-- Version is defined in `pyproject.toml` (single source of truth). `Cargo.toml` is kept in sync.
+- Version is defined in `pyproject.toml` (single source of truth). `Cargo.toml` is kept in sync manually.
