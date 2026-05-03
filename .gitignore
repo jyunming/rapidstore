@@ -97,6 +97,8 @@ convert_pdf.py
 /benchmarks/_combine_bench_results.py
 /benchmarks/_vector_store_compare.py
 /benchmarks/_bench_rotation_compare.py
+/benchmarks/_bench_tqfamily_compare.py
+/benchmarks/_smoke_tqfamily.py
 /benchmarks/compare_bench.py
 /benchmarks/hamming_nav_bench.py
 /benchmarks/ingest_speedup_bench.py
@@ -135,3 +137,16 @@ benchmarks/_private_plots_perf.png
 python/tqdb/_bin/tqdb-server
 python/tqdb/_bin/tqdb-server.exe
 docs/SERVER_DESIGN.md
+/benchmarks/_inspect_disk_layout.py
+/benchmarks/_bench_tqfamily_dim_sweep.py
+/benchmarks/_bench_tqfamily_dim_results.json
+/benchmarks/_bench_tqfamily_dim*.log
+/benchmarks/_inspect_srht_layout.py
+/benchmarks/_bench_more_quantizers.py
+/benchmarks/_bench_more_quantizers_results.json
+/benchmarks/_bench_tqdb_routing.py
+/benchmarks/_bench_tqdb_routing_results.json
+/benchmarks/_bench_tqdb_routing*.log
+/.venv-dev/
+/benchmarks/_smoke_v09.py
+/benchmarks/_verify_bf16_recall.py

@@ -59,12 +59,18 @@ impl Database {
     ///         that already emit unit vectors can set this to avoid repeating the normalisation
     ///         themselves.  Default ``False``.
     ///     quantizer_type: Which quantizer rotation to use:
-    ///         - ``None`` / ``"dense"`` (default): Haar-uniform QR rotation + dense Gaussian
-    ///           projection. n=d (no padding). Best recall; O(d²) ingest cost.
-    ///           ``"exact"`` is accepted as a legacy alias.
-    ///         - ``"srht"``: structured Walsh-Hadamard rotation. n=next_power_of_two(d).
-    ///           O(d log d) ingest; ~25% more subspaces scored at search time.
-    ///           Use for streaming or frequent-ingest workloads at high d.
+    ///         - ``None`` (default): auto-select. ``"dense"`` for ``d < 1024``,
+    ///           ``"srht"`` for ``d >= 1024``. The crossover reflects empirical
+    ///           wins for SRHT on ingest, p50, and (slightly) recall once the
+    ///           rotation is the dominant cost. To force a specific mode set the
+    ///           string explicitly.
+    ///         - ``"dense"``: Haar-uniform QR rotation + dense Gaussian
+    ///           projection. n=d (no padding). O(d²) ingest cost; stores a
+    ///           d×d f32 matrix on disk. ``"exact"`` is accepted as a legacy
+    ///           alias.
+    ///         - ``"srht"``: structured Walsh-Hadamard rotation. n=next
+    ///           power-of-two of d. O(d log d) ingest; pads to the next pow2
+    ///           in storage at non-pow2 d.
     ///         See `docs/QUANTIZER_MODES.md` for a full CPU/RAM/disk/recall comparison.
     ///
     /// Returns:

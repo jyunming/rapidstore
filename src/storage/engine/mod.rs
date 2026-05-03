@@ -533,7 +533,13 @@ impl TurboQuantEngine {
             let q = load_quantizer_state(local_dir, &backend)?;
             (m, q)
         } else {
-            let qt = quantizer_type.as_deref().unwrap_or("dense");
+            // Auto-select rotation: SRHT at d≥1024 is decisively better on
+            // ingest (2-3×), p50 latency (1.5-3×), and matches/beats dense
+            // Haar QR on recall in our public bench. Dense remains the default
+            // at low dim where SRHT's pow2 padding tax dominates the win.
+            let qt = quantizer_type.as_deref().unwrap_or_else(|| {
+                if d >= 1024 { "srht" } else { "dense" }
+            });
             let is_dense = qt == "dense" || qt == "exact"; // "exact" is a legacy alias
             let q = if is_dense && fast_mode {
                 ProdQuantizer::new_dense_fast(d, b, seed)

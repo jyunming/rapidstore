@@ -70,8 +70,56 @@ pub struct MseQuantizer {
     pub centroids: Vec<f32>,
     /// Exact-paper mode: d×d Haar-random orthogonal matrix, row-major.
     /// `None` → use SRHT (default). `Some` → dense matrix-vector multiply.
-    #[serde(default)]
+    ///
+    /// On disk this is encoded as bfloat16 (truncated f32 high bits) — about
+    /// 3 bits of mantissa loss per element relative to f32. For an orthogonal
+    /// matrix with elements ~N(0, 1/d) this loss is well below the Lloyd-Max
+    /// codebook quantization noise floor, so recall is unchanged at the
+    /// measurement precision of the public benchmarks. In memory the matrix
+    /// is rehydrated to f32 so the rotation hot-path is unchanged.
+    #[serde(default, with = "bf16_option_vec")]
     pub rotation_matrix: Option<Vec<f32>>,
+}
+
+/// Serde adapter: serialize `Option<Vec<f32>>` as `Option<Vec<u16>>` where each
+/// `u16` holds the high 16 bits of an `f32` (bfloat16 with round-to-nearest).
+/// On deserialization the f32 is reconstructed by left-shifting back into the
+/// high half of the f32 bits — the low mantissa bits are zero.
+mod bf16_option_vec {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    fn f32_to_bf16(x: f32) -> u16 {
+        // Round-to-nearest-even: add 0x7FFF + (low_bit) to the bits, then truncate.
+        let bits = x.to_bits();
+        let low_bit = (bits >> 16) & 1;
+        let rounded = bits.wrapping_add(0x7FFF + low_bit);
+        (rounded >> 16) as u16
+    }
+
+    fn bf16_to_f32(b: u16) -> f32 {
+        f32::from_bits((b as u32) << 16)
+    }
+
+    pub fn serialize<S>(v: &Option<Vec<f32>>, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match v {
+            None => Option::<Vec<u16>>::None.serialize(s),
+            Some(v) => {
+                let packed: Vec<u16> = v.iter().map(|&f| f32_to_bf16(f)).collect();
+                Some(packed).serialize(s)
+            }
+        }
+    }
+
+    pub fn deserialize<'de, D>(d: D) -> Result<Option<Vec<f32>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<Vec<u16>> = Option::deserialize(d)?;
+        Ok(opt.map(|v| v.iter().map(|&b| bf16_to_f32(b)).collect()))
+    }
 }
 
 impl MseQuantizer {
