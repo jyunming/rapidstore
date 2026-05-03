@@ -382,9 +382,7 @@ impl GraphManager {
                     // pattern of HNSW beam search. Caller-supplied; no-op when None.
                     if let Some(ref pf) = prefetch {
                         if let Some(&nb_next) = nbs.get(i + 1) {
-                            if (nb_next as usize) < self.node_count
-                                && !visited[nb_next as usize]
-                            {
+                            if (nb_next as usize) < self.node_count && !visited[nb_next as usize] {
                                 pf(nb_next);
                             }
                         }

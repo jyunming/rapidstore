@@ -1,19 +1,21 @@
 // Microbench harness for the brute-force scoring hot path.
 // Run with: cargo bench --bench score_kernel
 // Or a single group: cargo bench --bench score_kernel score_packed
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use ndarray::Array1;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
-use tqdb::quantizer::prod::{hamming_disagree_b4_signs, ProdQuantizer};
+use tqdb::quantizer::prod::{ProdQuantizer, hamming_disagree_b4_signs};
 
 const DIMS: &[usize] = &[200, 1536, 3072];
 const N_SLOTS: usize = 4096; // microbench scope: in-cache, isolates kernel arithmetic
 
 fn gen_vec(d: usize, rng: &mut StdRng) -> Vec<f32> {
     let dist = StandardNormal;
-    (0..d).map(|_| Distribution::<f64>::sample(&dist, rng) as f32).collect()
+    (0..d)
+        .map(|_| Distribution::<f64>::sample(&dist, rng) as f32)
+        .collect()
 }
 
 fn bench_score_packed_b4(c: &mut Criterion) {
