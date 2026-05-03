@@ -137,14 +137,19 @@ pub enum RerankPrecision {
     /// with existing databases; new dbs should use `ResidualInt4`.
     Int4,
     /// **P12 (v0.8.3) — recommended low-disk rerank.** INT4-quantized
-    /// **residual** = `vec_unit - dequant(MSE codes)`, with per-vector scale.
-    /// Stride = ⌈d/2⌉ + 4 bytes (same as `Int4`). Because the residual has a
-    /// much smaller dynamic range than the raw vector, 4 bits buy substantially
-    /// more precision per dim — recall matches `Int8` at half the disk on
-    /// b=4 production cells.
+    /// **residual** = `vec − dequant(MSE codes) × doc_norm`, INT4-quantised
+    /// with per-vector scale. Stride = ⌈d/2⌉ + 4 bytes (same as `Int4`).
+    /// Because the residual has a much smaller dynamic range than the raw
+    /// vector, 4 bits buy substantially more precision per dim — recall
+    /// matches `Int8` at half the disk on b=4 production cells.
     ///
-    /// Score is additive: `final = code_score + doc_norm × <q, residual_decoded>`.
-    /// No redundant code re-dequantization at query time.
+    /// Score is additive at query time:
+    ///   * IP:     `final = cand_score + <q, residual_decoded>`
+    ///   * Cosine: `final = cand_score + q_norm_inv × <q, residual_decoded>`
+    /// (`doc_norm` is absorbed into the residual at encode time, so the
+    /// rerank score does NOT multiply by it again at query time. See
+    /// `live_rerank_score_residual_int4`.) No redundant code re-dequantization
+    /// at query time.
     ResidualInt4,
     /// Raw f16 vectors. Stride = d × 2 bytes. Maximum precision for non-normalized vectors.
     F16,
@@ -1239,10 +1244,11 @@ impl TurboQuantEngine {
         let mut per_query: Vec<Vec<(u32, f64)>> = (0..nq)
             .map(|_| Vec::with_capacity(internal_k.min(256)))
             .collect();
-        let _ = vec![0u16; quantizer.n]; // (formerly idx_buf for the b!=4 fallback)
         // P8 (v0.8.3): score_ip_encoded_packed now dispatches a const-generic
         // SIMD kernel for every b ∈ [1, 8], so the previous A2-era b=4 gate is
         // gone. Every brute-force candidate goes through the fused-unpack path.
+        // (The pre-P8 code allocated a per-call `idx_buf: Vec<u16>` for the
+        // b!=4 fallback — that fallback is gone and the buffer along with it.)
         for &slot in &candidate_slots {
             let rec = &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
             let gamma = f32::from_le_bytes(
@@ -2162,7 +2168,11 @@ impl TurboQuantEngine {
 
             // C2: prefetch upcoming neighbour's live_codes record while the current
             // one is being scored. Hint to OS, no semantic change. No-op on non-x86_64.
-            let pf_index_ids = self.index_ids.clone();
+            // Capture `index_ids` by reference (already borrowed at line 2160) — the
+            // closure lives only for the duration of the search call so a borrow is
+            // sufficient and avoids a per-query Vec<u32> clone of the (potentially
+            // huge) index_ids buffer.
+            let pf_index_ids: &[u32] = index_ids.as_slice();
             let pf_live_codes = &self.live_codes;
             let pf_stride = self.live_stride();
             let prefetch_fn = move |node: u32| {
@@ -2688,11 +2698,10 @@ impl TurboQuantEngine {
             } else {
                 n_candidates
             });
+            // P8 (v0.8.3): IP/Cosine paths route through `score_ip_encoded_packed`
+            // (const-generic SIMD for every b ∈ [1, 8], no need for an unpacked
+            // idx_buf). The L2 fallback below still needs the unpacked indices.
             let mut idx = vec![0u16; quantizer.n];
-            // P8 (v0.8.3): score_ip_encoded_packed handles all b ∈ [1, 8] via
-            // a const-generic SIMD kernel. Removed the prior `if b4 ... else
-            // unpack+score` branch that bypassed SIMD for b ∈ {2, 3, 5, 6, 7, 8}.
-            let _ = &mut idx; // retained for the L1 (Hamming/L2) path below
             match metric {
                 DistanceMetric::Ip => {
                     let prep = quantizer.prepare_ip_query(query);

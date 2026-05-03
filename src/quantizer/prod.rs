@@ -632,6 +632,14 @@ impl ProdQuantizer {
             }
         }
         // b > 8 or no AVX2: unpack + scalar/SIMD fallback through score_ip_encoded.
+        //
+        // The per-call `Vec<CodeIndex>` allocation here is acceptable for two
+        // reasons: (1) on x86_64 with AVX2/FMA + b ∈ [1, 8] (production path)
+        // this branch is never taken; (2) the only callers are the non-SIMD
+        // ARM/aarch64 path (already scoring without SIMD) and the rare b > 8
+        // case (codes spanning 3+ bytes — not used by any documented config).
+        // Adding a thread-local scratch buffer would help only those paths
+        // and complicate the call signature.
         let mut idx = vec![0 as CodeIndex; self.n];
         self.unpack_mse_indices(packed_mse, &mut idx);
         self.score_ip_encoded(prep, &idx, qjl, gamma)
@@ -1186,23 +1194,23 @@ fn hamming_disagree_b2_fast(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
         i += 8;
         q_i += 4;
     }
-    // Tail (mse_bytes.len() not multiple of 8): byte-by-byte fallback.
+    // Tail (mse_bytes.len() not a multiple of 8): byte-by-byte. Each mse byte
+    // contributes 4 sign bits → low nibble of `query_signs[i/2]` if `i` is
+    // even, high nibble if `i` is odd. The assertion at the top of
+    // `hamming_disagree_signs::<2>` guarantees `query_signs.len() * 2 ==
+    // mse_bytes.len()`, so `i/2` is always a valid index into query_signs.
+    let _ = q_i; // q_i tracking is only needed for the main 8-byte loop above
     while i < mse_bytes.len() {
         let byte = mse_bytes[i] as u32;
-        // Extract bits {1, 3, 5, 7} into output bits {0, 1, 2, 3}.
         let mut packed: u8 = 0;
         for c in 0..4 {
             packed |= (((byte >> (2 * c + 1)) & 1) << c) as u8;
         }
-        // Compare against the 4 sign bits of this byte chunk in the query sketch.
-        // q_i / 1 mapping: every input byte = 4 sketch bits = 1/2 sketch byte.
-        // To avoid awkward half-byte addressing in the tail, compare against the
-        // appropriate half-byte of the next query sketch byte.
-        let q_byte = query_signs[q_i + (i - (q_i * 2))]; // best-effort; rare path
+        let q_byte = query_signs[i / 2];
         let q_nibble = if (i & 1) == 0 {
             q_byte & 0x0F
         } else {
-            q_byte >> 4
+            (q_byte >> 4) & 0x0F
         };
         disagree += (packed ^ q_nibble).count_ones();
         i += 1;
@@ -1739,6 +1747,39 @@ mod tests {
             let legacy = super::hamming_disagree_b4_signs(&q_signs, &mse_bytes);
             let generic = super::hamming_disagree_signs::<4>(&q_signs, &mse_bytes);
             assert_eq!(legacy, generic, "trial={trial} n={n}");
+        }
+    }
+
+    #[test]
+    fn p8_hamming_b2_tail_with_odd_byte_count() {
+        // Regression for a buggy `q_i + (i - q_i*2)` tail-index expression
+        // that drifted out of bounds when mse_bytes.len() % 8 != 0. Exercises
+        // mse_bytes.len() ∈ {10, 12, 14} (each → 2/4/6 byte tail at b=2).
+        use rand::Rng;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        let mut rng = StdRng::seed_from_u64(0xb201);
+        for &mse_len in &[10usize, 12, 14, 18, 22] {
+            let q_signs_len = mse_len / 2;
+            let mse_bytes: Vec<u8> = (0..mse_len)
+                .map(|_| rng.sample(rand::distributions::Standard))
+                .collect();
+            let q_signs: Vec<u8> = (0..q_signs_len)
+                .map(|_| rng.sample(rand::distributions::Standard))
+                .collect();
+            // Should not panic and should match the brute-force MSB extraction.
+            let actual = super::hamming_disagree_signs::<2>(&q_signs, &mse_bytes);
+            let n = mse_len * 8 / 2;
+            let mut expected = 0u32;
+            for i in 0..n {
+                let bit_pos = i * 2 + 1;
+                let doc_bit = (mse_bytes[bit_pos >> 3] >> (bit_pos & 7)) & 1;
+                let q_bit = (q_signs[i >> 3] >> (i & 7)) & 1;
+                if doc_bit != q_bit {
+                    expected += 1;
+                }
+            }
+            assert_eq!(actual, expected, "mse_len={mse_len}");
         }
     }
 
