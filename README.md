@@ -114,7 +114,7 @@ All numbers below come from runs on a single Windows laptop; absolute values wil
 
 ### A. Paper-validation (n=100k, brute-force, fast_mode=True)
 
-Config: dbpedia-1536, b=4, `rerank=True`, brute-force, `quantizer_type=None` (dense). Matches arXiv:2504.19874 Figure 5b's bit allocation.
+Config: dbpedia-1536, b=4, `rerank=True`, brute-force, `quantizer_type="dense"`. Matches arXiv:2504.19874 Figure 5b's bit allocation. (As of v0.9 the default at d ≥ 1024 is `"srht"`, which is faster on ingest and p50 with comparable recall — see [QUANTIZER_MODES.md](docs/QUANTIZER_MODES.md).)
 
 | Metric | Value |
 |---|---:|
@@ -240,7 +240,11 @@ Pass `executor=` to share a thread pool across multiple databases or to control 
 
 ## Configurations for common goals
 
-`rerank=True` stores raw INT8 vectors alongside compressed codes for exact second-pass rescoring. `fast_mode=True` (default) uses MSE-only quantization — optimal for d < 1536.
+`rerank=True` stores raw INT8 vectors alongside compressed codes for exact second-pass rescoring. The default is `rerank=False` for compression-first storage; turn it on when you need the extra recall.
+
+> **When do you actually need rerank?** Below d ≈ 768 the recall lift from rerank is large (+15–30 pp R@1) and worth the disk. From d ≥ 1536 with `bits=4`, brute-force `rerank=False` already hits R@1 ≈ 0.96 — rerank pushes that to 0.997 but doubles disk. For most production embedding shapes (1536, 3072), `rerank=False` is the right default.
+
+`fast_mode=True` (default) uses MSE-only quantization — optimal for d < 1536.
 
 ```python
 from tqdb import Database

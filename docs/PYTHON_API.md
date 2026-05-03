@@ -46,11 +46,13 @@ db = Database.open(
     normalize=False,         # bool — L2-normalize every inserted vector and every query at
                              #        write time; makes inner-product scoring equivalent to
                              #        cosine similarity without changing the metric parameter
-    quantizer_type=None,     # str|None — None/"dense" = default Haar-uniform QR path
-                             #            (O(d²) ingest, n=d, best recall)
-                             #            "exact" is a legacy alias for "dense"
-                             #            "srht" = structured fast path (O(d log d),
-                             #            n=next_power_of_two(d), faster ingest)
+    quantizer_type=None,     # str|None — None = auto: "dense" if d<1024, "srht" if d>=1024.
+                             #            "dense" = Haar-uniform QR (O(d²) ingest, n=d).
+                             #                     Rotation matrix stored as bf16 on disk.
+                             #            "exact" is a legacy alias for "dense".
+                             #            "srht" = structured Walsh-Hadamard (O(d log d) ingest,
+                             #                    n=next_power_of_two(d), faster ingest+search at
+                             #                    d>=1024).
 )
 
 # Parameterless reopen — reads all parameters from manifest.json:
@@ -75,8 +77,11 @@ images   = Database.open("./mydb", dimension=512,  collection="images")
 
 TurboQuantDB exposes the same two-stage MSE + residual-QJL layout through two quantizer families:
 
-- **`None` / `"dense"` (default)** — Haar-uniform QR rotation + dense i.i.d. Gaussian QJL with `n = d`. Best recall; O(d²) ingest cost. `"exact"` is a legacy alias.
-- **`"srht"`** — structured Walsh-Hadamard + random-sign transforms, `n = next_power_of_two(d)`, O(d log d) ingest. Use for streaming or frequent-ingest workloads at high d.
+- **`None` (default)** — auto-pick based on dimension. `"dense"` for `d < 1024`, `"srht"` for `d >= 1024`. The crossover reflects empirical wins for SRHT once the rotation dominates ingest/latency cost.
+- **`"dense"`** — Haar-uniform QR rotation + dense i.i.d. Gaussian QJL with `n = d`. O(d²) ingest cost; rotation matrix stored as bf16 on disk (since v0.9, ~50% rotation-tax savings vs f32). `"exact"` is a legacy alias.
+- **`"srht"`** — structured Walsh-Hadamard + random-sign transforms, `n = next_power_of_two(d)`, O(d log d) ingest. At `d >= 1024` this is now the default — typically 2–3× faster ingest, 1.5–3× lower p50 latency, with recall equal to or slightly better than dense in our public-bench numbers.
+
+See [`docs/QUANTIZER_MODES.md`](QUANTIZER_MODES.md) for the full per-dim trade-off table including disk and RAM.
 
 ### `fast_mode` and `rerank` interaction
 

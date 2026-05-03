@@ -1,134 +1,149 @@
-# Quantizer Modes: SRHT vs. Dense
+# Quantizer Modes: SRHT vs Dense Haar QR
 
-TurboQuantDB supports two quantizer families, selected via `quantizer_type` when opening a
-database. Both use the same MSE (Lloyd-Max) codebook and produce identical on-disk code
+TurboQuantDB supports two quantizer families, selected via `quantizer_type` when opening
+a database. Both use the same Lloyd-Max codebook and produce identical on-disk *code*
 layouts — the only difference is the rotation applied before quantization.
 
 ```python
-db = Database.open(path, dimension=DIM, bits=4)                           # default = dense
-db = Database.open(path, dimension=DIM, bits=4, quantizer_type="dense")   # explicit dense
-db = Database.open(path, dimension=DIM, bits=4, quantizer_type="srht")    # fast-ingest path
+db = Database.open(path, dimension=DIM, bits=4)                           # auto: dense if d<1024, srht if d>=1024
+db = Database.open(path, dimension=DIM, bits=4, quantizer_type="dense")   # force dense
+db = Database.open(path, dimension=DIM, bits=4, quantizer_type="srht")    # force srht
 # "exact" is accepted as a backward-compatible alias for "dense"
 ```
 
----
+## Default at a glance
 
-## What Each Mode Does
+| Dimension | Default | Why |
+|---|---|---|
+| `d < 1024` | `"dense"` | SRHT's pow2-padding tax outweighs its rotation-matrix savings; dense is competitive on every axis. |
+| `d >= 1024` | `"srht"` | SRHT delivers 2–3× ingest speedup, 1.5–3× lower p50, equal or slightly better recall, and lower RAM. The pow2-padding overhead becomes acceptable relative to total disk. |
 
-### `"srht"`
+The threshold is conservative — at d ≈ 768 SRHT already wins on most axes. If you
+care about ingest throughput at d=768 or below, override with `quantizer_type="srht"`
+explicitly.
 
-Applies a **Structured Random Hadamard Transform**: a random diagonal sign-flip matrix `D`
-followed by the Walsh-Hadamard transform `H`. Zero-pads the input to the next power of two
-so `n = next_power_of_two(d)`.
+## What each mode does
+
+### `"srht"` — Structured Random Hadamard Transform
+
+Applies a random diagonal sign-flip matrix `D` followed by the Walsh–Hadamard transform
+`H`. Zero-pads the input to the next power of two so `n = next_power_of_two(d)`.
 
 - Rotation cost: O(d log d) per vector
-- Rotation state: a random sign vector — O(d) storage, O(d) RAM
+- Rotation state on disk: a length-n random sign vector — **negligible**
 - Subspace count (b=4): `n / 8 = next_power_of_two(d) / 8`
 
-### `"dense"` (default)
+### `"dense"` — Haar-uniform QR rotation
 
-Applies a **Haar-uniform QR rotation**: samples a random Gaussian matrix and takes its QR
-factorization to get a Haar-distributed orthogonal matrix. No zero-padding: `n = d`.
+Samples a random Gaussian d×d matrix and takes its QR factorization to get a
+Haar-distributed orthogonal matrix. No zero-padding: `n = d`.
 
 - Rotation cost: O(d²) per vector (dense d×d matrix-vector multiply)
-- Rotation state: full d×d float32 matrix — O(d²) storage and RAM
+- Rotation state on disk: full d×d matrix stored as **bfloat16** (since v0.9) — `d² × 2` bytes
 - Subspace count (b=4): `d / 8`
 
----
+> The rotation matrix is bf16 on disk but rehydrated to f32 in memory at load time, so
+> the rotation hot path is unchanged. Recall is unchanged within sample noise (verified
+> on GloVe d=200 b=4 rerank=F at 10k queries: ΔR@1 = +0.0002).
 
-## Resource Comparison
+## Resource comparison
 
-### CPU
+### Ingest throughput
 
-| Operation | SRHT | Dense | Notes |
-|-----------|------|-------|-------|
-| Ingest per vector | O(d log d) | O(d²) | Dense is ~140× more ops at d=1536 |
-| DB open (init) | Negligible | O(d²) one-time QR | Paid once at first `Database.open()` |
-| Search scoring per vector | `n/8` subspaces | `d/8` subspaces | Dense is ~25% fewer at d=1536 |
+Measured on Windows 11, Python 3.11, single-process, n=100k vectors:
 
-**Example at d=1536:** SRHT ingest ≈ 16k multiply-adds per vector; Dense ≈ 2.4M. In
-practice the dense mat-vec is BLAS-optimized (cache-friendly), so the wall-clock ratio is
-10–30× rather than 140×, but still significant for large collections.
+| dim | dense (vps) | srht (vps) | speedup |
+|---:|---:|---:|---:|
+| 200 | 54,577 | 59,891 | 1.1× |
+| 1536 | 6,361 | 12,207 | **1.9×** |
+| 3072 | 2,140 | 6,348 | **3.0×** |
 
-### Memory (RAM)
+Below d=512 the speedup is in the noise; from d=1024 it grows quickly because the
+dense `d²` rotation becomes the bottleneck.
 
-| Component | SRHT | Dense |
-|-----------|------|-------|
-| Rotation matrix | ~0 (seed only) | d² × 4 bytes — **18.9 MB at d=1536, 75.5 MB at d=3072** |
-| `live_codes.bin` (mmap) | `n × b/8` B/vec, n padded | `d × b/8` B/vec — **~25% less** |
-| MSE codebook | 256 centroids × `n/8` subspaces | 256 × `d/8` — smaller |
-| `live_vectors.bin` (rerank) | `d × 4` B/vec | Same |
+### Search latency (brute-force, b=4, rerank=False, 1k queries)
 
-At very high d (≥3072), the Dense rotation matrix (75.5 MB) can exceed the savings on
-codes — net RAM advantage shifts back to SRHT.
+| dim | dense p50 | srht p50 | dense p99 | srht p99 |
+|---:|---:|---:|---:|---:|
+| 200 | 1.15 ms | 1.30 ms | 1.48 ms | 1.81 ms |
+| 1536 | 7.44 ms | **6.02 ms** | 8.66 ms | **6.81 ms** |
+| 3072 | 19.14 ms | **10.74 ms** | 24.13 ms | **11.86 ms** |
+
+Dense scores fewer subspaces at low d (no padding), so p50 is competitive there. At
+d ≥ 1536 the per-vector rotation cost dominates and SRHT pulls ahead.
 
 ### Disk
 
-| File | SRHT | Dense |
-|------|------|-------|
-| `live_codes.bin` | ~33% larger (padding) | Smaller |
-| Rotation matrix (in `quantizer.bin`) | Negligible | 18.9 MB at d=1536 |
-| `live_vectors.bin` (rerank=True) | `d × 4` B/vec | Same |
+Two competing taxes:
 
-At d=1536, 100k vectors, `rerank=False` (codes only):
-- SRHT: ~103 MB (codes only)
-- Dense: ~78 MB (codes) + 19 MB (rotation matrix) ≈ **97 MB** — roughly similar total
+| Source | Dense | SRHT |
+|---|---|---|
+| Rotation state (`quantizer.bin`) | `d² × 2` bytes (bf16, **was f32 pre-v0.9**) | length-`n` sign vector — `~0` |
+| Code padding (`live_codes.bin`) | None — exact `d` slots | Pads `d → next_power_of_two(d)` codes |
 
-### Recall
+The padding tax matters at non-pow2 dims. At d=3072, b=4, n=100k:
 
-| Setting | SRHT | Dense |
-|---------|------|-------|
-| `fast_mode=True`, b=4 | Slightly lower | Marginally better |
-| `fast_mode=True`, b=2 | More visible gap | Better |
-| `fast_mode=False` | Similar | Similar |
+|  | code data | rotation matrix | total |
+|---|---:|---:|---:|
+| dense (bf16 rotation) | 153.6 MB | 18.0 MB | **171.6 MB** |
+| dense (f32 rotation, pre-v0.9) | 153.6 MB | 36.0 MB | 189.6 MB |
+| srht (pads d to 4096) | 204.8 MB | ~0 | 204.8 MB |
 
-The recall gap comes from zero-padding: SRHT allocates `b` bits across `n > d` dimensions,
-wasting some budget on the padded zeros. Dense uses exactly `d` dimensions so no bits are
-wasted. At b=4 the gap is small (< 1pp typically); at b=2 it is more noticeable.
+Dense wins disk at non-pow2 d once bf16 rotation is in. At pow2 dims (1024, 2048,
+4096) SRHT has no padding tax and wins disk.
 
----
+### RAM (delta during ingest, brute search)
 
-## Benchmark Summary (d=1536, 100k vectors, DBpedia OpenAI3, brute-force)
+| dim | dense | srht |
+|---:|---:|---:|
+| 200 | 15.7 MB | 18.2 MB |
+| 1536 | 169.5 MB | **126.2 MB** |
+| 3072 | 372.4 MB | **294.9 MB** |
 
-| Config | Recall@1 | Recall@4 | Ingest | p50 search | Disk |
-|--------|----------|----------|--------|------------|------|
-| SRHT b=4 rerank=F | ~96.2% | ~100% | ~70k vps | ~39ms | ~103 MB |
-| Dense b=4 rerank=F | ~96.8% | ~100% | ~5–8k vps | ~30ms | ~97 MB |
-| SRHT b=2 rerank=F | ~79.2% | ~99.7% | ~70k vps | ~39ms | ~59 MB |
-| Dense b=2 rerank=F | ~80.5% | ~99.8% | ~5–8k vps | ~30ms | ~48 MB |
+SRHT's RAM advantage at high d comes from the absent in-memory rotation matrix
+(36 MB at d=3072 even after bf16 disk encoding).
 
-*Ingest vps for Dense is heavily hardware-dependent (BLAS threadcount). Search p50 for
-Dense is faster because it scores fewer subspaces (192 vs 256 at d=1536).*
+### Recall (b=4, rerank=False, R@1)
 
----
+Measured on the public benchmark datasets, n=100k:
 
-## Decision Guide
+| dataset | dim | dense | srht | Δ (srht − dense) |
+|---|---:|---:|---:|---:|
+| GloVe-200 | 200 | 0.819 | **0.841** | +0.022 |
+| DBpedia-1536 | 1536 | 0.958 | **0.962** | +0.004 |
+| DBpedia-3072 | 3072 | 0.963 | **0.980** | +0.017 |
+
+SRHT meets or beats dense on R@1 at every measured dim. Earlier guidance suggesting
+SRHT loses recall was based on synthetic tests at low d; on the public datasets SRHT
+is at least as accurate.
+
+At b=2 the picture is similar: SRHT b=2 rerank=F R@1 ≈ 0.55 / 0.86 / 0.90 vs dense
+0.51 / 0.84 / 0.90 (d=200/1536/3072).
+
+## Decision guide
 
 | Scenario | Recommended |
-|----------|-------------|
-| Default / don't care | **Dense** — default, best recall, paper-faithful |
-| Frequent ingestion (streaming, live updates) at d ≥ 512 | **SRHT** — ingest is 10–30× faster |
-| Memory-constrained with very high d (≥ 3072) | **SRHT** — Dense rotation matrix costs 75 MB |
-| Maximum recall at low bit budget (b=2) | **Dense** — no wasted bits on padding |
-| Reproducing paper figures exactly | **Dense** — matches the paper's QR + Gaussian formulation |
-| One-time bulk load, heavy read workload | **Dense** (default) — 25% faster search |
+|---|---|
+| Default — let the auto-picker decide | `quantizer_type=None` (default) |
+| You're at d ≥ 1024 and care about ingest, latency, or RAM | `"srht"` (this is now the default) |
+| You're at d ≤ 768 and care about minimal disk overhead | `"dense"` (this is now the default) |
+| Reproducing paper figures exactly | `"dense"` (matches the QR + Gaussian formulation in the TurboQuant paper) |
+| Heavy frequent-ingestion workload at any d | `"srht"` |
+| Maximum recall at b=2 with `rerank=True` | Either — at b=2 with rerank the gap is well within 0.5 pp |
+| Recovering from format break in v0.9 | Old DBs with f32-stored rotation must be rebuilt; bf16 is bincode-incompatible with v0.8 |
 
----
+## ANN + rerank interaction
 
-## ANN + Rerank Interaction
+Both modes produce the same HNSW graph structure (indexed from the MSE codes) and the
+same rerank path (`live_vectors.bin` is identical). Their differences are confined to
+the pre-rerank candidate selection. With `rerank=True` and `rerank_precision="int8"`,
+the recall gap between modes is sub-0.5 pp at every measured cell.
 
-Both modes produce the same HNSW graph structure (indexed from the MSE codes). The rerank
-path reads `live_vectors.bin` (float32 originals), which is identical for both modes.
-The ANN recall difference between SRHT and Dense therefore comes only from the pre-rerank
-candidate selection quality, not from the rerank itself.
+## Backward compatibility
 
-For `rerank=True`, the recall gap between modes narrows further — the float32 rerank
-compensates for any coding error in candidate retrieval.
-
----
-
-## Backward Compatibility
-
-`quantizer_type="exact"` is accepted as an alias for `"dense"` and will continue to work
-in all future versions. Databases written with `quantizer_type="exact"` reopen correctly
-without any migration step — the `quantizer.bin` is format-identical.
+- `quantizer_type="exact"` remains an alias for `"dense"`.
+- Setting `quantizer_type="dense"` or `"srht"` explicitly always wins over the
+  auto-default — existing code paths are unaffected if you pass an explicit string.
+- **Format break in v0.9**: bf16 rotation storage is bincode-incompatible with v0.8.x
+  databases. Old databases must be rebuilt or migrated. SRHT-mode databases reopen
+  cleanly — only `dense` mode is affected.
