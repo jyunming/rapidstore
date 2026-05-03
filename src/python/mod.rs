@@ -167,12 +167,36 @@ impl Database {
             }
             Some(ref s) if s == "disabled" || s == "dequant" => RerankPrecision::Disabled,
             Some(ref s) if s == "int8" || s == "i8" => RerankPrecision::Int8,
-            Some(ref s) if s == "int4" || s == "i4" => RerankPrecision::Int4,
+            Some(ref s) if s == "int4" || s == "i4" => {
+                // P12 (v0.8.3): Int4 raw rerank is strictly dominated by `rerank=False`
+                // at every measured (dim, b) cell — the INT4 quantization noise
+                // outweighs the benefit of any reranking. Use `residual_int4` instead
+                // for compression-first rerank.
+                pyo3::Python::with_gil(|py| -> PyResult<()> {
+                    let warnings = py.import_bound("warnings")?;
+                    warnings.call_method1(
+                        "warn",
+                        (
+                            "rerank_precision='int4' is deprecated and strictly dominated by \
+                             rerank=False at every benchmarked (dim, bits) cell. Use \
+                             rerank_precision='residual_int4' for compression-first rerank \
+                             (~31% disk savings vs int8 at near-int8 recall on b=4 cells), \
+                             or rerank=False for the smallest disk footprint.",
+                            py.import_bound("builtins")?.getattr("DeprecationWarning")?,
+                        ),
+                    )?;
+                    Ok(())
+                })?;
+                RerankPrecision::Int4
+            }
+            Some(ref s) if s == "residual_int4" || s == "ri4" || s == "residualint4" => {
+                RerankPrecision::ResidualInt4
+            }
             Some(ref s) if s == "f16" || s == "half" => RerankPrecision::F16,
             Some(ref s) if s == "f32" || s == "float" || s == "full" => RerankPrecision::F32,
             Some(ref s) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid rerank_precision: '{}'. Use 'int8' (default), 'int4', 'f16', 'f32', or None.",
+                    "Invalid rerank_precision: '{}'. Use 'int8' (default), 'residual_int4' (compression-first), 'int4' (deprecated), 'f16', 'f32', or None.",
                     s
                 )));
             }
@@ -738,10 +762,13 @@ impl Database {
     ) -> PyResult<()> {
         py.allow_threads(|| {
             let mut engine = self.write_engine()?;
+            let d = engine.quantizer.d;
+            let efc = ef_construction
+                .unwrap_or_else(|| crate::storage::engine::default_ann_ef_construction(d));
             engine
                 .create_index_with_params(
                     max_degree.unwrap_or(32),
-                    ef_construction.unwrap_or(200),
+                    efc,
                     search_list_size.unwrap_or(128),
                     alpha.unwrap_or(1.2),
                     n_refinements.unwrap_or(5),
@@ -767,10 +794,13 @@ impl Database {
     ) -> PyResult<()> {
         py.allow_threads(|| {
             let mut engine = self.write_engine()?;
+            let d = engine.quantizer.d;
+            let efc = ef_construction
+                .unwrap_or_else(|| crate::storage::engine::default_ann_ef_construction(d));
             engine
                 .create_index_incremental(
                     max_degree.unwrap_or(32),
-                    ef_construction.unwrap_or(200),
+                    efc,
                     search_list_size.unwrap_or(128),
                     alpha.unwrap_or(1.2),
                     n_refinements.unwrap_or(5),

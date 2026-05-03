@@ -243,11 +243,27 @@ impl GraphManager {
     /// ordered by descending `scorer` value, optionally filtered by `filter`.
     pub fn search(
         &self,
+        ep: u32,
+        k: usize,
+        search_list_size: usize,
+        scorer: impl FnMut(u32) -> f64,
+        filter: Option<impl Fn(u32) -> bool>,
+    ) -> Result<Vec<(u32, f64)>, Box<dyn std::error::Error + Send + Sync>> {
+        self.search_with_prefetch(ep, k, search_list_size, scorer, filter, None::<fn(u32)>)
+    }
+
+    /// C2: variant that accepts an optional prefetch callback. The callback is
+    /// invoked one neighbour ahead inside the level-0 beam loop, hinting the OS
+    /// to bring the upcoming node's data into cache while the current one is scored.
+    /// Pass `None` to get the legacy (no-prefetch) behaviour.
+    pub fn search_with_prefetch(
+        &self,
         _entry_node_unused: u32,
         k: usize,
         search_list_size: usize,
         mut scorer: impl FnMut(u32) -> f64,
         filter: Option<impl Fn(u32) -> bool>,
+        prefetch: Option<impl Fn(u32)>,
     ) -> Result<Vec<(u32, f64)>, Box<dyn std::error::Error + Send + Sync>> {
         if self.node_count == 0 {
             return Ok(Vec::new());
@@ -351,7 +367,8 @@ impl GraphManager {
             }
 
             if let Ok(nbs) = self.get_neighbors_at_level(current.id, 0) {
-                for nb in nbs {
+                for i in 0..nbs.len() {
+                    let nb = nbs[i];
                     if nb as usize >= self.node_count {
                         continue; // guard against corrupted neighbor ids
                     }
@@ -359,6 +376,17 @@ impl GraphManager {
                         continue;
                     }
                     visited[nb as usize] = true;
+
+                    // C2: prefetch the NEXT neighbour's data while we score this one.
+                    // Hides DRAM/L3 latency on the typically-random live_codes lookup
+                    // pattern of HNSW beam search. Caller-supplied; no-op when None.
+                    if let Some(ref pf) = prefetch {
+                        if let Some(&nb_next) = nbs.get(i + 1) {
+                            if (nb_next as usize) < self.node_count && !visited[nb_next as usize] {
+                                pf(nb_next);
+                            }
+                        }
+                    }
 
                     let score = sanitize_score(scorer(nb));
                     let cand = SearchCandidate { id: nb, score };

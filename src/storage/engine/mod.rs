@@ -86,6 +86,25 @@ pub(crate) fn default_rerank_factor(d: usize, is_ann: bool) -> usize {
     }
 }
 
+/// C1 (Fix B): dim-aware default for HNSW `ef_construction`.
+/// Larger values produce higher-quality neighbour lists at build time, lifting
+/// the search-time recall ceiling. Build is one-shot (not on the query hot path)
+/// so we can afford a more thorough construction at low `d` where quantization
+/// noise is most damaging to graph topology. At high `d` per-node build cost
+/// is already significant; keep the historical default of 200.
+///
+/// Used only when the caller passes `ef_construction=None`. Explicit overrides
+/// are respected.
+pub fn default_ann_ef_construction(d: usize) -> usize {
+    if d <= 384 {
+        400
+    } else if d <= 1024 {
+        300
+    } else {
+        200
+    }
+}
+
 /// Controls the precision used to store raw vectors in `live_vectors.bin` for reranking.
 ///
 /// All options except `Disabled` enable exact second-pass rescoring: after the quantized pass
@@ -110,9 +129,28 @@ pub enum RerankPrecision {
     /// INT8 per-vector-scaled storage. Stride = d + 4 bytes (d × i8 + f32 scale).
     /// Default when `rerank=True`. Near-identical recall to F16 at half the disk.
     Int8,
-    /// INT4 nibble-packed per-vector-scaled storage. Stride = ⌈d/2⌉ + 4 bytes.
-    /// ~4× smaller than F16. Slight recall cost at d < 256.
+    /// INT4 nibble-packed per-vector-scaled storage of the **raw** vector.
+    /// Stride = ⌈d/2⌉ + 4 bytes. **Deprecated** — strictly dominated by
+    /// `ResidualInt4` (same disk, much higher recall). Numpy validation on
+    /// dbpedia-1536 b=4 showed Int4 raw rerank R@1 = 0.925 vs ResidualInt4
+    /// R@1 = 0.995 at the same byte cost. Kept for backward compatibility
+    /// with existing databases; new dbs should use `ResidualInt4`.
     Int4,
+    /// **P12 (v0.8.3) — recommended low-disk rerank.** INT4-quantized
+    /// **residual** = `vec − dequant(MSE codes) × doc_norm`, INT4-quantised
+    /// with per-vector scale. Stride = ⌈d/2⌉ + 4 bytes (same as `Int4`).
+    /// Because the residual has a much smaller dynamic range than the raw
+    /// vector, 4 bits buy substantially more precision per dim — recall
+    /// matches `Int8` at half the disk on b=4 production cells.
+    ///
+    /// Score is additive at query time:
+    ///   * IP:     `final = cand_score + <q, residual_decoded>`
+    ///   * Cosine: `final = cand_score + q_norm_inv × <q, residual_decoded>`
+    /// (`doc_norm` is absorbed into the residual at encode time, so the
+    /// rerank score does NOT multiply by it again at query time. See
+    /// `live_rerank_score_residual_int4`.) No redundant code re-dequantization
+    /// at query time.
+    ResidualInt4,
     /// Raw f16 vectors. Stride = d × 2 bytes. Maximum precision for non-normalized vectors.
     F16,
     /// Raw f32 vectors. Stride = d × 4 bytes. Legacy/backward-compat option.
@@ -566,6 +604,9 @@ impl TurboQuantEngine {
         let mse_len = (quantizer.n * quantizer.mse_bits_per_idx()).div_ceil(8);
         let stride = mse_len + qjl_len + LIVE_GAMMA_BYTES + LIVE_NORM_BYTES + LIVE_DELETED_BYTES;
         let live_codes = LiveCodesFile::open(Path::new(local_dir).join("live_codes.bin"), stride)?;
+        // A1: hint OS to prefetch live_codes.bin into page cache. Reduces cold-cache
+        // penalty on the first few queries after open. Unix-only (no-op on Windows).
+        live_codes.advise_willneed();
         let live_vraw_path = Path::new(local_dir).join("live_vectors.bin");
         let live_vraw = if manifest.rerank_enabled
             && live_vraw_path.exists()
@@ -576,6 +617,7 @@ impl TurboQuantEngine {
                 RerankPrecision::F16 => manifest.d * 2,
                 RerankPrecision::Int8 => manifest.d + 4,
                 RerankPrecision::Int4 => (manifest.d + 1) / 2 + 4,
+                RerankPrecision::ResidualInt4 => (manifest.d + 1) / 2 + 4,
                 RerankPrecision::Disabled => manifest.d * 4, // unreachable, but must be valid
             };
             let vraw = LiveCodesFile::open(live_vraw_path, vstride)?;
@@ -1202,11 +1244,13 @@ impl TurboQuantEngine {
         let mut per_query: Vec<Vec<(u32, f64)>> = (0..nq)
             .map(|_| Vec::with_capacity(internal_k.min(256)))
             .collect();
-        let mut idx_buf = vec![0u16; quantizer.n];
-
+        // P8 (v0.8.3): score_ip_encoded_packed now dispatches a const-generic
+        // SIMD kernel for every b ∈ [1, 8], so the previous A2-era b=4 gate is
+        // gone. Every brute-force candidate goes through the fused-unpack path.
+        // (The pre-P8 code allocated a per-call `idx_buf: Vec<u16>` for the
+        // b!=4 fallback — that fallback is gone and the buffer along with it.)
         for &slot in &candidate_slots {
             let rec = &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
-            quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx_buf);
             let gamma = f32::from_le_bytes(
                 rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                     .try_into()
@@ -1218,15 +1262,21 @@ impl TurboQuantEngine {
                     .expect("doc_norm field is 4 bytes"),
             );
             let qjl_bits = &rec[mse_len..mse_len + qjl_len];
+            let packed_mse = &rec[..mse_len];
 
             for q_idx in 0..nq {
-                let raw =
-                    quantizer.score_ip_encoded(&preps[q_idx], &idx_buf, qjl_bits, gamma as f64)
-                        * doc_norm as f64;
+                let ip = quantizer.score_ip_encoded_packed(
+                    &preps[q_idx],
+                    packed_mse,
+                    qjl_bits,
+                    gamma as f64,
+                );
+                // Cosine: vectors stored unit-normalised; ip = <q, d̂>; divide by ‖q‖.
+                // IP: multiply by doc_norm to recover the original inner product magnitude.
                 let score = if matches!(self.metric, DistanceMetric::Cosine) {
-                    raw * q_norms_inv[q_idx]
+                    ip * q_norms_inv[q_idx]
                 } else {
-                    raw
+                    ip * doc_norm as f64
                 };
                 let heap = &mut per_query[q_idx];
                 if use_small_topk {
@@ -1640,6 +1690,27 @@ impl TurboQuantEngine {
                                 out[i] = signed as f64 * scale / 7.0;
                             }
                         }
+                        RerankPrecision::ResidualInt4 => {
+                            // Residual + dequant(codes_at_from_idx) = full reconstruction.
+                            let scale = f32::from_le_bytes(rec[..4].try_into().unwrap()) as f64;
+                            let from_codes = &all_mse[from_idx * qn..(from_idx + 1) * qn];
+                            let recon = quantizer.mse_quantizer.dequantize(from_codes);
+                            for i in 0..d {
+                                let byte = rec[4 + i / 2];
+                                let nibble = if i % 2 == 0 {
+                                    byte & 0x0F
+                                } else {
+                                    (byte >> 4) & 0x0F
+                                };
+                                let signed = if nibble > 7 {
+                                    nibble as i8 - 16
+                                } else {
+                                    nibble as i8
+                                };
+                                let residual = signed as f64 * scale / 7.0;
+                                out[i] = recon[i] + residual;
+                            }
+                        }
                         RerankPrecision::F16 => {
                             for i in 0..d {
                                 let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2].try_into().unwrap();
@@ -1744,6 +1815,27 @@ impl TurboQuantEngine {
                                     nibble as i8
                                 };
                                 out[i] = signed as f64 * scale / 7.0;
+                            }
+                        }
+                        RerankPrecision::ResidualInt4 => {
+                            // Residual + dequant(codes_at_from_idx) = full reconstruction.
+                            let scale = f32::from_le_bytes(rec[..4].try_into().unwrap()) as f64;
+                            let from_codes = &all_mse[from_idx * qn..(from_idx + 1) * qn];
+                            let recon = quantizer.mse_quantizer.dequantize(from_codes);
+                            for i in 0..d {
+                                let byte = rec[4 + i / 2];
+                                let nibble = if i % 2 == 0 {
+                                    byte & 0x0F
+                                } else {
+                                    (byte >> 4) & 0x0F
+                                };
+                                let signed = if nibble > 7 {
+                                    nibble as i8 - 16
+                                } else {
+                                    nibble as i8
+                                };
+                                let residual = signed as f64 * scale / 7.0;
+                                out[i] = recon[i] + residual;
                             }
                         }
                         RerankPrecision::F16 => {
@@ -2074,10 +2166,35 @@ impl TurboQuantEngine {
             // closure so it is allocated once and reused across all HNSW node visits.
             let mut idx_buf_ann = vec![0u16; qn];
 
+            // C2: prefetch upcoming neighbour's live_codes record while the current
+            // one is being scored. Hint to OS, no semantic change. No-op on non-x86_64.
+            // Capture `index_ids` by reference (already borrowed at line 2160) — the
+            // closure lives only for the duration of the search call so a borrow is
+            // sufficient and avoids a per-query Vec<u32> clone of the (potentially
+            // huge) index_ids buffer.
+            let pf_index_ids: &[u32] = index_ids.as_slice();
+            let pf_live_codes = &self.live_codes;
+            let pf_stride = self.live_stride();
+            let prefetch_fn = move |node: u32| {
+                let slot = pf_index_ids[node as usize] as usize;
+                let off = slot.saturating_mul(pf_stride);
+                let bytes = pf_live_codes.as_bytes();
+                if off < bytes.len() {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        std::arch::x86_64::_mm_prefetch(
+                            bytes.as_ptr().add(off) as *const i8,
+                            std::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                    let _ = off;
+                }
+            };
+
             // HNSW beam search: collect internal_k candidates with accurate full-LUT scores.
             // internal_k = sls (≥ top_k) provides a candidate buffer to recover from any
             // graph navigation approximation errors before truncating to the final top_k.
-            let ann_nodes = self.graph.search(
+            let ann_nodes = self.graph.search_with_prefetch(
                 0,
                 internal_k,
                 sls.max(internal_k),
@@ -2115,6 +2232,7 @@ impl TurboQuantEngine {
                     }
                 },
                 slot_set.map(|ss| move |node_idx: u32| ss.contains(&index_ids[node_idx as usize])),
+                Some(prefetch_fn),
             )?;
 
             // Navigation scores from the full LUT are already accurate; no re-score pass
@@ -2165,8 +2283,20 @@ impl TurboQuantEngine {
 
                 let score = if self.rerank_enabled {
                     if self.live_vraw.is_some() {
-                        let raw_vec = self.live_raw_vector_at_slot(slot as usize);
-                        score_vectors_with_metric(&self.metric, query, &raw_vec)
+                        // P12: ResidualInt4 uses the additive shortcut to avoid
+                        // O(d^2) code re-dequantization per candidate.
+                        if matches!(self.manifest.rerank_precision, RerankPrecision::ResidualInt4)
+                            && !matches!(self.metric, DistanceMetric::L2)
+                        {
+                            let q_norm_inv = if matches!(self.metric, DistanceMetric::Cosine) {
+                                let qn = query.iter().map(|x| x * x).sum::<f64>().sqrt();
+                                if qn > 1e-10 { 1.0 / qn } else { 0.0 }
+                            } else { 0.0 };
+                            self.live_rerank_score_residual_int4(slot as usize, query, approx_score, q_norm_inv)
+                        } else {
+                            let raw_vec = self.live_raw_vector_at_slot(slot as usize);
+                            score_vectors_with_metric(&self.metric, query, &raw_vec)
+                        }
                     } else {
                         score_vectors_with_metric(&self.metric, query, &deq_vecs[i])
                     }
@@ -2431,6 +2561,71 @@ impl TurboQuantEngine {
         let quantizer = &self.quantizer;
         let metric = &self.metric;
 
+        // Sign-bit Hamming prefilter (fast_mode + IP/Cosine + b ∈ {1, 2, 4, 8}).
+        //
+        // In fast_mode there's no QJL stored, but the MSB of each B-bit MSE code
+        // is the sign of the corresponding rotated dimension (Lloyd-Max codebook
+        // is symmetric around 0 for every B). We derive a 1-bit-per-dim sketch
+        // from the existing MSE bytes for free and use Hamming disagreement as
+        // a cheap proxy for IP to shrink the candidate set before full LUT scoring.
+        //
+        // **P8 (v0.8.3):** generalised from b=4-only to every cleanly-packed B.
+        // Other bit-rates (3, 5, 6, 7) span misaligned byte boundaries — those
+        // bypass the prefilter and run full LUT scoring on every candidate.
+        //
+        // Only enabled for sufficiently large candidate pools, where the prefilter's
+        // amortised cost is dwarfed by the savings on the full scoring pass.
+        const HAMMING_PREFILTER_MIN_CANDIDATES: usize = 5_000;
+        const HAMMING_PREFILTER_MIN_DIM: usize = 512;
+        const HAMMING_PREFILTER_RETAIN_RATIO: usize = 16; // P4: tightened from 8 -> 16
+        let prefilter_b = quantizer.b;
+        let prefilter_supports_b = matches!(prefilter_b, 1 | 2 | 4 | 8);
+        let use_sign_prefilter = qjl_len == 0
+            && prefilter_supports_b
+            && quantizer.d >= HAMMING_PREFILTER_MIN_DIM
+            && matches!(metric, DistanceMetric::Ip | DistanceMetric::Cosine)
+            && candidate_slots.len() >= HAMMING_PREFILTER_MIN_CANDIDATES;
+        let candidate_slots: Vec<u32> = if use_sign_prefilter {
+            let target = (candidate_slots.len() / HAMMING_PREFILTER_RETAIN_RATIO)
+                .max(internal_k.saturating_mul(10))
+                .min(candidate_slots.len());
+            let q_signs = quantizer.prepare_query_sign_bits(query);
+            let q_signs_ref: &[u8] = &q_signs;
+            // Dispatch the const-generic Hamming kernel based on B.
+            let score_one = |mse_slice: &[u8]| -> u32 {
+                match prefilter_b {
+                    1 => {
+                        crate::quantizer::prod::hamming_disagree_signs::<1>(q_signs_ref, mse_slice)
+                    }
+                    2 => {
+                        crate::quantizer::prod::hamming_disagree_signs::<2>(q_signs_ref, mse_slice)
+                    }
+                    4 => {
+                        crate::quantizer::prod::hamming_disagree_signs::<4>(q_signs_ref, mse_slice)
+                    }
+                    8 => {
+                        crate::quantizer::prod::hamming_disagree_signs::<8>(q_signs_ref, mse_slice)
+                    }
+                    _ => unreachable!("prefilter_supports_b checked above"),
+                }
+            };
+            let mut scored: Vec<(u32, u32)> = candidate_slots
+                .par_iter()
+                .map(|&slot| {
+                    let rec = &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
+                    let dis = score_one(&rec[..mse_len]);
+                    (slot, dis)
+                })
+                .collect();
+            if scored.len() > target {
+                scored.select_nth_unstable_by_key(target, |x| x.1);
+                scored.truncate(target);
+            }
+            scored.into_iter().map(|(s, _)| s).collect()
+        } else {
+            candidate_slots
+        };
+
         // Scoring: sequential for small N (avoids Rayon thread park/unpark on Windows
         // where scheduler granularity dominates the actual sub-millisecond work);
         // parallel chunk-based for large N where the work outweighs the thread overhead.
@@ -2503,6 +2698,9 @@ impl TurboQuantEngine {
             } else {
                 n_candidates
             });
+            // P8 (v0.8.3): IP/Cosine paths route through `score_ip_encoded_packed`
+            // (const-generic SIMD for every b ∈ [1, 8], no need for an unpacked
+            // idx_buf). The L2 fallback below still needs the unpacked indices.
             let mut idx = vec![0u16; quantizer.n];
             match metric {
                 DistanceMetric::Ip => {
@@ -2510,7 +2708,6 @@ impl TurboQuantEngine {
                     for &slot in &candidate_slots {
                         let rec =
                             &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
-                        quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
                         let gamma = f32::from_le_bytes(
                             rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                 .try_into()
@@ -2521,12 +2718,13 @@ impl TurboQuantEngine {
                                 .try_into()
                                 .expect("live_codes norm field is always 4 bytes"),
                         );
-                        let score = quantizer.score_ip_encoded(
+                        let raw_ip = quantizer.score_ip_encoded_packed(
                             &prep,
-                            &idx,
+                            &rec[..mse_len],
                             &rec[mse_len..mse_len + qjl_len],
                             gamma as f64,
-                        ) * doc_norm as f64;
+                        );
+                        let score = raw_ip * doc_norm as f64;
                         if use_small_topk {
                             push_small_topk(&mut out, slot, score, internal_k);
                         } else {
@@ -2539,15 +2737,14 @@ impl TurboQuantEngine {
                     for &slot in &candidate_slots {
                         let rec =
                             &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
-                        quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
                         let gamma = f32::from_le_bytes(
                             rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                 .try_into()
                                 .expect("live_codes gamma field is always 4 bytes"),
                         );
-                        let ip = quantizer.score_ip_encoded(
+                        let ip = quantizer.score_ip_encoded_packed(
                             &prep,
-                            &idx,
+                            &rec[..mse_len],
                             &rec[mse_len..mse_len + qjl_len],
                             gamma as f64,
                         );
@@ -2591,15 +2788,15 @@ impl TurboQuantEngine {
             }
             out
         } else {
-            // Parallel path: each chunk reuses one CodeIndex scratch buffer and keeps
-            // only local top-k before a streaming global merge.
+            // Parallel path: P8 — score_ip_encoded_packed dispatches the const-generic
+            // SIMD kernel for any b ∈ [1, 8], so we no longer maintain a per-chunk
+            // CodeIndex scratch buffer.
             match metric {
                 DistanceMetric::Ip => {
                     let prep = quantizer.prepare_ip_query(query);
                     candidate_slots
                         .par_chunks(par_chunk)
                         .map(|chunk| {
-                            let mut idx = vec![0u16; quantizer.n];
                             let mut out = Vec::with_capacity(if use_small_topk {
                                 internal_k
                             } else {
@@ -2608,7 +2805,6 @@ impl TurboQuantEngine {
                             for &slot in chunk {
                                 let rec = &codes_bytes
                                     [slot as usize * stride..(slot as usize + 1) * stride];
-                                quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
                                 let gamma = f32::from_le_bytes(
                                     rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                         .try_into()
@@ -2620,12 +2816,13 @@ impl TurboQuantEngine {
                                         .expect("live_codes norm field is always 4 bytes"),
                                 );
                                 // Vectors stored unit-normalized; scale back to recover <q, doc>.
-                                let score = quantizer.score_ip_encoded(
+                                let raw_ip = quantizer.score_ip_encoded_packed(
                                     &prep,
-                                    &idx,
+                                    &rec[..mse_len],
                                     &rec[mse_len..mse_len + qjl_len],
                                     gamma as f64,
-                                ) * doc_norm as f64;
+                                );
+                                let score = raw_ip * doc_norm as f64;
                                 if use_small_topk {
                                     push_small_topk(&mut out, slot, score, internal_k);
                                 } else {
@@ -2647,7 +2844,6 @@ impl TurboQuantEngine {
                     candidate_slots
                         .par_chunks(par_chunk)
                         .map(|chunk| {
-                            let mut idx = vec![0u16; quantizer.n];
                             let mut out = Vec::with_capacity(if use_small_topk {
                                 internal_k
                             } else {
@@ -2656,7 +2852,6 @@ impl TurboQuantEngine {
                             for &slot in chunk {
                                 let rec = &codes_bytes
                                     [slot as usize * stride..(slot as usize + 1) * stride];
-                                quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
                                 let gamma = f32::from_le_bytes(
                                     rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                         .try_into()
@@ -2664,9 +2859,9 @@ impl TurboQuantEngine {
                                 );
                                 // Vectors stored unit-normalized; ip estimates <query, unit_doc>.
                                 // cosine(query, doc) = <query, unit_doc> / ||query||
-                                let ip = quantizer.score_ip_encoded(
+                                let ip = quantizer.score_ip_encoded_packed(
                                     &prep,
-                                    &idx,
+                                    &rec[..mse_len],
                                     &rec[mse_len..mse_len + qjl_len],
                                     gamma as f64,
                                 );
@@ -2787,8 +2982,18 @@ impl TurboQuantEngine {
 
             let score = if self.rerank_enabled {
                 if self.live_vraw.is_some() {
-                    let raw_vec = self.live_raw_vector_at_slot(cand_slot as usize);
-                    score_vectors_with_metric(&self.metric, query, &raw_vec)
+                    if matches!(self.manifest.rerank_precision, RerankPrecision::ResidualInt4)
+                        && !matches!(self.metric, DistanceMetric::L2)
+                    {
+                        let q_norm_inv = if matches!(self.metric, DistanceMetric::Cosine) {
+                            let qn = query.iter().map(|x| x * x).sum::<f64>().sqrt();
+                            if qn > 1e-10 { 1.0 / qn } else { 0.0 }
+                        } else { 0.0 };
+                        self.live_rerank_score_residual_int4(cand_slot as usize, query, cand_score, q_norm_inv)
+                    } else {
+                        let raw_vec = self.live_raw_vector_at_slot(cand_slot as usize);
+                        score_vectors_with_metric(&self.metric, query, &raw_vec)
+                    }
                 } else {
                     score_vectors_with_metric(&self.metric, query, &deq_vecs[i])
                 }
@@ -2923,10 +3128,11 @@ impl TurboQuantEngine {
         self.bm25
             .flush()
             .map_err(|e| format!("flush_for_close: bm25.flush failed: {e}"))?;
-        self.persist_id_pool()
-            .map_err(|e| format!("flush_for_close: persist_id_pool failed: {e}"))?;
 
         // Sync live_codes.bin to the backend (required for cloud / remote backends).
+        // IMPORTANT: upload live codes *before* persisting the ID pool so that a crash
+        // between the two leaves a recoverable state (stale ID pool → WAL replay rebuilds
+        // it) rather than an ID pool that references codes that never reached the backend.
         self.live_codes.release_handles();
         let had_vraw = self.live_vraw.is_some();
         if had_vraw {
@@ -2949,6 +3155,11 @@ impl TurboQuantEngine {
                 self.backend.write("live_vectors.bin", &live_vraw_data)?;
             }
         }
+        // Persist ID pool last: for remote backends this uploads live_ids.bin after
+        // live_codes.bin is safely stored, ensuring the ID pool never gets ahead of
+        // the codes it references on the remote side.
+        self.persist_id_pool()
+            .map_err(|e| format!("flush_for_close: persist_id_pool failed: {e}"))?;
         // Reopen handles so truncate_to() in close() can operate on an open file.
         self.live_codes = LiveCodesFile::open(live_codes_path, self.live_stride())?;
         let slot_count = self.id_pool.slot_count();
@@ -3600,6 +3811,7 @@ impl TurboQuantEngine {
             RerankPrecision::F16 => self.d * 2,
             RerankPrecision::Int8 => self.d + 4,
             RerankPrecision::Int4 => (self.d + 1) / 2 + 4,
+            RerankPrecision::ResidualInt4 => (self.d + 1) / 2 + 4,
             RerankPrecision::Disabled => self.d * 4, // unreachable; file not created
         }
     }
@@ -3658,6 +3870,51 @@ impl TurboQuantEngine {
                     out[i] = signed as f64 * scale / 7.0;
                 }
             }
+            RerankPrecision::ResidualInt4 => {
+                // Residual stored INT4-quantized + per-vector scale. The residual
+                // was computed at encode time as `vector - dequant_unit(codes) * doc_norm`,
+                // so it already absorbs the per-vector scale. To recover the full
+                // vector here we add `dequant_unit(codes) * doc_norm + residual_decoded`.
+                //
+                // NOTE: this code path is only used by callers that need the full
+                // f64 vector (L2 metric, debug, etc.). Hot rerank paths use the
+                // additive `live_rerank_score_residual_int4` helper to skip the
+                // O(d²) code re-dequant.
+                let scale = f32::from_le_bytes(rec[..4].try_into().unwrap()) as f64;
+                let mut residual_decoded = vec![0.0f64; self.d];
+                for i in 0..self.d {
+                    let byte = rec[4 + i / 2];
+                    let nibble = if i % 2 == 0 {
+                        byte & 0x0F
+                    } else {
+                        (byte >> 4) & 0x0F
+                    };
+                    let signed = if nibble > 7 {
+                        nibble as i8 - 16
+                    } else {
+                        nibble as i8
+                    };
+                    residual_decoded[i] = signed as f64 * scale / 7.0;
+                }
+                // Read MSE codes + doc_norm for this slot, dequant codes, scale by doc_norm.
+                let stride = self.live_stride();
+                let mse_len = self.live_mse_len();
+                let qjl_len = self.live_qjl_len();
+                let codes_bytes = self.live_codes.as_bytes();
+                let rec_codes = &codes_bytes[slot * stride..slot * stride + mse_len];
+                let mut idx = vec![0 as CodeIndex; self.quantizer.n];
+                self.quantizer.unpack_mse_indices(rec_codes, &mut idx);
+                let recon = self.quantizer.mse_quantizer.dequantize(&idx);
+                let doc_norm = f32::from_le_bytes(
+                    codes_bytes[slot * stride + mse_len + qjl_len + 4
+                              ..slot * stride + mse_len + qjl_len + 8]
+                        .try_into()
+                        .expect("doc_norm field is 4 bytes"),
+                ) as f64;
+                for i in 0..self.d {
+                    out[i] = recon[i] * doc_norm + residual_decoded[i];
+                }
+            }
             RerankPrecision::F16 => {
                 for i in 0..self.d {
                     let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2]
@@ -3678,10 +3935,50 @@ impl TurboQuantEngine {
         out
     }
 
-    fn live_save_raw_vector(&mut self, slot: u32, vector: &[f32]) {
-        let Some(vraw) = &mut self.live_vraw else {
-            return;
+    /// Encode the per-vector rerank record at the given slot.
+    ///
+    /// `vector` is the unit-vector (or raw if normalize=False).
+    /// `idx` is the MSE code indices for this vector — used by the
+    /// `ResidualInt4` mode to compute `residual = vec - dequant(idx)`.
+    /// Other precision modes ignore `idx`.
+    ///
+    /// Convenience wrapper around `live_save_raw_vector_with_residual` that
+    /// computes the residual serially when needed (used by per-item callers
+    /// like WAL replay). The hot batch-insert path should pass a
+    /// pre-computed residual via `live_save_raw_vector_with_residual`
+    /// directly to amortise the dequant cost across cores.
+    fn live_save_raw_vector(&mut self, slot: u32, vector: &[f32], idx: &[CodeIndex]) {
+        // ResidualInt4: compute residual serially (per-item path).
+        // For batch inserts, callers should pre-compute residuals in parallel via
+        // `compute_residuals_batch_parallel` and pass through to
+        // `live_save_raw_vector_with_residual` to avoid the O(d²) dequant
+        // serially-per-vector.
+        let residual_storage: Option<Vec<f32>> = match self.manifest.rerank_precision {
+            RerankPrecision::ResidualInt4 => {
+                let recon_unit = self.quantizer.mse_quantizer.dequantize(idx);
+                let doc_norm: f32 = vector.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
+                let mut residual = vec![0f32; self.d];
+                for i in 0..self.d {
+                    residual[i] = vector[i] - recon_unit[i] as f32 * doc_norm;
+                }
+                Some(residual)
+            }
+            _ => None,
         };
+        self.live_save_raw_vector_with_residual(slot, vector, residual_storage.as_deref());
+    }
+
+    /// Lower-level encode that takes a pre-computed `precomputed_residual` for
+    /// `RerankPrecision::ResidualInt4`. Pass `None` for the other precision
+    /// modes — the parameter is ignored. This is the entry point used by the
+    /// batch insert path after `compute_residuals_batch_parallel`.
+    fn live_save_raw_vector_with_residual(
+        &mut self,
+        slot: u32,
+        vector: &[f32],
+        precomputed_residual: Option<&[f32]>,
+    ) {
+        let Some(vraw) = &mut self.live_vraw else { return; };
         let rec = vraw.get_slot_mut(slot as usize);
         match self.manifest.rerank_precision {
             RerankPrecision::Int8 => {
@@ -3715,6 +4012,27 @@ impl TurboQuantEngine {
                     rec[4 + i / 2] = (q0 as u8 & 0x0F) | ((q1 as u8 & 0x0F) << 4);
                 }
             }
+            RerankPrecision::ResidualInt4 => {
+                // Caller must supply precomputed_residual for this mode.
+                let residual = precomputed_residual
+                    .expect("ResidualInt4 requires precomputed_residual");
+                let scale = residual
+                    .iter()
+                    .map(|v| v.abs())
+                    .fold(0.0_f32, f32::max)
+                    .max(1e-9);
+                rec[..4].copy_from_slice(&scale.to_le_bytes());
+                let n = residual.len();
+                for i in (0..n).step_by(2) {
+                    let q0 = (residual[i] / scale * 7.0).round().clamp(-8.0, 7.0) as i8;
+                    let q1 = if i + 1 < n {
+                        (residual[i + 1] / scale * 7.0).round().clamp(-8.0, 7.0) as i8
+                    } else {
+                        0_i8
+                    };
+                    rec[4 + i / 2] = (q0 as u8 & 0x0F) | ((q1 as u8 & 0x0F) << 4);
+                }
+            }
             RerankPrecision::F16 => {
                 for (i, &val) in vector.iter().enumerate() {
                     let h = half::f16::from_f32(val);
@@ -3727,6 +4045,163 @@ impl TurboQuantEngine {
                 }
             }
         }
+    }
+
+    /// **P12 (v0.8.3)** — additive scoring helper for `RerankPrecision::ResidualInt4`.
+    ///
+    /// Reads the INT4 residual at `slot`, dequantizes it to `f32`, and returns
+    /// `<query, residual_decoded>`. The caller computes
+    /// `final_score = code_score_from_brute_pass + doc_norm * this_residual_score`
+    /// (or just `+ this_residual_score` for cosine where doc_norm == 1).
+    ///
+    /// Avoids redundant code re-dequantization at query time — the brute pass
+    /// has already produced `<q, dequant(codes)> * doc_norm`; we just need the
+    /// residual contribution.
+    /// **P12e (v0.8.3)** — pre-pass that computes the per-vector residual
+    /// `vec − dequant(idx)·doc_norm` for a whole batch at once.
+    ///
+    /// Used by the batch insert path when `RerankPrecision::ResidualInt4` is
+    /// enabled. The serial first-cut took ~24 min for 100k × d=3072 (single-
+    /// threaded O(d²) dequant per slot, memory-bandwidth-bound).
+    ///
+    /// Dense mode: uses **a single SGEMM** (`Q^T · y_tilde`) to do all N
+    /// inverse rotations in one pass, then a parallel per-column residual
+    /// subtraction. The d×d rotation matrix is streamed once — D×B vs D²×B
+    /// memory traffic compared to per-vector dequant.
+    ///
+    /// SRHT mode: per-vector inverse-SRHT is already O(d log d) and matrix-
+    /// free, so a Rayon par_iter is sufficient.
+    fn compute_residuals_batch_parallel(
+        &self,
+        unit_vecs: &[&[f32]],
+        all_indices: &[Vec<CodeIndex>],
+    ) -> Vec<Vec<f32>> {
+        use rayon::prelude::*;
+        debug_assert_eq!(unit_vecs.len(), all_indices.len());
+        let d = self.d;
+        let q = &self.quantizer;
+        let mse = &q.mse_quantizer;
+        let b = unit_vecs.len();
+
+        if let Some(rotation_matrix) = mse.rotation_matrix.as_ref() {
+            // Dense mode — GEMM-batched dequant.
+            let n = mse.n; // == d for dense
+            let centroids = &mse.centroids;
+
+            // Build y_tilde: n × b col-major (each column = centroids[idx[row]]).
+            let mut y_tilde = vec![0.0f32; n * b];
+            for (col, idx) in all_indices.iter().enumerate() {
+                let off = col * n;
+                for row in 0..n {
+                    y_tilde[off + row] = centroids[idx[row] as usize];
+                }
+            }
+
+            // recon = Q^T · y_tilde, d × b col-major. Q is row-major (d × d);
+            // passing strides (1, d) reads it as col-major = Q^T.
+            let mut recon = vec![0.0f32; d * b];
+            unsafe {
+                matrixmultiply::sgemm(
+                    d,
+                    d,
+                    b,
+                    1.0,
+                    rotation_matrix.as_ptr(),
+                    1, // Q^T: rsa=1
+                    d as isize, // Q^T: csa=d
+                    y_tilde.as_ptr(),
+                    1, // col-major y_tilde
+                    n as isize,
+                    0.0,
+                    recon.as_mut_ptr(),
+                    1, // col-major recon
+                    d as isize,
+                );
+            }
+
+            // Per-column residual subtraction in parallel. Recon col `col` lives
+            // at recon[col*d .. (col+1)*d].
+            (0..b)
+                .into_par_iter()
+                .map(|col| {
+                    let vec = unit_vecs[col];
+                    let doc_norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
+                    let off = col * d;
+                    let mut residual = vec![0f32; d];
+                    for i in 0..d {
+                        residual[i] = vec[i] - recon[off + i] * doc_norm;
+                    }
+                    residual
+                })
+                .collect()
+        } else {
+            // SRHT mode — per-vector inverse SRHT is already cheap.
+            unit_vecs
+                .par_iter()
+                .zip(all_indices.par_iter())
+                .map(|(vec, idx)| {
+                    let recon_unit = q.mse_quantizer.dequantize(idx);
+                    let doc_norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
+                    let mut residual = vec![0f32; d];
+                    for i in 0..d {
+                        residual[i] = vec[i] - recon_unit[i] as f32 * doc_norm;
+                    }
+                    residual
+                })
+                .collect()
+        }
+    }
+
+    /// **P12 additive rerank score for `RerankPrecision::ResidualInt4`.**
+    ///
+    /// `cand_score` is the score the brute-force pass already produced for this
+    /// candidate using the MSE codes alone. We add the residual contribution
+    /// without re-dequantizing the codes:
+    ///   * IP:     `final = cand_score + <q, residual_decoded>`
+    ///     (the encode side already absorbed `doc_norm` into the residual).
+    ///   * Cosine: `final = cand_score + q_norm_inv × <q, residual_decoded>`
+    ///   * L2:     no clean additive form — fall back to full reconstruction.
+    ///
+    /// At d=1536 this is ~10× faster than `live_raw_vector_at_slot` →
+    /// `score_vectors_with_metric` for ResidualInt4 (which re-dequants the
+    /// codes per candidate, an O(d²) operation in dense mode).
+    fn live_rerank_score_residual_int4(
+        &self,
+        slot: usize,
+        query: &Array1<f64>,
+        cand_score: f64,
+        q_norm_inv: f64,
+    ) -> f64 {
+        match self.metric {
+            DistanceMetric::Ip => {
+                let residual_score = self.live_residual_score_at_slot(slot, query);
+                cand_score + residual_score
+            }
+            DistanceMetric::Cosine => {
+                let residual_score = self.live_residual_score_at_slot(slot, query);
+                cand_score + q_norm_inv * residual_score
+            }
+            DistanceMetric::L2 => {
+                let raw_vec = self.live_raw_vector_at_slot(slot);
+                score_vectors_with_metric(&self.metric, query, &raw_vec)
+            }
+        }
+    }
+
+    fn live_residual_score_at_slot(&self, slot: usize, query: &Array1<f64>) -> f64 {
+        let Some(vraw) = &self.live_vraw else { return 0.0; };
+        let rec = vraw.get_slot(slot);
+        let scale = f32::from_le_bytes(rec[..4].try_into().unwrap()) as f64;
+        let inv_scale_over_7 = scale / 7.0;
+        let mut score = 0.0_f64;
+        for i in 0..self.d {
+            let byte = rec[4 + i / 2];
+            let nibble = if i % 2 == 0 { byte & 0x0F } else { (byte >> 4) & 0x0F };
+            let signed = if nibble > 7 { nibble as i8 - 16 } else { nibble as i8 };
+            let v = signed as f64 * inv_scale_over_7;
+            score += query[i] * v;
+        }
+        score
     }
 
     fn approx_raw_vector_from_entry(&self, entry: &WalEntry) -> Vec<f32> {
@@ -3769,7 +4244,7 @@ impl TurboQuantEngine {
             )?;
             if self.live_vraw.is_some() {
                 let approx_raw = self.approx_raw_vector_from_entry(entry);
-                self.live_save_raw_vector(slot, &approx_raw);
+                self.live_save_raw_vector(slot, &approx_raw, &entry.quantized_indices);
             }
             let meta: VectorMetadata = serde_json::from_str(&entry.metadata_json)?;
             if has_meaningful_metadata(&meta) {
@@ -4128,7 +4603,7 @@ impl TurboQuantEngine {
                     self.delta_slots_dirty = true;
                 }
             }
-            self.live_save_raw_vector(slot, raw_for_rerank);
+            self.live_save_raw_vector(slot, raw_for_rerank, &entry.quantized_indices);
             if has_meaningful_metadata(&meta) {
                 self.metadata.put(slot, &meta)?;
             } else {
@@ -4205,6 +4680,36 @@ impl TurboQuantEngine {
                 .collect();
             let quantized = self.quantizer.quantize_batch(&vec_refs);
 
+            // P12e: pre-compute residuals in parallel for ResidualInt4 to avoid
+            // serial O(d²) dequant in the per-vector save loop below. The bytes
+            // needed by `live_save_raw_vector_with_residual` are computed here
+            // for the ENTIRE batch under Rayon par_iter, then consumed sequentially.
+            //
+            // For non-rerank-stored modes (Disabled) and other precisions this
+            // pre-pass is a no-op (vector kept None).
+            let precomputed_residuals: Option<Vec<Vec<f32>>> = match self.manifest.rerank_precision {
+                RerankPrecision::ResidualInt4 if self.live_vraw.is_some() => {
+                    // For ResidualInt4 the residual is computed against the
+                    // vector that's actually stored: vec_unit when normalize=True,
+                    // otherwise vec_f32 (raw).
+                    let store_refs: Vec<&[f32]> = unit_vecs_and_norms
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (uv, _))| if self.normalize {
+                            uv.as_slice()
+                        } else {
+                            chunk[i].vector.as_slice()
+                        })
+                        .collect();
+                    let all_idx: Vec<Vec<CodeIndex>> = quantized
+                        .iter()
+                        .map(|(idx, _, _)| idx.clone())
+                        .collect();
+                    Some(self.compute_residuals_batch_parallel(&store_refs, &all_idx))
+                }
+                _ => None,
+            };
+
             for (_i, (item, ((unit_vec, norm), (indices, qjl, gamma)))) in chunk
                 .iter()
                 .zip(unit_vecs_and_norms.iter().zip(quantized))
@@ -4246,7 +4751,10 @@ impl TurboQuantEngine {
                     entry.gamma,
                     stored_norm,
                 )?;
-                self.live_save_raw_vector(slot, raw_for_rerank);
+                let precomputed = precomputed_residuals
+                    .as_ref()
+                    .map(|all| all[_i].as_slice());
+                self.live_save_raw_vector_with_residual(slot, raw_for_rerank, precomputed);
                 touched_slots.push(slot);
                 if has_meaningful_metadata(&meta) {
                     metadata_entries.push((slot, meta));

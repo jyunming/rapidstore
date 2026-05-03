@@ -166,6 +166,18 @@ impl LiveCodesFile {
         }
     }
 
+    /// A1: hint the OS that the entire mmap will be needed soon (page in upfront).
+    /// Reduces cold-cache penalty on the first few queries after `open()` by letting
+    /// the OS prefetch live_codes.bin into page cache before any search hits it.
+    /// No-op on Windows (no equivalent madvise) and other non-Unix platforms.
+    #[allow(unused_variables)]
+    pub fn advise_willneed(&self) {
+        #[cfg(unix)]
+        if let Some(mmap) = &self.mmap {
+            let _ = mmap.advise(memmap2::Advice::WillNeed);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }

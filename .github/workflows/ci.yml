@@ -14,8 +14,12 @@ jobs:
     name: Rust tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # x86_64: ubuntu-latest, windows-latest (already in baseline)
+        # arm64:  macos-latest is Apple Silicon; gives us NEON / non-x86_64 coverage
+        # arm64-linux: macos-latest can also cross-test, but a real ARM runner closes the gap
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -31,6 +35,48 @@ jobs:
 
       - name: cargo check server (no Python features)
         run: cargo check -q --manifest-path server/Cargo.toml
+
+  # Linux aarch64 cross-compile + test under QEMU. Verifies the SIMD-fallback
+  # paths (#[cfg(target_arch = "x86_64")]) compile + behave correctly on ARM.
+  rust-test-linux-arm64:
+    name: Rust tests (linux-aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install QEMU + cross-linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static gcc-aarch64-linux-gnu
+
+      - name: Configure cross-compile
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          runner = "qemu-aarch64-static -L /usr/aarch64-linux-gnu"
+          EOF
+
+      # PyO3 needs to know the target Python version when cross-compiling
+      # without target-side Python headers. The `abi3-py310` feature path is
+      # gated behind PYO3_CROSS_PYTHON_VERSION.
+      - name: cargo check (aarch64)
+        env:
+          RUSTFLAGS: "-D warnings"
+          PYO3_CROSS_PYTHON_VERSION: "3.11"
+        run: cargo check -q --target aarch64-unknown-linux-gnu
+
+      # Note: cargo test under QEMU is slow (~5-10x native). Run only the lib
+      # tests, not integration tests, to keep CI under 15 min.
+      - name: cargo test --lib (aarch64 via QEMU)
+        env:
+          PYO3_CROSS_PYTHON_VERSION: "3.11"
+        run: cargo test -q --lib --target aarch64-unknown-linux-gnu
 
   python-smoke:
     name: Python smoke test

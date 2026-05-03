@@ -515,6 +515,108 @@ fn int4_rerank_odd_dimension_packing() {
     assert_eq!(results[0].id, "v1");
 }
 
+// ── P12 (v0.8.3): ResidualInt4 rerank ──────────────────────────────────
+
+#[test]
+fn residual_int4_rerank_roundtrip() {
+    // ResidualInt4 stores `vec_unit - dequant(codes)` at INT4 precision.
+    // Round-trip: insert → search → returned vector should match the input
+    // within INT4-residual tolerance (much tighter than Int4-raw which is
+    // strictly dominated by no-rerank).
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 16;
+    let mut e = TurboQuantEngine::open_with_options(
+        p,
+        p,
+        d,
+        4,
+        42,
+        DistanceMetric::Ip,
+        true,
+        false,
+        RerankPrecision::ResidualInt4,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    let v: Vec<f64> = (1..=d).map(|i| i as f64 * 0.1).collect();
+    let expected: f64 = v.iter().map(|x| x * x).sum();
+    e.insert("v1".into(), &Array1::from_vec(v.clone()), no_meta())
+        .unwrap();
+    let results = e
+        .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None, true, None)
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, "v1");
+    // ResidualInt4 tolerance: residual is much smaller than raw vector,
+    // so 4-bit quantization gives finer effective precision.
+    // 5% relative error should be more than sufficient.
+    let rel_err = (results[0].score - expected).abs() / expected;
+    assert!(
+        rel_err < 0.05,
+        "ResidualInt4 rel_err {:.4} exceeds 0.05; score={:.4}, expected={:.4}",
+        rel_err,
+        results[0].score,
+        expected
+    );
+}
+
+#[test]
+fn residual_int4_record_size_matches_int4() {
+    // ResidualInt4 must use the same on-disk stride as Int4 (⌈d/2⌉ + 4).
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 32;
+    let e = TurboQuantEngine::open_with_options(
+        p,
+        p,
+        d,
+        4,
+        42,
+        DistanceMetric::Ip,
+        true,
+        true,
+        RerankPrecision::ResidualInt4,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    // d=32 → (32+1)/2 + 4 = 16 + 4 = 20 bytes per slot
+    assert_eq!(e.live_vraw_stride(), 20);
+}
+
+#[test]
+fn residual_int4_reload_preserves_recall() {
+    // Insert at ResidualInt4 → close → reopen → search must still return the same
+    // top-1 (manifest must persist the new precision and reopen must read it correctly).
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 32;
+    let v: Vec<f64> = (0..d).map(|i| (i as f64 * 0.013).sin()).collect();
+    {
+        let mut e = TurboQuantEngine::open_with_options(
+            p, p, d, 4, 42,
+            DistanceMetric::Ip, true, false,
+            RerankPrecision::ResidualInt4, None, false, None,
+        ).unwrap();
+        e.insert("v1".into(), &Array1::from_vec(v.clone()), no_meta()).unwrap();
+        e.checkpoint().unwrap();
+    }
+    let e = TurboQuantEngine::open_with_options(
+        p, p, d, 4, 42,
+        DistanceMetric::Ip, true, false,
+        RerankPrecision::ResidualInt4, None, false, None,
+    ).unwrap();
+    let results = e
+        .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None, false, None)
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, "v1");
+}
+
 // ── Stats and disk bytes ───────────────────────────────────────────────
 
 #[test]
@@ -3281,4 +3383,422 @@ fn delta_slots_cleared_after_compaction() {
         "delta_slots must be cleared by live_compact_slab; was {} entries",
         e.delta_slots.len()
     );
+}
+
+// ── A1+A2: cosine score_batch_brute regression ────────────────────────────
+
+#[test]
+fn cosine_batch_results_match_per_query_single_search() {
+    // Vectors with norm != 1.0 so doc_norm != 1.0 on a normalize=false engine.
+    // The old buggy score_batch_brute multiplied cosine scores by doc_norm,
+    // causing ranking divergence vs single-query search when ||d|| != 1.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+    let mut e = TurboQuantEngine::open_with_metric(p, p, d, 4, 42, DistanceMetric::Cosine).unwrap();
+
+    for i in 0..10u32 {
+        let scale = (i as f64 + 1.0) * 0.4; // norms range 0.4..=4.0
+        let mut v = make_vec(d, 0.0);
+        v[0] = scale;
+        v[1] = scale * 0.5;
+        e.insert(format!("v{i}"), &v, no_meta()).unwrap();
+    }
+
+    let q1 = make_vec(d, 0.5);
+    let mut q2 = make_vec(d, 0.0);
+    q2[1] = 2.0;
+
+    let batch = e
+        .search_batch(&[q1.clone(), q2.clone()], 5, None, None, Some(false), None)
+        .unwrap();
+    let single0 = e
+        .search_with_filter_and_ann(&q1, 5, None, None, false, None)
+        .unwrap();
+    let single1 = e
+        .search_with_filter_and_ann(&q2, 5, None, None, false, None)
+        .unwrap();
+
+    let batch_ids0: Vec<&str> = batch[0].iter().map(|r| r.id.as_str()).collect();
+    let single_ids0: Vec<&str> = single0.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        batch_ids0, single_ids0,
+        "batch q0 ranking must match single search"
+    );
+
+    let batch_ids1: Vec<&str> = batch[1].iter().map(|r| r.id.as_str()).collect();
+    let single_ids1: Vec<&str> = single1.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        batch_ids1, single_ids1,
+        "batch q1 ranking must match single search"
+    );
+}
+
+#[test]
+fn cosine_batch_scores_not_inflated_by_doc_norm() {
+    // Old buggy path: score = ip * doc_norm * q_norm_inv (doc_norm == ||d|| > 1).
+    // Fixed path:     score = ip * q_norm_inv.
+    // After the fix cosine scores must lie in (-1, 1].
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+    let mut e = TurboQuantEngine::open_with_metric(p, p, d, 4, 42, DistanceMetric::Cosine).unwrap();
+
+    for i in 0..8u32 {
+        let scale = (i as f64 + 1.0) * 3.0; // norms 3..=24 — maximally expose inflation
+        let mut v = make_vec(d, scale * 0.1);
+        v[0] = scale;
+        e.insert(format!("v{i}"), &v, no_meta()).unwrap();
+    }
+
+    let query = make_vec(d, 1.0);
+    let batch = e
+        .search_batch(&[query], 8, None, None, Some(false), None)
+        .unwrap();
+
+    for r in &batch[0] {
+        assert!(
+            r.score <= 1.01,
+            "cosine score {} > 1 (doc_norm inflation?)",
+            r.score
+        );
+        assert!(r.score >= -1.01, "cosine score {} < -1", r.score);
+    }
+}
+
+// ── A3: flush_for_close ordering invariant ───────────────────────────────
+
+#[test]
+fn flush_for_close_reopened_engine_is_consistent() {
+    // Exercises the flush_for_close ordering fix: persist_id_pool must
+    // execute AFTER the remote-backend upload of live_codes so a crash
+    // between the two doesn't leave the ID pool ahead of the codes.
+    // On local backends this validates the basic consistency guarantee.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+    let mut e = TurboQuantEngine::open(p, p, d, 2, 42).unwrap();
+
+    for i in 0..12u32 {
+        e.insert(
+            format!("w{i}"),
+            &make_vec(d, 0.1 * i as f64 + 0.05),
+            no_meta(),
+        )
+        .unwrap();
+    }
+
+    e.flush_for_close().unwrap();
+    drop(e);
+
+    let e2 = TurboQuantEngine::open(p, p, d, 2, 42).unwrap();
+    let ids = e2.list_all();
+    assert_eq!(
+        ids.len(),
+        12,
+        "all vectors present after flush_for_close + reopen"
+    );
+    for i in 0..12u32 {
+        assert!(
+            ids.contains(&format!("w{i}")),
+            "id w{i} missing after reopen"
+        );
+    }
+}
+
+// ── A4: WAL crash-recovery scenarios ─────────────────────────────────────
+
+#[test]
+fn wal_recovery_after_drop_without_close_restores_vectors() {
+    // Simulates a crash: engine dropped without close/checkpoint.
+    // All WAL-logged inserts must survive into the next open.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+
+    {
+        let mut e = TurboQuantEngine::open(p, p, d, 2, 42).unwrap();
+        for i in 0..5u32 {
+            e.insert(
+                format!("r{i}"),
+                &make_vec(d, 0.1 * i as f64 + 0.1),
+                no_meta(),
+            )
+            .unwrap();
+        }
+        // Drop without close = simulated crash.
+    }
+
+    let e2 = TurboQuantEngine::open(p, p, d, 2, 42).unwrap();
+    let ids2 = e2.list_all();
+    assert_eq!(ids2.len(), 5, "WAL replay must recover all 5 vectors");
+    for i in 0..5u32 {
+        assert!(
+            e2.get(&format!("r{i}")).unwrap().is_some(),
+            "r{i} missing after WAL recovery"
+        );
+    }
+}
+
+#[test]
+fn wal_recovery_after_drop_preserves_search_correctness() {
+    // After crash-recovery, search results must be semantically correct.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+
+    {
+        let mut e = TurboQuantEngine::open(p, p, d, 2, 42).unwrap();
+        for i in 0..8u32 {
+            let mut v = make_vec(d, 0.0);
+            v[i as usize % d] = 1.0;
+            e.insert(format!("axis{i}"), &v, no_meta()).unwrap();
+        }
+        // Crash.
+    }
+
+    let e2 = TurboQuantEngine::open(p, p, d, 2, 42).unwrap();
+    assert_eq!(e2.list_all().len(), 8);
+    let mut query = make_vec(d, 0.0);
+    query[0] = 1.0;
+    let results = e2
+        .search_with_filter_and_ann(&query, 1, None, None, false, None)
+        .unwrap();
+    assert_eq!(
+        results[0].id, "axis0",
+        "nearest to e0 must be axis0 after WAL recovery"
+    );
+}
+
+#[test]
+fn wal_recovery_with_interleaved_deletes() {
+    // Insert 8 vectors, delete 2, crash. Reopen must see exactly 6 live vectors.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+
+    {
+        let mut e = TurboQuantEngine::open(p, p, d, 2, 42).unwrap();
+        for i in 0..8u32 {
+            e.insert(
+                format!("d{i}"),
+                &make_vec(d, 0.1 * i as f64 + 0.1),
+                no_meta(),
+            )
+            .unwrap();
+        }
+        e.delete("d2".into()).unwrap();
+        e.delete("d5".into()).unwrap();
+        // Crash.
+    }
+
+    let e2 = TurboQuantEngine::open(p, p, d, 2, 42).unwrap();
+    let ids2 = e2.list_all();
+    assert_eq!(
+        ids2.len(),
+        6,
+        "6 vectors should survive after 2 deletes + crash"
+    );
+    assert!(!ids2.contains(&"d2".to_string()), "d2 must stay deleted");
+    assert!(!ids2.contains(&"d5".to_string()), "d5 must stay deleted");
+}
+
+// ── A5: Filter edge cases ─────────────────────────────────────────────────
+
+#[test]
+fn filter_empty_and_array_is_vacuously_true() {
+    // $and: [] — all() over an empty iterator → true → every vector matches.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+    let mut e = open_default(p, d);
+    for i in 0..4u32 {
+        e.insert(
+            format!("x{i}"),
+            &make_vec(d, 0.1 * i as f64 + 0.1),
+            no_meta(),
+        )
+        .unwrap();
+    }
+    let filter: HashMap<String, serde_json::Value> =
+        serde_json::from_str(r#"{"$and": []}"#).unwrap();
+    let r = e
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, false, None)
+        .unwrap();
+    assert_eq!(r.len(), 4, "$and:[] should match all 4 vectors");
+}
+
+#[test]
+fn filter_empty_or_array_is_vacuously_false() {
+    // $or: [] — any() over an empty iterator → false → nothing matches.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+    let mut e = open_default(p, d);
+    for i in 0..4u32 {
+        e.insert(
+            format!("x{i}"),
+            &make_vec(d, 0.1 * i as f64 + 0.1),
+            no_meta(),
+        )
+        .unwrap();
+    }
+    let filter: HashMap<String, serde_json::Value> =
+        serde_json::from_str(r#"{"$or": []}"#).unwrap();
+    let r = e
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, false, None)
+        .unwrap();
+    assert!(r.is_empty(), "$or:[] should match nothing");
+}
+
+#[test]
+fn filter_empty_in_array_matches_nothing() {
+    // $in: [] — field value cannot be contained in an empty set.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+    let mut e = open_default(p, d);
+    let mut m = no_meta();
+    m.insert("tag".into(), json!("rust"));
+    e.insert("a".into(), &make_vec(d, 0.1), m).unwrap();
+    let filter: HashMap<String, serde_json::Value> =
+        serde_json::from_str(r#"{"tag": {"$in": []}}"#).unwrap();
+    let r = e
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, false, None)
+        .unwrap();
+    assert!(r.is_empty(), "$in:[] should match nothing");
+}
+
+#[test]
+fn filter_empty_nin_array_matches_everything() {
+    // $nin: [] — field value is never in an empty set → every vector matches.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+    let mut e = open_default(p, d);
+    for i in 0..3u32 {
+        let mut m = no_meta();
+        m.insert("tag".into(), json!(format!("t{i}")));
+        e.insert(format!("n{i}"), &make_vec(d, 0.1 * i as f64 + 0.1), m)
+            .unwrap();
+    }
+    let filter: HashMap<String, serde_json::Value> =
+        serde_json::from_str(r#"{"tag": {"$nin": []}}"#).unwrap();
+    let r = e
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, false, None)
+        .unwrap();
+    assert_eq!(r.len(), 3, "$nin:[] should match all 3 vectors");
+}
+
+#[test]
+fn filter_depth_exceeding_max_returns_no_results() {
+    // A filter nested beyond MAX_FILTER_DEPTH (32) must not match anything.
+    // The depth guard (filter.rs:29) prevents stack-overflow from pathological inputs.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+    let mut e = open_default(p, d);
+    e.insert("a".into(), &make_vec(d, 0.5), no_meta()).unwrap();
+
+    // Build {"$and": [{"$and": [...]}]} 33 levels deep — one beyond the limit.
+    let mut inner = serde_json::json!({"x": 1});
+    for _ in 0..33u32 {
+        inner = serde_json::json!({"$and": [inner]});
+    }
+    let filter: HashMap<String, serde_json::Value> = inner
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    let r = e
+        .search_with_filter_and_ann(&make_vec(d, 0.5), 10, Some(&filter), None, false, None)
+        .unwrap();
+    assert!(
+        r.is_empty(),
+        "filter beyond MAX_FILTER_DEPTH must not match"
+    );
+}
+
+// ── A6: search_batch edge cases ───────────────────────────────────────────
+
+#[test]
+fn search_batch_single_query_matches_single_search() {
+    // nq=1: batch must return the same ranking as a direct single-query search.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+    let mut e = open_default(p, d);
+    for i in 0..6u32 {
+        e.insert(
+            format!("s{i}"),
+            &make_vec(d, 0.1 * i as f64 + 0.1),
+            no_meta(),
+        )
+        .unwrap();
+    }
+    let q = make_vec(d, 0.5);
+    let batch = e
+        .search_batch(&[q.clone()], 3, None, None, Some(false), None)
+        .unwrap();
+    let single = e
+        .search_with_filter_and_ann(&q, 3, None, None, false, None)
+        .unwrap();
+    let batch_ids: Vec<&str> = batch[0].iter().map(|r| r.id.as_str()).collect();
+    let single_ids: Vec<&str> = single.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(batch_ids, single_ids, "batch nq=1 must equal single search");
+}
+
+#[test]
+fn search_batch_top_k_larger_than_corpus_returns_all() {
+    // top_k > N: must return all N vectors without panic.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+    let mut e = open_default(p, d);
+    for i in 0..5u32 {
+        e.insert(
+            format!("all{i}"),
+            &make_vec(d, 0.1 * i as f64 + 0.1),
+            no_meta(),
+        )
+        .unwrap();
+    }
+    let q = make_vec(d, 0.5);
+    let batch = e
+        .search_batch(&[q], 100, None, None, Some(false), None)
+        .unwrap();
+    assert_eq!(
+        batch[0].len(),
+        5,
+        "top_k>N must return all N corpus vectors"
+    );
+}
+
+#[test]
+fn search_batch_many_queries_returns_correct_count() {
+    // nq=50 stress test: every query gets its own independent result set.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+    let mut e = open_default(p, d);
+    for i in 0..20u32 {
+        e.insert(
+            format!("m{i}"),
+            &make_vec(d, 0.05 * i as f64 + 0.01),
+            no_meta(),
+        )
+        .unwrap();
+    }
+    let queries: Vec<_> = (0..50u32)
+        .map(|i| make_vec(d, 0.02 * i as f64 + 0.01))
+        .collect();
+    let batch = e
+        .search_batch(&queries, 5, None, None, Some(false), None)
+        .unwrap();
+    assert_eq!(batch.len(), 50, "one result set per query");
+    for (i, results) in batch.iter().enumerate() {
+        assert_eq!(results.len(), 5, "query {i} must have top_k=5 results");
+    }
 }

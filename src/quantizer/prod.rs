@@ -25,6 +25,17 @@ pub struct PreparedIpQuery {
     // Lookup table flattened as [dim0 c0..cK, dim1 c0..cK, ...]
     mse_lut: Vec<f32>,
     mse_lut_width: usize,
+    /// i16-quantized version of `mse_lut` with a single global scale.
+    /// Halves the L1/L2 footprint of the LUT (96 KB -> 48 KB at d=1536, lut_w=16).
+    /// Per the P6 numpy validation, ranking is bit-identical to the f32 LUT.
+    // P7/P8: i16 LUT used by the x86_64 AVX2 fast-mode kernel
+    // (`score_ip_encoded_packed_simd_i16`). On non-x86_64 targets the kernel
+    // isn't compiled in, so these fields are dead — silenced rather than
+    // cfg-gated to keep `prepare_ip_query` portable.
+    #[allow(dead_code)]
+    mse_lut_i16: Vec<i16>,
+    #[allow(dead_code)]
+    mse_lut_i16_scale: f32,
     sq: Vec<f32>,
     qjl_scale: f32,
 }
@@ -150,9 +161,30 @@ impl ProdQuantizer {
             self.qjl_quantizer.apply_projection(&query_f32, &mut sq);
         }
 
+        // Build i16 mirror with a single global max-abs scale. Used only by the b=4 fast-mode
+        // SIMD path; cost is one pass over n*lut_w f32 entries — at d=1536/lut_w=16 that's
+        // ~25k mul+round+cast ops = ~50us, marginal vs the ~1ms prepare_ip_query baseline.
+        let max_abs = mse_lut.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        let mse_lut_i16_scale = if max_abs > 0.0 {
+            max_abs / 32767.0
+        } else {
+            1.0
+        };
+        let inv_scale = if max_abs > 0.0 {
+            32767.0 / max_abs
+        } else {
+            1.0
+        };
+        let mse_lut_i16: Vec<i16> = mse_lut
+            .iter()
+            .map(|&v| (v * inv_scale).round().clamp(-32768.0, 32767.0) as i16)
+            .collect();
+
         PreparedIpQuery {
             mse_lut,
             mse_lut_width: lut_w,
+            mse_lut_i16,
+            mse_lut_i16_scale,
             sq,
             qjl_scale: self.qjl_query_scale(),
         }
@@ -536,6 +568,253 @@ impl ProdQuantizer {
         (mse_sum + (gamma as f32) * prep.qjl_scale * qjl_sum) as f64
     }
 
+    /// Fused nibble-unpack + LUT-gather scoring for b=4 (production fast path).
+    ///
+    /// Reads the raw packed MSE bytes directly and extracts nibbles inline,
+    /// avoiding the intermediate `idx_buf: Vec<u16>` materialization (~4-8KB
+    /// of L1 traffic per slot at d=2048).
+    ///
+    /// **P8 (v0.8.3)**: kernel is now const-generic over `B` ∈ [1, 8]. Every
+    /// supported bit-rate gets the same fused-unpack + i16 LUT optimizations
+    /// that previously landed only at b=4. For `B > 8` (codes span 3+ bytes,
+    /// rare configuration), we fall back to the unpack+score path.
+    pub fn score_ip_encoded_packed(
+        &self,
+        prep: &PreparedIpQuery,
+        packed_mse: &[u8],
+        qjl: &[u8],
+        gamma: f64,
+    ) -> f64 {
+        let b = self.mse_quantizer.b;
+        debug_assert_eq!(
+            packed_mse.len(),
+            (self.n * b).div_ceil(8),
+            "score_ip_encoded_packed: packed_mse.len() must equal ceil(n*b/8) ({})",
+            (self.n * b).div_ceil(8)
+        );
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if (1..=8).contains(&b)
+                && is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("fma")
+            {
+                // Fast-mode path: QJL term is zero, use i32 accumulator + i16 LUT.
+                if self.fast_mode && qjl.is_empty() {
+                    return unsafe {
+                        match b {
+                            1 => self.score_ip_encoded_packed_simd_i16::<1>(prep, packed_mse),
+                            2 => self.score_ip_encoded_packed_simd_i16::<2>(prep, packed_mse),
+                            3 => self.score_ip_encoded_packed_simd_i16::<3>(prep, packed_mse),
+                            4 => self.score_ip_encoded_packed_simd_i16::<4>(prep, packed_mse),
+                            5 => self.score_ip_encoded_packed_simd_i16::<5>(prep, packed_mse),
+                            6 => self.score_ip_encoded_packed_simd_i16::<6>(prep, packed_mse),
+                            7 => self.score_ip_encoded_packed_simd_i16::<7>(prep, packed_mse),
+                            8 => self.score_ip_encoded_packed_simd_i16::<8>(prep, packed_mse),
+                            _ => unreachable!(),
+                        }
+                    };
+                }
+                // QJL path: f32 MSE accumulator + signed-bit FMA over residuals.
+                return unsafe {
+                    match b {
+                        1 => self.score_ip_encoded_packed_simd::<1>(prep, packed_mse, qjl, gamma),
+                        2 => self.score_ip_encoded_packed_simd::<2>(prep, packed_mse, qjl, gamma),
+                        3 => self.score_ip_encoded_packed_simd::<3>(prep, packed_mse, qjl, gamma),
+                        4 => self.score_ip_encoded_packed_simd::<4>(prep, packed_mse, qjl, gamma),
+                        5 => self.score_ip_encoded_packed_simd::<5>(prep, packed_mse, qjl, gamma),
+                        6 => self.score_ip_encoded_packed_simd::<6>(prep, packed_mse, qjl, gamma),
+                        7 => self.score_ip_encoded_packed_simd::<7>(prep, packed_mse, qjl, gamma),
+                        8 => self.score_ip_encoded_packed_simd::<8>(prep, packed_mse, qjl, gamma),
+                        _ => unreachable!(),
+                    }
+                };
+            }
+        }
+        // b > 8 or no AVX2: unpack + scalar/SIMD fallback through score_ip_encoded.
+        //
+        // The per-call `Vec<CodeIndex>` allocation here is acceptable for two
+        // reasons: (1) on x86_64 with AVX2/FMA + b ∈ [1, 8] (production path)
+        // this branch is never taken; (2) the only callers are the non-SIMD
+        // ARM/aarch64 path (already scoring without SIMD) and the rare b > 8
+        // case (codes spanning 3+ bytes — not used by any documented config).
+        // Adding a thread-local scratch buffer would help only those paths
+        // and complicate the call signature.
+        let mut idx = vec![0 as CodeIndex; self.n];
+        self.unpack_mse_indices(packed_mse, &mut idx);
+        self.score_ip_encoded(prep, &idx, qjl, gamma)
+    }
+
+    /// Extract one `B`-bit code from a packed byte stream at the given bit offset.
+    /// Reads at most 2 consecutive bytes (always safe for `B <= 8` provided
+    /// the caller stays within `i < n`).
+    ///
+    /// Only used by the x86_64 AVX2 SIMD scoring kernels; gated to suppress
+    /// dead-code warnings on other targets.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn extract_code<const B: usize>(packed_ptr: *const u8, bit_pos: usize) -> u8 {
+        let byte_idx = bit_pos >> 3;
+        let bit_off = bit_pos & 7;
+        let mask: u32 = (1u32 << B) - 1;
+        let lo = unsafe { *packed_ptr.add(byte_idx) } as u32;
+        let val = if B + bit_off > 8 {
+            let hi = unsafe { *packed_ptr.add(byte_idx + 1) } as u32;
+            (lo >> bit_off) | (hi << (8 - bit_off))
+        } else {
+            lo >> bit_off
+        };
+        (val & mask) as u8
+    }
+
+    /// **P8 (v0.8.3) — generic fused-unpack kernel for any `B` ∈ [1, 8].**
+    ///
+    /// Mirrors the architecture of the previous b=4-only variant: 8-code SIMD
+    /// batches, no intermediate index buffer. The bit-extraction loop is
+    /// const-generic so each `B` instantiation compiles to specialized
+    /// shifts/masks. QJL accumulator is identical to `score_ip_encoded_simd`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn score_ip_encoded_packed_simd<const B: usize>(
+        &self,
+        prep: &PreparedIpQuery,
+        packed_mse: &[u8],
+        qjl: &[u8],
+        gamma: f64,
+    ) -> f64 {
+        use std::arch::x86_64::*;
+
+        let mut mse_acc = _mm256_setzero_ps();
+        let lut = prep.mse_lut.as_ptr();
+        let lut_width = prep.mse_lut_width;
+        let n = self.n;
+        let packed_ptr = packed_mse.as_ptr();
+
+        let mut i = 0usize;
+        // Process 8 codes per SIMD batch.
+        while i + 8 <= n {
+            let mut vals = [0.0f32; 8];
+            for j in 0..8 {
+                let code = unsafe { Self::extract_code::<B>(packed_ptr, (i + j) * B) };
+                vals[j] = unsafe { *lut.add((i + j) * lut_width + code as usize) };
+            }
+            mse_acc = _mm256_add_ps(mse_acc, _mm256_loadu_ps(vals.as_ptr()));
+            i += 8;
+        }
+
+        let mut res = [0.0f32; 8];
+        _mm256_storeu_ps(res.as_mut_ptr(), mse_acc);
+        let mut mse_sum = 0.0f32;
+        for v in res {
+            mse_sum += v;
+        }
+
+        // Scalar tail.
+        while i < n {
+            let code = unsafe { Self::extract_code::<B>(packed_ptr, i * B) };
+            mse_sum += unsafe { *lut.add(i * lut_width + code as usize) };
+            i += 1;
+        }
+
+        // QJL portion: identical pattern to score_ip_encoded_simd.
+        let mut qjl_acc = _mm256_setzero_ps();
+        let sq = prep.sq.as_ptr();
+        let qjl_ptr = qjl.as_ptr();
+        let qjl_len = qjl.len();
+        let bit_masks = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+        let zero_si = _mm256_setzero_si256();
+        let pos_one = _mm256_set1_ps(1.0f32);
+        let neg_one = _mm256_set1_ps(-1.0f32);
+
+        let mut b = 0;
+        while b < qjl_len {
+            let byte = unsafe { *qjl_ptr.add(b) as i32 };
+            let base_i = b << 3;
+            if base_i + 7 < n {
+                let s_vec = _mm256_loadu_ps(unsafe { sq.add(base_i) });
+                let byte_broadcast = _mm256_set1_epi32(byte);
+                let masked = _mm256_and_si256(byte_broadcast, bit_masks);
+                let is_zero = _mm256_cmpeq_epi32(masked, zero_si);
+                let signs = _mm256_blendv_ps(pos_one, neg_one, _mm256_castsi256_ps(is_zero));
+                qjl_acc = _mm256_fmadd_ps(signs, s_vec, qjl_acc);
+            } else {
+                let mut qs = 0.0f32;
+                for bit in 0..8 {
+                    let idx = base_i + bit;
+                    if idx >= n {
+                        break;
+                    }
+                    let s = unsafe { *sq.add(idx) };
+                    qs += if (byte & (1 << bit)) != 0 { s } else { -s };
+                }
+                mse_sum += (gamma as f32) * prep.qjl_scale * qs;
+            }
+            b += 1;
+        }
+
+        _mm256_storeu_ps(res.as_mut_ptr(), qjl_acc);
+        let mut qjl_sum = 0.0f32;
+        for v in res {
+            qjl_sum += v;
+        }
+
+        (mse_sum + (gamma as f32) * prep.qjl_scale * qjl_sum) as f64
+    }
+
+    /// **P8 (v0.8.3) — generic i16 LUT fast-mode scorer for any `B` ∈ [1, 8].**
+    ///
+    /// Replaces the b=4-only `_b4_simd_i16` variant. Halves LUT footprint vs
+    /// the f32 path and uses an i32 accumulator (1-cycle latency vs f32 add's
+    /// 4 cycles). Single global scale applied at the very end.
+    /// Bit-identical recall to the f32 variant per P6 validation.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn score_ip_encoded_packed_simd_i16<const B: usize>(
+        &self,
+        prep: &PreparedIpQuery,
+        packed_mse: &[u8],
+    ) -> f64 {
+        use std::arch::x86_64::*;
+
+        let mut acc_i32 = _mm256_setzero_si256();
+        let lut = prep.mse_lut_i16.as_ptr();
+        let lut_width = prep.mse_lut_width;
+        let n = self.n;
+        let packed_ptr = packed_mse.as_ptr();
+
+        let mut i = 0usize;
+        // Process 8 codes per SIMD batch.
+        while i + 8 <= n {
+            let mut vals = [0i16; 8];
+            for j in 0..8 {
+                let code = unsafe { Self::extract_code::<B>(packed_ptr, (i + j) * B) };
+                vals[j] = unsafe { *lut.add((i + j) * lut_width + code as usize) };
+            }
+            let v128 = _mm_loadu_si128(vals.as_ptr() as *const __m128i);
+            let v256 = _mm256_cvtepi16_epi32(v128);
+            acc_i32 = _mm256_add_epi32(acc_i32, v256);
+            i += 8;
+        }
+
+        let mut tmp = [0i32; 8];
+        _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, acc_i32);
+        let mut sum_i64: i64 = 0;
+        for v in tmp {
+            sum_i64 += v as i64;
+        }
+
+        // Scalar tail.
+        while i < n {
+            let code = unsafe { Self::extract_code::<B>(packed_ptr, i * B) };
+            sum_i64 += unsafe { *lut.add(i * lut_width + code as usize) } as i64;
+            i += 1;
+        }
+
+        (sum_i64 as f32 * prep.mse_lut_i16_scale) as f64
+    }
+
     pub fn quantize(&self, x: &[f32]) -> (Vec<CodeIndex>, Vec<u8>, f64) {
         let idx = self.mse_quantizer.quantize(x);
 
@@ -612,32 +891,50 @@ impl ProdQuantizer {
             );
         }
 
-        // Per-vector: centroid lookup on each column of Y, then QJL if needed.
-        (0..b)
-            .map(|col| {
-                let y_col = y_mat.column(col);
-                let idx: Vec<CodeIndex> = y_col
-                    .iter()
-                    .map(|&val| self.mse_quantizer.nearest_centroid_index(val))
-                    .collect();
-
-                if self.fast_mode {
-                    return (idx, vec![0u8; self.n.div_ceil(8)], 0.0f64);
-                }
-
-                let x_mse = self.mse_quantizer.dequantize(&idx);
-                let mut residual = Array1::zeros(d);
-                let mut gamma_sq = 0.0f64;
-                for i in 0..d {
-                    let rv = xs[col][i] as f64 - x_mse[i];
-                    residual[i] = rv;
-                    gamma_sq += rv * rv;
-                }
-                let gamma = gamma_sq.sqrt();
-                let qjl = self.qjl_quantizer.quantize(&residual);
-                (idx, qjl, gamma)
-            })
-            .collect()
+        // B1: parallelize the per-vector centroid lookup + (optional) QJL residual.
+        // Each column is independent; using par_iter scales linearly with cores
+        // for the dominant cost in dense ingest at high d.
+        // Gate by TOTAL work (b * d). At small d the per-vector work is so cheap
+        // that Rayon park/unpark overhead exceeds the saving (measured: d=200 was
+        // 12% SLOWER under always-on par). Threshold tuned so d=1536+ at b≥1000
+        // parallelizes (positive bench), d=200 stays sequential.
+        const PAR_WORK_THRESHOLD: usize = 5_000_000;
+        let parallel = b.saturating_mul(d) >= PAR_WORK_THRESHOLD;
+        // Snapshot the columns we need before entering Rayon — DMatrix isn't Sync.
+        let cols: Vec<Vec<f32>> = (0..b)
+            .map(|col| y_mat.column(col).iter().copied().collect())
+            .collect();
+        let process = |col: usize, y_col: &[f32]| -> (Vec<CodeIndex>, Vec<u8>, f64) {
+            let idx: Vec<CodeIndex> = y_col
+                .iter()
+                .map(|&val| self.mse_quantizer.nearest_centroid_index(val))
+                .collect();
+            if self.fast_mode {
+                return (idx, vec![0u8; self.n.div_ceil(8)], 0.0f64);
+            }
+            let x_mse = self.mse_quantizer.dequantize(&idx);
+            let mut residual = Array1::zeros(d);
+            let mut gamma_sq = 0.0f64;
+            for i in 0..d {
+                let rv = xs[col][i] as f64 - x_mse[i];
+                residual[i] = rv;
+                gamma_sq += rv * rv;
+            }
+            let gamma = gamma_sq.sqrt();
+            let qjl = self.qjl_quantizer.quantize(&residual);
+            (idx, qjl, gamma)
+        };
+        if parallel {
+            cols.par_iter()
+                .enumerate()
+                .map(|(c, y)| process(c, y))
+                .collect()
+        } else {
+            cols.iter()
+                .enumerate()
+                .map(|(c, y)| process(c, y))
+                .collect()
+        }
     }
 
     pub fn dequantize(&self, idx: &[CodeIndex], qjl: &[u8], gamma: f64) -> Array1<f64> {
@@ -803,6 +1100,257 @@ impl ProdQuantizer {
         let (_, qjl_bits, _) = self.quantize(&query_f32);
         qjl_bits
     }
+
+    /// Compute query sign-bit sketch from the rotated query for fast Hamming
+    /// prefiltering when fast_mode + b=4 (no QJL stored). Output length = n/8 bytes,
+    /// where bit i of byte i/8 is 1 iff the i-th rotated dimension is non-negative.
+    ///
+    /// This matches the doc-side sketch derivable from the high bit of each MSE
+    /// nibble (Lloyd-Max codebook is symmetric around 0, so idx >= 1<<(b-1) ↔
+    /// centroid > 0).
+    pub(crate) fn prepare_query_sign_bits(&self, query: &Array1<f64>) -> Vec<u8> {
+        let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
+        let mut y = vec![0.0f32; self.n];
+        self.mse_quantizer.apply_rotation(&query_f32, &mut y);
+        let mut bits = vec![0u8; self.n.div_ceil(8)];
+        for i in 0..self.n {
+            if y[i] >= 0.0 {
+                bits[i >> 3] |= 1u8 << (i & 7);
+            }
+        }
+        bits
+    }
+}
+
+/// Hamming disagreement between a query sign sketch (`query_signs`) and the
+/// document's implicit sign sketch derivable from b=4 packed MSE nibbles.
+///
+/// Kept for backward compatibility. New code should call the const-generic
+/// [`hamming_disagree_signs::<4>`] which produces the same result.
+#[inline]
+pub fn hamming_disagree_b4_signs(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
+    hamming_disagree_signs::<4>(query_signs, mse_bytes)
+}
+
+/// **P8 (v0.8.3) — generic Hamming sign-bit prefilter for `B` ∈ {1, 2, 4, 8}.**
+///
+/// The Lloyd-Max codebook is symmetric around 0 for every B, so the **MSB of
+/// each B-bit code** is the sign of the corresponding rotated dimension. We
+/// extract those sign bits from the packed MSE bytes for free (no extra
+/// storage) and XOR-popcount against a precomputed query sign sketch.
+///
+/// Each `B` instantiation routes to a u64-chunked fast path — the const
+/// branches are folded away at compile time, so each specialisation contains
+/// only its own bit-compression dance.
+///
+/// Other bit-rates (3, 5, 6, 7) span misaligned boundaries and aren't covered
+/// — for those configs the prefilter is bypassed at the engine layer.
+///
+/// `query_signs.len() * B == mse_bytes.len()` (one sign byte per B mse bytes,
+/// since each mse byte holds 8/B codes and each code contributes 1 sign bit).
+/// Lower return = closer in IP.
+#[inline]
+pub fn hamming_disagree_signs<const B: usize>(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
+    debug_assert_eq!(
+        query_signs.len() * B,
+        mse_bytes.len(),
+        "hamming_disagree_signs<B={B}>: query_signs.len()*B must equal mse_bytes.len()"
+    );
+    match B {
+        1 => hamming_popcount_xor(query_signs, mse_bytes),
+        2 => hamming_disagree_b2_fast(query_signs, mse_bytes),
+        4 => hamming_disagree_b4_fast(query_signs, mse_bytes),
+        8 => hamming_disagree_b8_fast(query_signs, mse_bytes),
+        _ => hamming_disagree_signs_generic::<B>(query_signs, mse_bytes),
+    }
+}
+
+/// Compress every other bit of a u64 into the low 32 bits.
+/// Input bits at positions {1, 3, 5, ..., 63} become output bits {0, 1, ..., 31}.
+#[inline(always)]
+fn compress_odd_bits_u64(z: u64) -> u32 {
+    // Keep only odd-position bits, then shift right by 1 so they land at even positions.
+    let mut z = (z & 0xAAAA_AAAA_AAAA_AAAAu64) >> 1;
+    // Standard sequence to compress every-other-bit into a contiguous low half.
+    z = (z | (z >> 1)) & 0x3333_3333_3333_3333u64;
+    z = (z | (z >> 2)) & 0x0F0F_0F0F_0F0F_0F0Fu64;
+    z = (z | (z >> 4)) & 0x00FF_00FF_00FF_00FFu64;
+    z = (z | (z >> 8)) & 0x0000_FFFF_0000_FFFFu64;
+    z = (z | (z >> 16)) & 0x0000_0000_FFFF_FFFFu64;
+    z as u32
+}
+
+/// b=2 fast path: 8 mse bytes (= 32 codes) per iteration → 32 sign bits = 4 sketch bytes.
+#[inline]
+fn hamming_disagree_b2_fast(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
+    let mut disagree = 0u32;
+    let mut i = 0usize;
+    let mut q_i = 0usize;
+    while i + 8 <= mse_bytes.len() {
+        let chunk = u64::from_le_bytes(mse_bytes[i..i + 8].try_into().unwrap());
+        let packed = compress_odd_bits_u64(chunk); // 32 sign bits in low 32
+        let q = u32::from_le_bytes(query_signs[q_i..q_i + 4].try_into().unwrap());
+        disagree += (packed ^ q).count_ones();
+        i += 8;
+        q_i += 4;
+    }
+    // Tail (mse_bytes.len() not a multiple of 8): byte-by-byte. Each mse byte
+    // contributes 4 sign bits → low nibble of `query_signs[i/2]` if `i` is
+    // even, high nibble if `i` is odd. The assertion at the top of
+    // `hamming_disagree_signs::<2>` guarantees `query_signs.len() * 2 ==
+    // mse_bytes.len()`, so `i/2` is always a valid index into query_signs.
+    let _ = q_i; // q_i tracking is only needed for the main 8-byte loop above
+    while i < mse_bytes.len() {
+        let byte = mse_bytes[i] as u32;
+        let mut packed: u8 = 0;
+        for c in 0..4 {
+            packed |= (((byte >> (2 * c + 1)) & 1) << c) as u8;
+        }
+        let q_byte = query_signs[i / 2];
+        let q_nibble = if (i & 1) == 0 {
+            q_byte & 0x0F
+        } else {
+            (q_byte >> 4) & 0x0F
+        };
+        disagree += (packed ^ q_nibble).count_ones();
+        i += 1;
+    }
+    disagree
+}
+
+/// b=4 fast path: 8 mse bytes (= 16 codes) per iteration → 16 sign bits = 2 sketch bytes.
+#[inline]
+fn hamming_disagree_b4_fast(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
+    let mut disagree = 0u32;
+    let mut i = 0usize;
+    let mut q_i = 0usize;
+    while i + 8 <= mse_bytes.len() {
+        let chunk = u64::from_le_bytes(mse_bytes[i..i + 8].try_into().unwrap());
+        // MSBs of b=4 nibbles are at bit positions {3, 7, 11, 15, ...} = mask 0x8888...
+        // Shift right 3 so they land at {0, 4, 8, 12, ...}, then compress every 4th bit.
+        let shifted = (chunk & 0x8888_8888_8888_8888u64) >> 3;
+        // shifted has bits at positions {0, 4, 8, 12, 16, 20, 24, 28, ...}.
+        // Compress to contiguous low 16 bits.
+        let mut z = shifted;
+        z = (z | (z >> 3)) & 0x1111_1111_1111_1111u64; // pack pairs (this is a no-op given the shifted layout but keeps the pattern uniform)
+        // Simpler: gather bits with shift-or steps.
+        // Actually do it the straightforward way: extract per-byte and accumulate.
+        let mut packed: u16 = 0;
+        for k in 0..8 {
+            let byte = (chunk >> (8 * k)) as u8;
+            packed |= ((byte as u16 >> 3) & 0x01) << (2 * k);
+            packed |= ((byte as u16 >> 7) & 0x01) << (2 * k + 1);
+        }
+        let _ = z; // retain the experimental compression path; not used in this version
+        let q = u16::from_le_bytes(query_signs[q_i..q_i + 2].try_into().unwrap());
+        disagree += (packed ^ q).count_ones();
+        i += 8;
+        q_i += 2;
+    }
+    // Tail: 4 mse bytes → 1 sketch byte.
+    while i + 4 <= mse_bytes.len() {
+        let m0 = mse_bytes[i];
+        let m1 = mse_bytes[i + 1];
+        let m2 = mse_bytes[i + 2];
+        let m3 = mse_bytes[i + 3];
+        let packed: u8 = ((m0 >> 3) & 0x01)
+            | ((m0 >> 6) & 0x02)
+            | ((m1 >> 1) & 0x04)
+            | ((m1 >> 4) & 0x08)
+            | ((m2 << 1) & 0x10)
+            | ((m2 >> 2) & 0x20)
+            | ((m3 << 3) & 0x40)
+            | (m3 & 0x80);
+        disagree += (packed ^ query_signs[q_i]).count_ones();
+        i += 4;
+        q_i += 1;
+    }
+    disagree
+}
+
+/// b=8 fast path: 8 mse bytes (= 8 codes) per iteration → 8 sign bits = 1 sketch byte.
+#[inline]
+fn hamming_disagree_b8_fast(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
+    let mut disagree = 0u32;
+    let mut i = 0usize;
+    let mut q_i = 0usize;
+    while i + 8 <= mse_bytes.len() {
+        let chunk = u64::from_le_bytes(mse_bytes[i..i + 8].try_into().unwrap());
+        // MSB of each byte = bit 7 of that byte. After & 0x80 mask, bits at {7, 15, 23, ...}.
+        let masked = chunk & 0x8080_8080_8080_8080u64;
+        // Compress to byte 0 by multiplying with a magic constant (gathers high bits).
+        // Use a portable scalar fallback: per-byte extraction.
+        let mut packed: u8 = 0;
+        for k in 0..8 {
+            let byte = (chunk >> (8 * k)) as u8;
+            packed |= ((byte >> 7) & 0x01) << k;
+        }
+        let _ = masked;
+        disagree += (packed ^ query_signs[q_i]).count_ones();
+        i += 8;
+        q_i += 1;
+    }
+    // Tail.
+    while i < mse_bytes.len() {
+        // Each remaining byte contributes 1 bit; rare path, byte-by-byte.
+        let bit = (mse_bytes[i] >> 7) & 0x01;
+        let q_byte = query_signs[q_i];
+        let q_bit = (q_byte >> (i & 7)) & 0x01;
+        if bit != q_bit {
+            disagree += 1;
+        }
+        i += 1;
+        if (i & 7) == 0 {
+            q_i += 1;
+        }
+    }
+    disagree
+}
+
+/// Slow byte-by-byte fallback used for general B (and as a parity reference in tests).
+#[inline]
+fn hamming_disagree_signs_generic<const B: usize>(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
+    let mut disagree = 0u32;
+    let mut i = 0usize;
+    let mut q_i = 0usize;
+    let codes_per_byte = 8 / B;
+    let bytes_per_query_byte = 8 / codes_per_byte;
+    while i + bytes_per_query_byte <= mse_bytes.len() {
+        let mut packed: u8 = 0;
+        for k in 0..bytes_per_query_byte {
+            let byte = mse_bytes[i + k] as u32;
+            for c in 0..codes_per_byte {
+                let bit_in_byte = c * B + (B - 1);
+                let dst_bit = k * codes_per_byte + c;
+                packed |= (((byte >> bit_in_byte) & 1) << dst_bit) as u8;
+            }
+        }
+        disagree += (packed ^ query_signs[q_i]).count_ones();
+        i += bytes_per_query_byte;
+        q_i += 1;
+    }
+    disagree
+}
+
+/// Bit-level popcount(XOR) between two equal-length byte slices, processing
+/// 8 bytes at a time as u64 for native POPCNT throughput.
+#[inline]
+fn hamming_popcount_xor(a: &[u8], b: &[u8]) -> u32 {
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let mut disagree = 0u32;
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let av = u64::from_le_bytes(a[i..i + 8].try_into().unwrap());
+        let bv = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        disagree += (av ^ bv).count_ones();
+        i += 8;
+    }
+    while i < n {
+        disagree += (a[i] ^ b[i]).count_ones();
+        i += 1;
+    }
+    disagree
 }
 
 /// Normalized Hamming similarity between two bit-packed byte slices.
@@ -965,6 +1513,300 @@ mod tests {
         let mut unpacked = vec![0u16; pq.n];
         pq.unpack_mse_indices(&packed, &mut unpacked);
         assert_eq!(idx, unpacked);
+    }
+
+    // -----------------------------------------------------------------------
+    // P8 (v0.8.3): generic SIMD parity tests for every supported bit-rate.
+    //
+    // For each B ∈ [1, 8], assert that score_ip_encoded_packed (which dispatches
+    // into the const-generic `score_ip_encoded_packed_simd[_i16]::<B>`) matches
+    // the scalar reference (`score_ip_encoded_scalar` after unpacking) within
+    // floating-point tolerance. The chosen `d=50` is intentionally not a
+    // multiple of 8 so the SIMD-batch + scalar-tail boundary is exercised.
+    // -----------------------------------------------------------------------
+
+    fn parity_check_packed_simd_fast_mode(b: usize) {
+        use rand::Rng;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        use rand_distr::StandardNormal;
+
+        let d = 50;
+        let pq = ProdQuantizer::new_dense_fast(d, b, 42);
+        let mut rng = StdRng::seed_from_u64(0xa0b1c2d3 ^ b as u64);
+        let x: Vec<f32> = (0..d).map(|_| rng.sample(StandardNormal)).collect();
+        let q: Vec<f32> = (0..d).map(|_| rng.sample(StandardNormal)).collect();
+
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        assert!(
+            qjl.iter().all(|&b| b == 0),
+            "fast_mode should produce empty qjl bits"
+        );
+        assert_eq!(gamma, 0.0, "fast_mode should report gamma=0");
+
+        let packed = pq.pack_mse_indices(&idx);
+        let q_arr: ndarray::Array1<f64> = q.iter().map(|&v| v as f64).collect();
+        let prep = pq.prepare_ip_query(&q_arr);
+
+        let simd_score = pq.score_ip_encoded_packed(&prep, &packed, &qjl, gamma);
+        let scalar_score = pq.score_ip_encoded_scalar(&prep, &idx, &qjl, gamma);
+
+        let denom = scalar_score.abs().max(1e-6);
+        let rel_err = (simd_score - scalar_score).abs() / denom;
+        // i16 LUT path uses a single global scale, so bounded quantisation
+        // error vs the f32 reference is expected. 2% relative is comfortably
+        // above the worst-case rounding for any well-conditioned query.
+        assert!(
+            rel_err < 0.02,
+            "b={b}: SIMD={simd_score} vs scalar={scalar_score} rel_err={rel_err}"
+        );
+    }
+
+    fn parity_check_packed_simd_qjl(mse_b: usize) {
+        use rand::Rng;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        use rand_distr::StandardNormal;
+
+        // new_dense uses mse_quantizer.b = b - 1, so to drive the kernel at
+        // a given mse_b we construct with `mse_b + 1`.
+        let d = 50;
+        let pq = ProdQuantizer::new_dense(d, mse_b + 1, 42);
+        assert_eq!(pq.mse_quantizer.b, mse_b);
+
+        let mut rng = StdRng::seed_from_u64(0xb1c2d3e4 ^ mse_b as u64);
+        let x: Vec<f32> = (0..d).map(|_| rng.sample(StandardNormal)).collect();
+        let q: Vec<f32> = (0..d).map(|_| rng.sample(StandardNormal)).collect();
+
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        assert!(!qjl.is_empty(), "non-fast_mode should produce qjl bits");
+
+        let packed = pq.pack_mse_indices(&idx);
+        let q_arr: ndarray::Array1<f64> = q.iter().map(|&v| v as f64).collect();
+        let prep = pq.prepare_ip_query(&q_arr);
+
+        let simd_score = pq.score_ip_encoded_packed(&prep, &packed, &qjl, gamma);
+        let scalar_score = pq.score_ip_encoded_scalar(&prep, &idx, &qjl, gamma);
+
+        let denom = scalar_score.abs().max(1e-6);
+        let rel_err = (simd_score - scalar_score).abs() / denom;
+        assert!(
+            rel_err < 1e-4,
+            "mse_b={mse_b}: SIMD={simd_score} vs scalar={scalar_score} rel_err={rel_err}"
+        );
+    }
+
+    #[test]
+    fn p8_packed_simd_parity_b1_fast() {
+        parity_check_packed_simd_fast_mode(1);
+    }
+    #[test]
+    fn p8_packed_simd_parity_b2_fast() {
+        parity_check_packed_simd_fast_mode(2);
+    }
+    #[test]
+    fn p8_packed_simd_parity_b3_fast() {
+        parity_check_packed_simd_fast_mode(3);
+    }
+    #[test]
+    fn p8_packed_simd_parity_b4_fast() {
+        parity_check_packed_simd_fast_mode(4);
+    }
+    #[test]
+    fn p8_packed_simd_parity_b5_fast() {
+        parity_check_packed_simd_fast_mode(5);
+    }
+    #[test]
+    fn p8_packed_simd_parity_b6_fast() {
+        parity_check_packed_simd_fast_mode(6);
+    }
+    #[test]
+    fn p8_packed_simd_parity_b7_fast() {
+        parity_check_packed_simd_fast_mode(7);
+    }
+    #[test]
+    fn p8_packed_simd_parity_b8_fast() {
+        parity_check_packed_simd_fast_mode(8);
+    }
+
+    #[test]
+    fn p8_packed_simd_parity_b1_qjl() {
+        parity_check_packed_simd_qjl(1);
+    }
+    #[test]
+    fn p8_packed_simd_parity_b2_qjl() {
+        parity_check_packed_simd_qjl(2);
+    }
+    #[test]
+    fn p8_packed_simd_parity_b3_qjl() {
+        parity_check_packed_simd_qjl(3);
+    }
+    #[test]
+    fn p8_packed_simd_parity_b4_qjl() {
+        parity_check_packed_simd_qjl(4);
+    }
+    #[test]
+    fn p8_packed_simd_parity_b5_qjl() {
+        parity_check_packed_simd_qjl(5);
+    }
+    #[test]
+    fn p8_packed_simd_parity_b6_qjl() {
+        parity_check_packed_simd_qjl(6);
+    }
+    #[test]
+    fn p8_packed_simd_parity_b7_qjl() {
+        parity_check_packed_simd_qjl(7);
+    }
+    #[test]
+    fn p8_packed_simd_parity_b8_qjl() {
+        parity_check_packed_simd_qjl(8);
+    }
+
+    #[test]
+    fn p8_hamming_disagree_b1_matches_popcount_xor() {
+        use rand::Rng;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        let n = 256;
+        let mut rng = StdRng::seed_from_u64(7);
+        let q: Vec<u8> = (0..n)
+            .map(|_| rng.sample(rand::distributions::Standard))
+            .collect();
+        let d: Vec<u8> = (0..n)
+            .map(|_| rng.sample(rand::distributions::Standard))
+            .collect();
+        let dis = super::hamming_disagree_signs::<1>(&q, &d);
+        // For B=1, expected = popcount(q XOR d) over all bytes.
+        let expected: u32 = q
+            .iter()
+            .zip(d.iter())
+            .map(|(a, b)| (a ^ b).count_ones())
+            .sum();
+        assert_eq!(dis, expected);
+    }
+
+    #[test]
+    fn p8_hamming_disagree_b2_b4_b8_match_brute_force() {
+        // Build a random packed_mse for each B and assert hamming_disagree_signs
+        // returns the same Hamming distance as a brute-force per-code MSB extraction.
+        use rand::Rng;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        for &b in &[2usize, 4, 8] {
+            let n = 256; // codes
+            let total_bits = n * b;
+            let mse_len = total_bits / 8;
+            let q_signs_len = n / 8;
+            let mut rng = StdRng::seed_from_u64(0x101 ^ b as u64);
+            let mse_bytes: Vec<u8> = (0..mse_len)
+                .map(|_| rng.sample(rand::distributions::Standard))
+                .collect();
+            let q_signs: Vec<u8> = (0..q_signs_len)
+                .map(|_| rng.sample(rand::distributions::Standard))
+                .collect();
+
+            // Brute-force reference: for each code i ∈ 0..n, MSB = bit at position
+            // (i*b + b - 1) of the packed stream; query sign = bit i of q_signs.
+            let mut expected = 0u32;
+            for i in 0..n {
+                let bit_pos = i * b + (b - 1);
+                let doc_bit = (mse_bytes[bit_pos >> 3] >> (bit_pos & 7)) & 1;
+                let q_bit = (q_signs[i >> 3] >> (i & 7)) & 1;
+                if doc_bit != q_bit {
+                    expected += 1;
+                }
+            }
+            let actual = match b {
+                2 => super::hamming_disagree_signs::<2>(&q_signs, &mse_bytes),
+                4 => super::hamming_disagree_signs::<4>(&q_signs, &mse_bytes),
+                8 => super::hamming_disagree_signs::<8>(&q_signs, &mse_bytes),
+                _ => unreachable!(),
+            };
+            assert_eq!(actual, expected, "b={b}");
+        }
+    }
+
+    #[test]
+    fn p8_hamming_b4_back_compat_matches_const_generic() {
+        // The legacy hamming_disagree_b4_signs wrapper must agree with the new
+        // const-generic for every input.
+        use rand::Rng;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        let mut rng = StdRng::seed_from_u64(42);
+        for trial in 0..20 {
+            let n = 64 + trial * 8;
+            let mse_len = n / 2; // b=4: each byte = 2 codes
+            let q_signs_len = n / 8;
+            let mse_bytes: Vec<u8> = (0..mse_len)
+                .map(|_| rng.sample(rand::distributions::Standard))
+                .collect();
+            let q_signs: Vec<u8> = (0..q_signs_len)
+                .map(|_| rng.sample(rand::distributions::Standard))
+                .collect();
+            let legacy = super::hamming_disagree_b4_signs(&q_signs, &mse_bytes);
+            let generic = super::hamming_disagree_signs::<4>(&q_signs, &mse_bytes);
+            assert_eq!(legacy, generic, "trial={trial} n={n}");
+        }
+    }
+
+    #[test]
+    fn p8_hamming_b2_tail_with_odd_byte_count() {
+        // Regression for a buggy `q_i + (i - q_i*2)` tail-index expression
+        // that drifted out of bounds when mse_bytes.len() % 8 != 0. Exercises
+        // mse_bytes.len() ∈ {10, 12, 14} (each → 2/4/6 byte tail at b=2).
+        use rand::Rng;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        let mut rng = StdRng::seed_from_u64(0xb201);
+        for &mse_len in &[10usize, 12, 14, 18, 22] {
+            let q_signs_len = mse_len / 2;
+            let mse_bytes: Vec<u8> = (0..mse_len)
+                .map(|_| rng.sample(rand::distributions::Standard))
+                .collect();
+            let q_signs: Vec<u8> = (0..q_signs_len)
+                .map(|_| rng.sample(rand::distributions::Standard))
+                .collect();
+            // Should not panic and should match the brute-force MSB extraction.
+            let actual = super::hamming_disagree_signs::<2>(&q_signs, &mse_bytes);
+            let n = mse_len * 8 / 2;
+            let mut expected = 0u32;
+            for i in 0..n {
+                let bit_pos = i * 2 + 1;
+                let doc_bit = (mse_bytes[bit_pos >> 3] >> (bit_pos & 7)) & 1;
+                let q_bit = (q_signs[i >> 3] >> (i & 7)) & 1;
+                if doc_bit != q_bit {
+                    expected += 1;
+                }
+            }
+            assert_eq!(actual, expected, "mse_len={mse_len}");
+        }
+    }
+
+    #[test]
+    fn p8_packed_simd_long_dim_b2_fast() {
+        // Larger d to exercise multiple 8-code SIMD batches + tail.
+        // n=50 → 6 batches + 2-code tail; let's also check d=200 with no tail.
+        use rand::Rng;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        use rand_distr::StandardNormal;
+
+        for d in [200usize, 511, 1024] {
+            let pq = ProdQuantizer::new_dense_fast(d, 2, 42);
+            let mut rng = StdRng::seed_from_u64(d as u64);
+            let x: Vec<f32> = (0..d).map(|_| rng.sample(StandardNormal)).collect();
+            let q: Vec<f32> = (0..d).map(|_| rng.sample(StandardNormal)).collect();
+            let (idx, qjl, gamma) = pq.quantize(&x);
+            let packed = pq.pack_mse_indices(&idx);
+            let q_arr: ndarray::Array1<f64> = q.iter().map(|&v| v as f64).collect();
+            let prep = pq.prepare_ip_query(&q_arr);
+            let simd_score = pq.score_ip_encoded_packed(&prep, &packed, &qjl, gamma);
+            let scalar_score = pq.score_ip_encoded_scalar(&prep, &idx, &qjl, gamma);
+            let denom = scalar_score.abs().max(1e-6);
+            let rel_err = (simd_score - scalar_score).abs() / denom;
+            assert!(rel_err < 0.02, "d={d}: rel_err={rel_err}");
+        }
     }
 
     #[test]

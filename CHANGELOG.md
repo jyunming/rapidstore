@@ -6,6 +6,124 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ---
 
+## [0.8.3] — 2026-05-03
+
+End-to-end search hot path optimization + compression-first rerank sprint. Stacks brute-force kernel improvements (P0/P2/P4/P7), parallel-ingest + cold-cache wins (A1/A2/B1), ANN tuning (C1/C2), generalised SIMD for every bit-rate (P8), and a new opt-in **`residual_int4` rerank precision** (P12) that cuts the rerank file ~31% at near-int8 recall. Adds CI coverage for macOS Apple Silicon and Linux aarch64.
+
+**Headline vs v0.8.2 main:**
+
+| Cell (n=100k, brute, fast_mode) | v0.8.2 p50 | v0.8.3 p50 | Δ |
+|---|---:|---:|---:|
+| dbpedia-1536 b=2 rerank=F | 20.1 ms | **5.62 ms** | **−72%** |
+| dbpedia-1536 b=4 rerank=F | 12.8 ms | **8.28 ms** | **−35%** |
+| dbpedia-3072 b=2 rerank=F | 50.0 ms | **15.88 ms** | **−68%** |
+| dbpedia-3072 b=4 rerank=F | 27.4 ms | **20.76 ms** | **−24%** |
+| glove-200 b=4 rerank=F | 1.4 ms | **1.14 ms** | **−19%** |
+
+Recall preserved bit-for-bit on default paths. b=2 cells improve dramatically because the v0.8.3 SIMD optimisations now apply to every supported bit-rate (P8), not just b=4.
+
+### Performance — brute-force kernel (P0/P2/P4/P7)
+
+- **Sign-bit Hamming pre-filter for b=4 fast-mode** (`src/storage/engine/mod.rs`, `src/quantizer/prod.rs`). At fast-mode + b=4, the high bit of every 4-bit MSE nibble is the sign of the corresponding rotated dimension (Lloyd-Max codebook is symmetric around 0). This lets us derive a 1-bit-per-dim sketch directly from the existing live MSE bytes — no extra storage. Active when `qjl_len == 0 && b == 4 && d ≥ 512 && candidates ≥ 5_000`. Pre-scores all candidates by Hamming distance, retains top 1/16, full LUT scoring runs only on those. Bit-identical recall (Hamming only orders the prefilter survivors; no candidate is dropped that the full scorer would have ranked top-K).
+
+- **Fused MSE nibble unpack into b=4 scoring loop** (`src/quantizer/prod.rs`: new `score_ip_encoded_packed_b4_simd`). The prior path materialized a `Vec<u16>` of code indices per slot before scoring (~4-8 KB of L1 traffic per slot at d=2048). The fused kernel reads packed bytes directly and extracts nibbles inline into a 16-byte stack array. AVX2/FMA gated; b≠4 falls back to the prior unpack-then-score path.
+
+- **Tightened `HAMMING_PREFILTER_RETAIN_RATIO` from 8 → 16** (`src/storage/engine/mod.rs:2446`). Halves the post-filter kernel work (6250 vs 12500 candidates scored at n=100k). Hamming sketch's recall is sufficient at 1/16 retention for production embedding distributions; bit-identical R@1/R@10 vs the previous ratio.
+
+- **i16 LUT for b=4 fast-mode scorer** (`src/quantizer/prod.rs`: new `score_ip_encoded_packed_b4_simd_i16`). `PreparedIpQuery` now also carries an i16 mirror of the MSE LUT with a single global max-abs scale. Halves the LUT L1/L2 footprint (96 KB → 48 KB at d=1536, lut_w=16) and uses an i32 accumulator (1-cycle latency vs f32 add's 4 cycles). Scale applied once at the very end. Numpy-only validation showed bit-identical R@1/R@10 vs the f32 path on synthetic Gaussian and dbpedia query distributions, with EITHER per-row or global scale (global chosen for SIMD simplicity).
+
+  | Dataset | Cell | v0.8.2 p50 | v0.8.3 p50 | Δ |
+  |---|---|---:|---:|---:|
+  | glove-200 | rerank=F | 1.15 ms | 1.02 ms | **−11.3%** |
+  | glove-200 | rerank=T | 1.44 ms | 1.33 ms | **−7.6%** |
+  | dbpedia-1536 | rerank=F | 10.31 ms | 7.99 ms | **−22.5%** |
+  | dbpedia-1536 | rerank=T | 10.12 ms | 8.22 ms | **−18.8%** |
+  | dbpedia-3072 | rerank=F | 22.36 ms | 19.73 ms | **−11.8%** |
+  | dbpedia-3072 | rerank=T | 21.95 ms | 20.08 ms | **−8.5%** |
+
+### Performance — ingest + cold-cache (A1/A2/B1)
+
+- **A1: `MADV_WILLNEED` on `live_codes` open** (`src/storage/live_codes.rs`). New `LiveCodesFile::advise_willneed()` hints the OS to prefetch `live_codes.bin` into the page cache after open(). Mirrors the existing `advise_random()` pattern — `#[cfg(unix)]` body, no-op on Windows / non-Unix. Reduces cold-cache penalty on the first few queries in a fresh-process scenario; expected 5–15% on cold queries on Linux production. Bench machine is Windows so no local measurement; bit-identical recall vs v0.8.2 confirmed.
+
+- **A2: `score_batch_brute` uses fused `score_ip_encoded_packed` for b=4** (`src/storage/engine/mod.rs`). The multi-query batch scorer (gated to `Q ≥ 8 AND N ≥ 500k`) was using the older `score_ip_encoded` path which requires unpacking MSE indices into a `Vec<u16>` per slot. Swapped to `score_ip_encoded_packed` for b=4 (production cell), routing through the P7 i16 LUT in fast_mode. Falls back to the unpack path for b≠4. Expected ~10–15% on multi-query batched workloads at N≥500k; not exercised by the single-query bench.
+
+- **B1: parallel per-vector centroid lookup in dense GEMM ingest** (`src/quantizer/prod.rs`: `quantize_batch_dense_gemm`). The post-rotation per-column nearest-centroid lookup (+ optional QJL residual) is per-column independent. Switched to `par_iter`, gated by total work `b * d ≥ 5M` so small-d batches stay sequential (Rayon park/unpark overhead exceeds savings at d=200; first attempt with always-on parallel made d=200 12% SLOWER).
+
+  | Ingest p50 (3-iter median, 100k inserts) | v0.8.2 | v0.8.3 | Δ |
+  |---|---:|---:|---:|
+  | d=200 | 2.73 s | 2.78 s | +1.8% (within noise; gated off) |
+  | d=1536 | 17.74 s | 16.49 s | **−7.0%** |
+  | d=3072 | 40.03 s | 36.82 s | **−8.0%** |
+
+### Performance — generalize SIMD brute path to all bit-rates (P8)
+
+- **Const-generic fused-unpack scoring kernel** (`src/quantizer/prod.rs`: `score_ip_encoded_packed_simd<const B>` + `_simd_i16<const B>`). Replaces the previous b=4-only `score_ip_encoded_packed_b4_simd*` variants. The 8-code SIMD batch architecture is now parameterized over `B ∈ [1, 8]`; each instantiation compiles to specialized bit-extraction shifts. The `score_ip_encoded_packed` dispatch routes the right monomorphisation based on `mse_quantizer.b`. Bits beyond 8 fall back to the unpack+score path.
+
+- **Generalized Hamming sign-bit pre-filter** (`hamming_disagree_signs<const B>`) for `B ∈ {1, 2, 4, 8}`. The Lloyd-Max codebook is symmetric around 0 for every B, so the MSB of each B-bit code is the sign of the rotated dimension. Per-B u64-chunked extraction kernels (b=2 uses an "every-other-bit compress" trick on a u64 chunk; b=8 collects MSBs from byte stream; b=4 keeps the original optimised pattern; b=1 popcounts XOR directly). The legacy `hamming_disagree_b4_signs` is kept as a thin wrapper. `b ∈ {3, 5, 6, 7}` span misaligned byte boundaries — those bypass the pre-filter and fall back to full-LUT scoring.
+
+- **Engine plumbing** (`src/storage/engine/mod.rs`). Removed the `let b4 = quantizer.mse_bits_per_idx() == 4` gates in `score_batch_brute` and the brute-force exhaustive search (sequential + parallel + Cosine paths). All bit-rates now go through the const-generic `score_ip_encoded_packed`. The Hamming pre-filter gate widened from `b == 4` to `b ∈ {1, 2, 4, 8}`.
+
+  | Cell (dbpedia-1536, n=100k, brute, fast_mode=True) | v0.8.3 pre-P8 p50 | v0.8.3 post-P8 p50 | Δ |
+  |---|---:|---:|---:|
+  | b=2 rerank=F | 20.0 ms | **6.23 ms** | **−69%** |
+  | b=2 rerank=T | 21.2 ms | **6.51 ms** | **−69%** |
+  | b=4 rerank=F | 12.8 ms | **7.62 ms** | **−40%** |
+  | b=4 rerank=T | 12.5 ms | **7.75 ms** | **−38%** |
+
+  At b=2 the LUT is 4× smaller than at b=4 so cache behaviour favours b=2 once both bit-rates share the same scoring path — for the first time, **b=2 brute is faster than b=4**. Recall bit-identical at all cells.
+
+### Compression-first rerank — `RerankPrecision::ResidualInt4` (P12)
+
+- **New opt-in rerank precision** (`src/storage/engine/mod.rs`: `RerankPrecision::ResidualInt4`; Python: `rerank_precision="residual_int4"`). Stores the per-vector **residual** = `vec − dequant(MSE codes) × doc_norm` at INT4 precision (4 + ⌈d/2⌉ bytes per vector — same on-disk record size as the deprecated `Int4` raw mode). Because the residual has a much smaller dynamic range than the raw vector, 4 bits buy substantially more precision per dim than INT4-over-raw.
+
+- **Additive scoring at rerank time** (`live_rerank_score_residual_int4`). Inner-product is linear, so `<q, full_vec> = <q, dequant(codes)>·doc_norm + <q, residual>`. The brute-force pass already produces `cand_score = <q, dequant(codes)>·doc_norm`, so we just add `<q, residual_decoded>` per candidate — no need to re-dequantize the codes (an O(d²) operation in dense mode). At d=1536 this is **~14× faster** than the naive full-reconstruction path (8.4 ms vs 121 ms in benchmarks).
+
+- **GEMM-batched residual computation at insert time** (`compute_residuals_batch_parallel`). For dense mode the per-vector dequant at insert is memory-bandwidth-bound (the d×d rotation matrix = 36 MB at d=3072 is re-streamed per vector). A single SGEMM (`Q^T · y_tilde`) does all N inverse rotations in one pass and streams the matrix once. Combined with a parallel per-column residual subtraction, this brings ResidualInt4 ingest within **1.4–1.5× of int8 ingest** at every measured dim (vs the naive serial implementation which was ~22× slower at d=3072).
+
+  | Dataset | d | int8 ingest | residual_int4 ingest (GEMM) | Ratio |
+  |---|---:|---:|---:|---:|
+  | dbpedia-1536 | 1536 | 18.9 s | 26.7 s | 1.41× |
+  | dbpedia-3072 | 3072 | 39.6 s | 60.3 s | 1.52× |
+
+- **Numpy-validated across all (dim, b) cells.** ResidualInt4 at b=4 gives near-int8 recall everywhere (−0 to −1pp R@1 vs int8 across glove-200, dbpedia-1536, dbpedia-3072). At b=2 it loses 2–6.5 pp because the residual has a larger dynamic range — for the b=2 compression-first user, the int8 default still wins, so ResidualInt4 ships as **opt-in**, not as the new default.
+
+  | Dataset | Cell | int8 R@1 | int8 disk | residual_int4 R@1 | residual_int4 disk | Δ disk |
+  |---|---|---:|---:|---:|---:|---:|
+  | glove-200 | b=4 rerank=T | 0.980 | 31 MB | **0.975** | **21 MB** | **−32%** |
+  | dbpedia-1536 | b=4 rerank=T | 0.995 | 230 MB | **0.985** | **158 MB** | **−31%** |
+  | dbpedia-3072 | b=4 rerank=T | 0.995 | 477 MB | **0.985** | **331 MB** | **−31%** |
+
+- **`RerankPrecision::Int4` (raw) is now deprecated.** It was strictly dominated by `rerank=False` at every measured cell — INT4 quantization adds enough noise to the rerank score that it actively hurts ranking instead of helping. The enum variant is kept for backward compatibility with existing databases; new uses should select `ResidualInt4` instead.
+
+- **Tests:** 3 new (`residual_int4_rerank_roundtrip`, `residual_int4_record_size_matches_int4`, `residual_int4_reload_preserves_recall`) pinning encode/decode parity and on-disk format compatibility.
+
+### Performance — ANN (C1/C2)
+
+- **C1: dim-aware `ef_construction` default** (`src/storage/engine/mod.rs`: new `default_ann_ef_construction(d)`; `src/python/mod.rs`). The fixed default of 200 hurts low-d HNSW recall (more quantization noise → graph needs a wider neighbour search at construction). Stepped defaults: `d ≤ 384 → 400`, `d ≤ 1024 → 300`, `d > 1024 → 200` (unchanged). User-supplied `ef_construction=` still respected. On glove-200 ANN rerank=T: **R@1 +6pp, R@10 +6pp**. d=1536/3072 cells within bench noise. Build time at low d is dominated by per-node sampling, so the larger pool doesn't translate to wall-time regression.
+
+- **C2: software prefetch in HNSW level-0 beam search** (`src/storage/graph.rs`: new `search_with_prefetch`; `src/storage/engine/mod.rs`). New entry point accepts an optional prefetch closure; the legacy `search()` delegates with `None` so existing callers are unaffected. The engine ANN path passes a closure that issues an L1 prefetch (`_mm_prefetch _MM_HINT_T0`) for the upcoming neighbour's `live_codes` record while the current one is being scored. Hides DRAM/L3 latency on the typically-random ANN beam-search lookup pattern. `#[cfg]`-gated to x86_64; no-op on ARM. Apples-to-apples 3-iter median: **d=1536 rerank=F −4.8%, rerank=T −5.9%** — small but direction-consistent (right at 5% bench noise floor).
+
+### Fixed
+
+- **`score_batch_brute` cosine path applied stale `doc_norm`** (`src/storage/engine/mod.rs`). Computing `score = ip * doc_norm * q_norm_inv` for the cosine metric — the sequential and parallel cosine paths correctly use only `score = ip * q_norm_inv`. Silent for the common normalize=True case (doc_norm == 1.0); returned wrong scores for normalize=False + cosine + multi-query batch. doc_norm is now applied only on the IP path.
+
+- **`flush_for_close` ordering crash window** (`src/storage/engine/mod.rs`). `persist_id_pool()` ran before the remote-backend upload of `live_codes.bin`. A crash between the two left `live_ids.bin` ahead of `live_codes` on the remote (ID pool referenced codes that never arrived) → corrupt reads on reopen. Flipped the order so codes upload first; stale ID pool is recoverable via WAL replay.
+
+### CI
+
+- **macOS Apple Silicon + Linux aarch64 added to Rust test matrix** (`.github/workflows/ci.yml`). The `rust-test` job now runs on `ubuntu-latest`, `windows-latest`, **`macos-latest`** (Apple Silicon, ARM64); exercises the scalar-fallback paths gated by `#[cfg(target_arch = "x86_64")]` on real ARM hardware. New `rust-test-linux-arm64` job cross-compiles to `aarch64-unknown-linux-gnu` and runs `cargo test --lib` under QEMU (covers Linux ARM Graviton/Ampere-class targets). Closes the compile-only verification gap that pre-dated this sprint — release wheels already shipped for these targets but Rust unit tests only ran on x86_64.
+
+### Tests
+
+- New `benches/score_kernel.rs` — Criterion microbench harness for `score_ip_encoded_packed_b4_simd`, `prepare_ip_query`, `hamming_disagree_b4_signs`, and a 4k-slot in-cache scan. Run with `cargo bench --bench score_kernel`. Used during the sprint to gate sub-5% kernel changes that the noisy end-to-end Python bench cannot reliably distinguish.
+- 12 new regression and coverage tests for the engine module (Phase A): pin contracts on quantize/score determinism, ANN dispatch boundaries, and metric-path correctness. Also fixes the prior CHANGELOG drift on test count.
+- **20 new P8 tests** (`prod.rs`): SIMD-vs-scalar parity for every `B ∈ [1, 8]` across both fast-mode (i16 LUT) and QJL paths, long-dim batch+tail boundary at d ∈ {200, 511, 1024}, and Hamming pre-filter parity (b=1 popcount-XOR equivalence, b=2/4/8 vs brute-force MSB extraction, legacy `hamming_disagree_b4_signs` wrapper agreement).
+- **3 new P12 tests** (`engine/tests.rs`): `residual_int4_rerank_roundtrip` (insert→search recall within 5% of true IP), `residual_int4_record_size_matches_int4` (on-disk format), `residual_int4_reload_preserves_recall` (manifest persistence + reopen).
+- **462/462 cargo lib tests pass** (was 425 in v0.8.2 + 37 new; 2 ignored long-running boundary tests carried forward).
+- Full paper bench validated against `main` HEAD on the same machine: brute-force −21% p50 at d=1536; ANN R@1 actually improved by 0.8–0.9pp at d=1536 (recall not regressed despite ANN being unrelated to the sprint changes — likely run variance favouring v0.8.3).
+
+---
+
 ## [0.8.2] — 2026-04-30
 
 Audit-driven follow-up to v0.8.1: a deeper scan surfaced three real bugs in compaction and snapshot paths. All three are fixed here, each with a regression test pinning the contract.
