@@ -1128,13 +1128,15 @@ pub fn hamming_disagree_b4_signs(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
 /// Other bit-rates (3, 5, 6, 7) span misaligned boundaries and aren't covered
 /// — for those configs the prefilter is bypassed at the engine layer.
 ///
-/// `query_signs.len() * 8 == mse_bytes.len() * B`. Lower return = closer in IP.
+/// `query_signs.len() * B == mse_bytes.len()` (one sign byte per B mse bytes,
+/// since each mse byte holds 8/B codes and each code contributes 1 sign bit).
+/// Lower return = closer in IP.
 #[inline]
 pub fn hamming_disagree_signs<const B: usize>(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
     debug_assert_eq!(
-        query_signs.len() * 8,
-        mse_bytes.len() * B,
-        "hamming_disagree_signs<B={B}>: query_signs.len()*8 must equal mse_bytes.len()*B"
+        query_signs.len() * B,
+        mse_bytes.len(),
+        "hamming_disagree_signs<B={B}>: query_signs.len()*B must equal mse_bytes.len()"
     );
     match B {
         1 => hamming_popcount_xor(query_signs, mse_bytes),
