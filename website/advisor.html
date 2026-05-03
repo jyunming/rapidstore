@@ -97,15 +97,16 @@
                 <div class="adv-hint" id="dim-match">Benchmark dataset: <span>dbpedia-1536</span></div>
             </div>
             <div class="adv-cell">
-                <div class="adv-step-label">③ Retrieval window</div>
+                <div class="adv-step-label">③ Recall@k</div>
                 <div class="chip-row" id="topk-row">
-                    <button class="chip" data-rk="1">top-1</button>
-                    <button class="chip" data-rk="4">top-5</button>
-                    <button class="chip active" data-rk="8">top-10</button>
-                    <button class="chip" data-rk="16">top-20</button>
-                    <button class="chip" data-rk="32">top-50</button>
+                    <button class="chip" data-rk="1">k=1</button>
+                    <button class="chip" data-rk="2">k=2</button>
+                    <button class="chip" data-rk="4">k=4</button>
+                    <button class="chip active" data-rk="8">k=8</button>
+                    <button class="chip" data-rk="16">k=16</button>
+                    <button class="chip" data-rk="32">k=32</button>
                 </div>
-                <div class="adv-hint">how many results your app shows</div>
+                <div class="adv-hint">how many neighbors retrieved before reranking</div>
             </div>
         </div>
     </section>
