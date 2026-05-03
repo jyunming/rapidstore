@@ -135,7 +135,8 @@
         const recall = (cfg.rk[recallKey] * 100).toFixed(1);
         const compr  = cfg.compr.toFixed(1);
         const p50    = cfg.p50.toFixed(1);
-        const disk1M = (cfg.disk * 100).toFixed(0);
+        // cfg.disk is total MB measured at N=100k. 1M corpus = 10× = cfg.disk × 10.
+        const disk1M = (cfg.disk * 10).toFixed(0);
 
         const card = document.createElement('div');
         card.className = `result-card${rank === 0 ? ' top' : ''}`;
@@ -198,7 +199,7 @@
         if (cfg.rerank && useRi4) {
             parts.push(`<span class="py-key">rerank_precision</span>=<span class="py-str">"residual_int4"</span>`);
         }
-        return `Database.open(<span class="py-str">"./db"</span>, dim=${cfg.d}, ${parts.join(', ')})`;
+        return `Database.open(<span class="py-str">"./db"</span>, <span class="py-key">dimension</span>=<span class="py-num">${cfg.d}</span>, ${parts.join(', ')})`;
     }
 
     function buildTip(cfg, dim) {

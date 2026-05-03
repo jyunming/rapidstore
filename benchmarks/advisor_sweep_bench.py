@@ -184,6 +184,9 @@ def run_one(vecs: np.ndarray, qvecs: np.ndarray, true_top1: np.ndarray,
             lats.append((time.perf_counter() - t1) * 1000)
             all_returned.append([r["id"] for r in res])
 
+        # Close before tempdir cleanup — Windows can't delete files mmap is holding.
+        db.close()
+
     recalls = compute_recalls(all_returned, true_top1)
     mrr     = compute_mrr(all_returned, true_top1)
     lats_s  = sorted(lats)
