@@ -3,236 +3,477 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TurboQuantDB - The Zero-Training Quantized Vector Database</title>
-    <meta name="description" content="TurboQuantDB: An embedded vector database implementing the TurboQuant algorithm for 2-4 bit compression and zero training time.">
+    <title>TurboQuantDB — Massive embedding datasets on lightweight hardware</title>
+    <meta name="description" content="Embedded vector database in Rust. Two-stage TurboQuant quantization: 5–10× disk compression, zero training, sub-10ms search at d=1536. pip install tqdb.">
     <link rel="icon" href="favicon.svg" type="image/svg+xml">
 
-    <!-- Google Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
 
-    <!-- Custom CSS -->
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+    <div class="grain"></div>
     <div class="bg-glow bg-glow-1"></div>
     <div class="bg-glow bg-glow-2"></div>
+    <div class="bg-glow bg-glow-3"></div>
 
     <nav class="navbar glass-panel">
         <div class="nav-brand">
             <img src="favicon.svg" class="nav-logo" alt="TurboQuantDB logo">
             <span class="logo-text">TurboQuant<span class="accent">DB</span></span>
+            <span class="nav-pill" id="nav-version-pill">v0.8.3</span>
         </div>
         <div class="nav-links">
-            <a href="#features">Features</a>
-            <a href="#quickstart">Quick Start</a>
-            <a href="advisor.html" class="btn btn-outline">Config Advisor</a>
-            <a href="https://github.com/jyunming/TurboQuantDB" class="btn btn-outline" target="_blank">GitHub</a>
+            <a href="#algorithm">Algorithm</a>
+            <a href="#benchmarks">Benchmarks</a>
+            <a href="#code">Code</a>
+            <a href="advisor.html" class="btn btn-outline">Advisor</a>
+            <a href="https://github.com/jyunming/TurboQuantDB" class="btn btn-outline" target="_blank">GitHub ↗</a>
         </div>
     </nav>
 
+    <!-- ─────────────────── HERO ─────────────────── -->
     <header class="hero snap-section">
         <div class="hero-content fade-in-up">
-            <div class="badge" id="version-badge">Loading...</div>
-            <h1 class="hero-title">Massive embedding datasets.<br>Lightweight hardware.</h1>
+            <div class="hero-eyebrow">
+                <span class="eyebrow-dot"></span>
+                <span>Embedded vector database · Apache 2.0 · arXiv:2504.19874</span>
+            </div>
+
+            <h1 class="hero-title">
+                Massive embedding<br>
+                datasets.<br>
+                <span class="hero-title-italic">Lightweight hardware.</span>
+            </h1>
+
             <p class="hero-subtitle">
-                An embedded vector database in Rust with Python bindings — delivering <strong>10× compression</strong>, sub-millisecond search, and zero training time.
+                Embedded vector DB in Rust. <strong class="text-accent">10× smaller</strong> than raw f32, <strong class="text-accent">zero training</strong>, <strong class="text-accent">sub-10 ms</strong> search at d=1536.
             </p>
 
-            <div class="install-card glass-panel flex-row">
-                <code class="install-code">pip install tqdb</code>
-                <button class="copy-btn tooltip" data-tooltip="Copy" onclick="copyInstallCmd()">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-                </button>
+            <div class="hero-actions-row">
+                <div class="install-card glass-panel flex-row">
+                    <span class="install-prefix">$</span>
+                    <code class="install-code">pip install tqdb</code>
+                    <button class="copy-btn tooltip" data-tooltip="Copy" onclick="copyInstallCmd()">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                    </button>
+                </div>
+                <a href="#code" class="btn btn-primary">Quick Start →</a>
+                <a href="https://arxiv.org/abs/2504.19874" class="btn btn-ghost" target="_blank">Read the paper</a>
             </div>
 
-            <div class="hero-actions">
-                <a href="#quickstart" class="btn btn-primary">Get Started</a>
-                <a href="advisor.html" class="btn btn-secondary">Config Advisor</a>
-                <a href="https://arxiv.org/abs/2504.19874" class="btn btn-ghost" target="_blank">Read Paper</a>
-            </div>
         </div>
     </header>
 
-    <section id="features" class="snap-section">
-        <div class="section">
-            <div class="section-header fade-in-up">
-                <h2>Why TurboQuantDB?</h2>
-                <p>Built for teams running large embedding datasets on real hardware budgets.</p>
-            </div>
-
-            <div class="features-grid">
-                <div class="feature-card glass-panel fade-in-up" style="transition-delay: 0.05s">
-                    <div class="feature-card-header"><div class="feature-icon">⚡</div><h3>Zero Training</h3></div>
-                    <p>Quantize and search from the first insert. No offline phase, no index rebuild.</p>
+    <!-- ─────────────────── COMPRESSION STORY BAND ─────────────────── -->
+    <section class="stats-band">
+        <div class="stats-band-inner">
+            <div class="stats-band-eyebrow">The compression story · 100k vectors at d=1536</div>
+            <h2 class="stats-band-headline">Same dataset. <span class="text-italic">Pick your trade-off.</span></h2>
+            <div class="stats-band-row">
+                <div class="stats-band-cell">
+                    <div class="stats-band-label">Raw f32 (baseline)</div>
+                    <div class="stats-band-num stats-strike">586<span>MB</span></div>
+                    <div class="stats-band-hint">no quantization</div>
                 </div>
-                <div class="feature-card glass-panel fade-in-up" style="transition-delay: 0.1s">
-                    <div class="feature-card-header"><div class="feature-icon">🗜️</div><h3>10× Smaller on Disk</h3></div>
-                    <p>Store 1M 1536-dim embeddings in ~600 MB instead of 6 GB with 2-bit compression.</p>
+                <div class="stats-band-arrow">→</div>
+                <div class="stats-band-cell">
+                    <div class="stats-band-label">b=4 codes</div>
+                    <div class="stats-band-num stats-accent">84<span>MB</span></div>
+                    <div class="stats-band-hint">7× smaller · R@1 0.96</div>
                 </div>
-                <div class="feature-card glass-panel fade-in-up" style="transition-delay: 0.15s">
-                    <div class="feature-card-header"><div class="feature-icon">🎯</div><h3>Accurate Results</h3></div>
-                    <p>Random rotation + residual sketch keep inner product rankings unbiased after compression.</p>
+                <div class="stats-band-arrow">→</div>
+                <div class="stats-band-cell">
+                    <div class="stats-band-label">b=2 codes</div>
+                    <div class="stats-band-num stats-accent stats-purple">47<span>MB</span></div>
+                    <div class="stats-band-hint">12× smaller · R@1 0.84</div>
                 </div>
-                <div class="feature-card glass-panel fade-in-up" style="transition-delay: 0.2s">
-                    <div class="feature-card-header"><div class="feature-icon">🔍</div><h3>Metadata Filtering</h3></div>
-                    <p>MongoDB-style filters — <code>$eq</code>, <code>$gt</code>, <code>$in</code>, <code>$contains</code> — applied at query time.</p>
-                </div>
-                <div class="feature-card glass-panel fade-in-up" style="transition-delay: 0.25s">
-                    <div class="feature-card-header"><div class="feature-icon">🔌</div><h3>Drop-in Compatible</h3></div>
-                    <p>Swap ChromaDB or LanceDB with zero code changes. First-class LangChain support.</p>
-                </div>
-                <div class="feature-card glass-panel fade-in-up" style="transition-delay: 0.3s">
-                    <div class="feature-card-header"><div class="feature-icon">🏎️</div><h3>Sub-ms ANN Search</h3></div>
-                    <p>HNSW + AVX2/SIMD. In-process — no network hops, no serialization overhead.</p>
+                <div class="stats-band-arrow">→</div>
+                <div class="stats-band-cell">
+                    <div class="stats-band-label">b=4 + ri4 rerank</div>
+                    <div class="stats-band-num">181<span>MB</span></div>
+                    <div class="stats-band-hint">3.2× smaller · R@1 0.995</div>
                 </div>
             </div>
         </div>
     </section>
 
-    <section id="quickstart" class="snap-section bg-darker">
+    <!-- ─────────────────── HOW IT WORKS (visual) ─────────────────── -->
+    <section id="algorithm" class="snap-section">
         <div class="section">
-            <div class="quickstart-container">
-                <div class="quickstart-text fade-in-left">
-                    <h2>Two minutes to running</h2>
-                    <p>No daemon, no Docker, no config files.<br>Just <code>pip install tqdb</code> and write Python.</p>
-                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md" class="btn btn-outline" style="margin-top:1.5rem;display:inline-block" target="_blank">Full API Reference →</a>
-                </div>
+            <div class="section-eyebrow">01 · How it works</div>
+            <h2 class="section-display">
+                One vector in.<br>
+                <span class="text-italic">A handful of bytes out.</span>
+            </h2>
 
-                <div class="code-window glass-panel fade-in-right">
-                    <div class="code-header">
-                        <div class="mac-buttons">
-                            <span></span><span></span><span></span>
-                        </div>
-                        <div class="code-title">example.py</div>
-                        <button class="copy-btn copy-code" data-target="python-code">Copy</button>
+            <div class="algo-visual">
+                <!-- Input -->
+                <div class="algo-box algo-box-in">
+                    <div class="algo-box-title">RAW</div>
+                    <div class="algo-bytes">
+                        <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+                        <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+                        <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+                        <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
                     </div>
-                    <pre><code id="python-code" class="language-python">from tqdb import Database
-import numpy as np
+                    <div class="algo-box-meta">d = 1536 · float32</div>
+                    <div class="algo-box-num">6144<span> B</span></div>
+                </div>
 
-db = Database.open("./my_db", dimension=1536)
+                <!-- Pipe — pure TurboQuant from the paper -->
+                <div class="algo-pipe">
+                    <div class="algo-pipe-step">rotate <span>R · x</span></div>
+                    <div class="algo-pipe-flow"><span></span><span></span><span></span></div>
+                    <div class="algo-pipe-step">MSE quantize <span>Lloyd-Max · b bits</span></div>
+                    <div class="algo-pipe-flow"><span></span><span></span><span></span></div>
+                    <div class="algo-pipe-step">QJL residual <span>1-bit Gaussian sketch</span></div>
+                </div>
 
-db.insert("doc-1",
-    np.random.randn(1536).astype("f4"),
-    metadata={"topic": "ml", "year": 2026},
-    document="Machine learning intro"
-)
+                <!-- Output: codes only, matching the paper -->
+                <div class="algo-box algo-box-out">
+                    <div class="algo-box-title">TurboQuant · b=4 codes</div>
+                    <div class="algo-bytes algo-bytes-tiny">
+                        <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+                    </div>
+                    <div class="algo-box-meta">codes only — no rerank</div>
+                    <div class="algo-box-num accent">768<span> B</span> <em>−87%</em></div>
+                </div>
+            </div>
 
-results = db.search(
-    np.random.randn(1536).astype("f4"),
-    top_k=5,
-    filter={"year": {"$gte": 2026}}
-)
-for r in results:
-    print(r["id"], r["score"], r["document"])</code></pre>
+            <p class="algo-foot">
+                <strong>No training. No eval set. No <code>fit()</code>.</strong> Codebook is closed-form on a Beta(d/2) marginal. <a href="https://arxiv.org/abs/2504.19874" target="_blank">Paper →</a>
+            </p>
+        </div>
+    </section>
+
+    <!-- ─────────────────── BENCHMARKS ─────────────────── -->
+    <section id="benchmarks" class="snap-section bg-darker">
+        <div class="section">
+            <div class="section-eyebrow">02 · Benchmarks</div>
+            <h2 class="section-display">
+                Real numbers.<br>
+                <span class="text-italic">Three datasets.</span>
+            </h2>
+
+            <div class="bench-tabs">
+                <button class="bench-tab active" data-bench="dbpedia1536">DBpedia-1536</button>
+                <button class="bench-tab" data-bench="dbpedia3072">DBpedia-3072</button>
+                <button class="bench-tab" data-bench="glove200">GloVe-200</button>
+            </div>
+
+            <div class="bench-card glass-panel">
+                <table class="bench-table">
+                    <thead>
+                        <tr>
+                            <th>Config</th>
+                            <th class="num">R@1</th>
+                            <th class="num">R@4</th>
+                            <th class="num">p50</th>
+                            <th class="num">Disk</th>
+                        </tr>
+                    </thead>
+                    <tbody id="bench-tbody"></tbody>
+                </table>
+                <p class="bench-foot">100k vectors · 1k queries · single laptop · brute-force · <code>python benchmarks/paper_recall_bench.py</code></p>
+            </div>
+        </div>
+    </section>
+
+    <!-- ─────────────────── CODE GALLERY ─────────────────── -->
+    <section id="code" class="snap-section bg-darker">
+        <div class="section">
+            <div class="section-eyebrow">04 · Code</div>
+            <h2 class="section-display">
+                Six recipes.<br>
+                <span class="text-italic">Copy. Paste. Run.</span>
+            </h2>
+
+            <div class="code-tabs">
+                <button class="code-tab active" data-code="quickstart">Quickstart</button>
+                <button class="code-tab" data-code="rag">RAG retriever</button>
+                <button class="code-tab" data-code="hybrid">Hybrid (BM25 + dense)</button>
+                <button class="code-tab" data-code="async">Async API</button>
+                <button class="code-tab" data-code="migrate">Migrate from Chroma</button>
+                <button class="code-tab" data-code="server">Server mode (curl)</button>
+            </div>
+
+            <div class="code-window glass-panel">
+                <div class="code-header">
+                    <div class="mac-buttons"><span></span><span></span><span></span></div>
+                    <div class="code-title" id="code-title">examples/quickstart.py</div>
+                    <button class="copy-btn copy-code" id="copy-code-btn">Copy</button>
+                </div>
+                <pre><code id="active-code" class="language-python"></code></pre>
+            </div>
+        </div>
+    </section>
+
+    <!-- ─────────────────── RERANK PRECISION PICKER ─────────────────── -->
+    <section id="rerank" class="snap-section">
+        <div class="section">
+            <div class="section-eyebrow">05 · Rerank precision</div>
+            <h2 class="section-display">
+                Disk per vector,<br>
+                <span class="text-italic">at d=1536.</span>
+            </h2>
+
+            <div class="rerank-chart glass-panel">
+                <div class="rerank-chart-legend">
+                    <span class="legend-key"><i class="legend-swatch swatch-disk"></i> disk per vector</span>
+                    <span class="legend-key"><i class="legend-swatch swatch-recall"></i> R@1 recall</span>
+                    <span class="legend-meta">d=1536 · b=4 brute · DBpedia</span>
+                </div>
+
+                <div class="rerank-row">
+                    <div class="rerank-name">
+                        <code>rerank=False</code>
+                        <span class="rerank-name-tag">codes only</span>
+                    </div>
+                    <div class="rerank-bars">
+                        <div class="rerank-bar-line">
+                            <div class="rerank-bar-track">
+                                <div class="rerank-bar-fill fill-empty" style="width: 100%;">0 B</div>
+                            </div>
+                        </div>
+                        <div class="rerank-bar-line">
+                            <div class="rerank-bar-track recall-track">
+                                <div class="rerank-bar-fill recall-fill" style="width: 95.8%;">0.958</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="rerank-row rerank-row-best">
+                    <div class="rerank-name">
+                        <code>"residual_int4"</code>
+                        <span class="rerank-name-tag tag-new">new · v0.8.3 · recommended</span>
+                    </div>
+                    <div class="rerank-bars">
+                        <div class="rerank-bar-line">
+                            <div class="rerank-bar-track">
+                                <div class="rerank-bar-fill fill-purple" style="width: 25%;">772 B</div>
+                            </div>
+                        </div>
+                        <div class="rerank-bar-line">
+                            <div class="rerank-bar-track recall-track">
+                                <div class="rerank-bar-fill recall-fill recall-purple" style="width: 99.5%;">0.995</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="rerank-row">
+                    <div class="rerank-name">
+                        <code>"int8"</code>
+                        <span class="rerank-name-tag tag-default">previous default</span>
+                    </div>
+                    <div class="rerank-bars">
+                        <div class="rerank-bar-line">
+                            <div class="rerank-bar-track">
+                                <div class="rerank-bar-fill" style="width: 50%;">1540 B</div>
+                            </div>
+                        </div>
+                        <div class="rerank-bar-line">
+                            <div class="rerank-bar-track recall-track">
+                                <div class="rerank-bar-fill recall-fill" style="width: 99.7%;">0.997</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="rerank-row">
+                    <div class="rerank-name">
+                        <code>"f16"</code>
+                        <span class="rerank-name-tag">non-normalized vectors</span>
+                    </div>
+                    <div class="rerank-bars">
+                        <div class="rerank-bar-line">
+                            <div class="rerank-bar-track">
+                                <div class="rerank-bar-fill" style="width: 100%;">3076 B</div>
+                            </div>
+                        </div>
+                        <div class="rerank-bar-line">
+                            <div class="rerank-bar-track recall-track">
+                                <div class="rerank-bar-fill recall-fill" style="width: 99.7%;">0.997</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="rerank-row rerank-row-deprecated">
+                    <div class="rerank-name">
+                        <code>"int4"</code>
+                        <span class="rerank-name-tag tag-dep">deprecated · v0.8.3</span>
+                    </div>
+                    <div class="rerank-bars">
+                        <div class="rerank-bar-line">
+                            <div class="rerank-bar-track">
+                                <div class="rerank-bar-fill fill-muted" style="width: 25%;">772 B</div>
+                            </div>
+                        </div>
+                        <div class="rerank-bar-line">
+                            <div class="rerank-bar-track recall-track">
+                                <div class="rerank-bar-fill recall-fill recall-muted" style="width: 92%;">0.92</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="rerank-tips">
+                    <div class="rerank-tip">
+                        <span class="rerank-tip-icon">▸</span>
+                        <strong>Low dim (≤384):</strong> rerank usually needed — codes alone often give R@1 &lt; 0.85.
+                    </div>
+                    <div class="rerank-tip">
+                        <span class="rerank-tip-icon">▸</span>
+                        <strong>High dim (≥1024):</strong> codes alone may be enough — pick <code>rerank=False</code> for the smallest footprint.
+                    </div>
+                    <div class="rerank-tip">
+                        <span class="rerank-tip-icon">▸</span>
+                        <strong>Either way:</strong> when you do enable rerank, prefer <code>residual_int4</code> — half the disk of int8, ~0.2 pp recall cost.
+                    </div>
                 </div>
             </div>
         </div>
     </section>
 
-    <!-- ── Ecosystem + CTA (snap section 4) ─────────────────────────────── -->
+    <!-- ─────────────────── WHAT'S NEW ─────────────────── -->
+    <section id="whats-new" class="whats-new-strip">
+        <div class="whats-new-strip-inner">
+            <span class="whats-new-tag">v0.8.3</span>
+            <span class="whats-new-line"><strong>2× faster brute search</strong> · <strong>residual_int4 rerank</strong> · half the disk, near-int8 recall.</span>
+            <a href="https://github.com/jyunming/TurboQuantDB/blob/main/CHANGELOG.md" class="whats-new-strip-link" target="_blank">Changelog →</a>
+        </div>
+    </section>
+
+    <!-- ─────────────────── ECOSYSTEM ─────────────────── -->
     <section id="ecosystem" class="snap-section bg-darker">
         <div class="section">
-            <!-- Config Advisor CTA strip -->
-            <div class="advisor-banner fade-in-up">
-                <div class="advisor-banner-inner">
-                    <div class="advisor-banner-text">
-                        <h3>Not sure which config fits your use case?</h3>
-                        <p>Pick your dimension and priorities — get a recommendation from data across 9 public datasets.</p>
-                    </div>
-                    <a href="advisor.html" class="btn btn-primary btn-lg">Open Config Advisor →</a>
+            <div class="section-eyebrow">05 · Drop-in</div>
+            <h2 class="section-display">
+                Plays with<br>
+                <span class="text-italic">your stack.</span>
+            </h2>
+
+            <div class="eco-tiles">
+                <div class="eco-tile">
+                    <div class="eco-tile-name">LangChain</div>
+                    <div class="eco-tile-cmd">pip install 'tqdb[langchain]'</div>
                 </div>
-            </div>
-
-            <div class="section-header fade-in-up" style="transition-delay:0.1s">
-                <h2>Developer Ecosystem</h2>
-                <p>Embedded library, HTTP server, or drop-in replacement — pick your integration style.</p>
-            </div>
-
-            <div class="ecosystem-grid">
-                <!-- Featured: Server Mode -->
-                <div class="eco-featured fade-in-up" style="transition-delay:0.15s">
-                    <div class="eco-featured-text">
-                        <div class="eco-featured-badge">🚀 Production-ready</div>
-                        <h3>Server Mode</h3>
-                        <p>Spin up a full HTTP service with multi-tenancy, RBAC, per-tenant quotas, and Prometheus metrics. Designed for teams that need centralized vector search without the overhead of a heavyweight database.</p>
-                        <div class="eco-featured-pills">
-                            <span class="eco-pill">multi-tenant</span>
-                            <span class="eco-pill">RBAC</span>
-                            <span class="eco-pill">Prometheus</span>
-                            <span class="eco-pill">async jobs</span>
-                        </div>
-                    </div>
-                    <div class="eco-featured-code">
-                        <div class="code-header">server startup</div>
-                        <pre><code># Start the server
-tqdb-server --port 8080 \
-  --data-dir ./data
-
-# Create a collection
-curl -X POST localhost:8080/collections \
-  -d '{"name":"docs","dim":1536}'
-
-# Insert vectors
-curl -X POST localhost:8080/collections/docs/upsert \
-  -d '{"id":"a1","vector":[...]}'</code></pre>
-                    </div>
+                <div class="eco-tile">
+                    <div class="eco-tile-name">LlamaIndex</div>
+                    <div class="eco-tile-cmd">pip install 'tqdb[llamaindex]'</div>
                 </div>
-
-                <!-- Three integration cards -->
-                <div class="eco-integrations">
-                    <div class="eco-card fade-in-up" style="transition-delay:0.2s">
-                        <div class="eco-icon-wrap green">🦜</div>
-                        <h3>LangChain RAG</h3>
-                        <p>Drop-in <code>TurboQuantRetriever</code> for any LangChain pipeline. Zero boilerplate.</p>
-                        <div class="eco-import">from tqdb import TurboQuantRetriever</div>
-                        <a href="https://github.com/jyunming/TurboQuantDB/blob/main/python/tqdb/rag.py" class="eco-link">View source →</a>
-                    </div>
-                    <div class="eco-card fade-in-up" style="transition-delay:0.28s">
-                        <div class="eco-icon-wrap blue">🔄</div>
-                        <h3>ChromaDB Drop-in</h3>
-                        <p>Replace ChromaDB with zero code changes using the <code>chroma_compat</code> shim.</p>
-                        <div class="eco-import">from tqdb import chroma_compat as chromadb</div>
-                        <a href="https://github.com/jyunming/TurboQuantDB/blob/main/python/tqdb/chroma_compat.py" class="eco-link">View source →</a>
-                    </div>
-                    <div class="eco-card fade-in-up" style="transition-delay:0.36s">
-                        <div class="eco-icon-wrap purple">⚙️</div>
-                        <h3>LanceDB Compatible</h3>
-                        <p>Use as a backend replacement for LanceDB with native PyArrow table ingestion.</p>
-                        <div class="eco-import">from tqdb import lancedb_compat as lancedb</div>
-                        <a href="https://github.com/jyunming/TurboQuantDB/blob/main/python/tqdb/lancedb_compat.py" class="eco-link">View source →</a>
-                    </div>
+                <div class="eco-tile">
+                    <div class="eco-tile-name">Chroma → TQDB</div>
+                    <div class="eco-tile-cmd">python -m tqdb.migrate chroma /old /new</div>
+                </div>
+                <div class="eco-tile">
+                    <div class="eco-tile-name">HTTP server</div>
+                    <div class="eco-tile-cmd">tqdb-server  # bundled in the wheel</div>
                 </div>
             </div>
         </div>
     </section>
 
-    <footer class="footer">
-        <div class="footer-content">
-            <div class="footer-brand">
-                <div style="display:flex;align-items:center;gap:0.6rem">
+    <!-- ─────────────────── BUILT FOR ─────────────────── -->
+    <section id="fits" class="snap-section">
+        <div class="section">
+            <div class="section-eyebrow">06 · Built for</div>
+            <h2 class="section-display">
+                Local. Embedded.<br>
+                <span class="text-italic">Fast on a laptop.</span>
+            </h2>
+
+            <div class="fits-cards fits-cards-4">
+                <div class="fit-card">
+                    <div class="fit-card-icon">⌂</div>
+                    <h3>Private RAG</h3>
+                    <p>Data stays on your box.</p>
+                </div>
+                <div class="fit-card">
+                    <div class="fit-card-icon">◇</div>
+                    <h3>Laptop-scale</h3>
+                    <p>1M × d=1536 in ~1 GB.</p>
+                </div>
+                <div class="fit-card">
+                    <div class="fit-card-icon">◐</div>
+                    <h3>Edge / on-device</h3>
+                    <p>One binary. No daemon.</p>
+                </div>
+                <div class="fit-card">
+                    <div class="fit-card-icon">⏵</div>
+                    <h3>Sub-10ms ANN</h3>
+                    <p>HNSW when N grows.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ─────────────────── CTA ─────────────────── -->
+    <section class="cta-band">
+        <div class="cta-inner">
+            <div class="cta-text">
+                <div class="cta-eyebrow">Pick the right config in seconds</div>
+                <h2>The Config Advisor scores every combo.</h2>
+            </div>
+            <div class="cta-actions">
+                <a href="advisor.html" class="btn btn-primary btn-xl">Open Advisor →</a>
+                <a href="https://github.com/jyunming/TurboQuantDB" class="btn btn-outline" target="_blank">GitHub ↗</a>
+            </div>
+        </div>
+    </section>
+
+    <!-- ─────────────────── FOOTER ─────────────────── -->
+    <footer class="footer-rich">
+        <div class="footer-rich-inner">
+            <div class="footer-rich-brand">
+                <div class="footer-rich-logo">
                     <img src="favicon.svg" class="nav-logo" alt="TurboQuantDB logo">
                     <span class="logo-text">TurboQuant<span class="accent">DB</span></span>
                 </div>
-                <p>Massive embedding datasets on lightweight hardware.</p>
+                <p>Massive embedding datasets on lightweight hardware.<br>An independent implementation of <a href="https://arxiv.org/abs/2504.19874" target="_blank">arXiv:2504.19874</a>.</p>
+                <div class="footer-rich-installs"><code>$ pip install tqdb</code></div>
             </div>
-            <div class="footer-links">
+
+            <div class="footer-rich-links">
                 <div class="footer-col">
-                    <h4>Resources</h4>
-                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md">Documentation</a>
-                    <a href="https://github.com/jyunming/TurboQuantDB">GitHub</a>
-                    <a href="https://pypi.org/project/tqdb/">PyPI</a>
+                    <h4>Get started</h4>
+                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/README.md" target="_blank">README</a>
+                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/examples/quickstart.py" target="_blank">Quickstart example</a>
+                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/examples/rag.py" target="_blank">RAG example</a>
+                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/examples/migrate_from_chroma.py" target="_blank">Migration script</a>
+                </div>
+                <div class="footer-col">
+                    <h4>Reference</h4>
+                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md" target="_blank">Python API</a>
+                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/docs/SERVER_API.md" target="_blank">Server API</a>
+                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/docs/CONFIGURATION.md" target="_blank">Configuration</a>
+                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/docs/MIGRATION.md" target="_blank">Migration guide</a>
+                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/docs/MULTI_VECTOR.md" target="_blank">Multi-vector / ColBERT</a>
+                </div>
+                <div class="footer-col">
+                    <h4>Community</h4>
+                    <a href="https://github.com/jyunming/TurboQuantDB" target="_blank">GitHub</a>
+                    <a href="https://github.com/jyunming/TurboQuantDB/issues" target="_blank">Issues</a>
+                    <a href="https://github.com/jyunming/TurboQuantDB/releases" target="_blank">Releases</a>
+                    <a href="https://pypi.org/project/tqdb/" target="_blank">PyPI</a>
                 </div>
                 <div class="footer-col">
                     <h4>Tools</h4>
                     <a href="advisor.html">Config Advisor</a>
-                    <a href="https://arxiv.org/abs/2504.19874" target="_blank">Research Paper</a>
+                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/CHANGELOG.md" target="_blank">Changelog</a>
+                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/benchmarks/benchmark_plots.png" target="_blank">Benchmark plots</a>
+                    <a href="https://arxiv.org/abs/2504.19874" target="_blank">Research paper</a>
                 </div>
             </div>
         </div>
-        <div class="footer-bottom">
-            <p>&copy; 2026 TurboQuantDB. Apache 2.0 License.</p>
+        <div class="footer-rich-bottom">
+            <span>&copy; 2026 TurboQuantDB · Apache License 2.0</span>
+            <span class="footer-rich-bottom-pill">Built in Rust · Python bindings via PyO3</span>
         </div>
     </footer>
 
