@@ -89,7 +89,13 @@
         if (!ds) return;
 
         const d = advisorData.dims[ds];
-        dimMatch.innerHTML = `Matched to <span>${ds} (d=${d})</span>`;
+        if (d === userDim) {
+            dimMatch.innerHTML = `Benchmark dataset: <span>${ds} (d=${d})</span>`;
+        } else {
+            const delta = userDim - d;
+            const sign = delta > 0 ? '+' : '';
+            dimMatch.innerHTML = `<strong style="color:#facc15">No exact d=${userDim} benchmark.</strong> Showing nearest: <span>${ds} (d=${d}, ${sign}${delta})</span>`;
+        }
 
         const rows = advisorData.configs[ds] || [];
         if (rows.length === 0) {
