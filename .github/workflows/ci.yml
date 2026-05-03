@@ -62,14 +62,20 @@ jobs:
           runner = "qemu-aarch64-static -L /usr/aarch64-linux-gnu"
           EOF
 
+      # PyO3 needs to know the target Python version when cross-compiling
+      # without target-side Python headers. The `abi3-py310` feature path is
+      # gated behind PYO3_CROSS_PYTHON_VERSION.
       - name: cargo check (aarch64)
         env:
           RUSTFLAGS: "-D warnings"
+          PYO3_CROSS_PYTHON_VERSION: "3.11"
         run: cargo check -q --target aarch64-unknown-linux-gnu
 
       # Note: cargo test under QEMU is slow (~5-10x native). Run only the lib
       # tests, not integration tests, to keep CI under 15 min.
       - name: cargo test --lib (aarch64 via QEMU)
+        env:
+          PYO3_CROSS_PYTHON_VERSION: "3.11"
         run: cargo test -q --lib --target aarch64-unknown-linux-gnu
 
   python-smoke:

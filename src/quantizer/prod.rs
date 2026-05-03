@@ -28,7 +28,13 @@ pub struct PreparedIpQuery {
     /// i16-quantized version of `mse_lut` with a single global scale.
     /// Halves the L1/L2 footprint of the LUT (96 KB -> 48 KB at d=1536, lut_w=16).
     /// Per the P6 numpy validation, ranking is bit-identical to the f32 LUT.
+    // P7/P8: i16 LUT used by the x86_64 AVX2 fast-mode kernel
+    // (`score_ip_encoded_packed_simd_i16`). On non-x86_64 targets the kernel
+    // isn't compiled in, so these fields are dead — silenced rather than
+    // cfg-gated to keep `prepare_ip_query` portable.
+    #[allow(dead_code)]
     mse_lut_i16: Vec<i16>,
+    #[allow(dead_code)]
     mse_lut_i16_scale: f32,
     sq: Vec<f32>,
     qjl_scale: f32,
@@ -634,6 +640,10 @@ impl ProdQuantizer {
     /// Extract one `B`-bit code from a packed byte stream at the given bit offset.
     /// Reads at most 2 consecutive bytes (always safe for `B <= 8` provided
     /// the caller stays within `i < n`).
+    ///
+    /// Only used by the x86_64 AVX2 SIMD scoring kernels; gated to suppress
+    /// dead-code warnings on other targets.
+    #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn extract_code<const B: usize>(packed_ptr: *const u8, bit_pos: usize) -> u8 {
         let byte_idx = bit_pos >> 3;
