@@ -300,7 +300,7 @@ def run_benchmark(args):
             f"FAIL: Recall@{args.k} = {recall_at_k:.1%} "
             f"(threshold: {args.recall_threshold:.0%})"
         )
-        print(f"✓ Recall threshold passed (≥{args.recall_threshold:.0%})")
+        print(f"OK Recall threshold passed (>={args.recall_threshold:.0%})")
 
     return result
 

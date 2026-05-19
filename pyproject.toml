@@ -56,7 +56,13 @@ Changelog = "https://github.com/jyunming/TurboQuantDB/releases"
 [tool.maturin]
 features = ["python", "pyo3/extension-module"]
 python-source = "python"
-include = ["python/tqdb/*.pyi", "python/tqdb/_bin/*"]
+include = [
+    "python/tqdb/*.pyi",
+    "python/tqdb/_bin/*",
+    { path = "server/Cargo.toml", format = "sdist" },
+    { path = "server/Cargo.lock", format = "sdist" },
+    { path = "server/src/**/*", format = "sdist" },
+]
 
 [tool.pytest.ini_options]
 tmp_path_retention_policy = "failed"
