@@ -1170,6 +1170,9 @@ impl TurboQuantEngine {
         include_document: bool,
     ) -> Result<Vec<Vec<SearchResult>>, Box<dyn std::error::Error + Send + Sync>> {
         let nq = queries.len();
+        if top_k == 0 {
+            return Ok(vec![Vec::new(); nq]);
+        }
         let internal_k = top_k; // no rerank — caller already checked rerank_enabled=false
 
         // Apply the same query normalisation as the single-query path.

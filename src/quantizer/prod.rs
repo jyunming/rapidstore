@@ -136,6 +136,25 @@ impl ProdQuantizer {
         }
     }
 
+    fn packed_mse_len(&self) -> usize {
+        (self.n * self.mse_bits_per_idx()).div_ceil(8)
+    }
+
+    fn qjl_len(&self) -> usize {
+        self.n.div_ceil(8)
+    }
+
+    fn assert_qjl_len_if_used(&self, qjl: &[u8], gamma: f64, caller: &str) {
+        if gamma != 0.0 {
+            assert_eq!(
+                qjl.len(),
+                self.qjl_len(),
+                "{caller}: qjl.len() must equal ceil(n/8) ({}) when gamma is non-zero",
+                self.qjl_len()
+            );
+        }
+    }
+
     pub fn prepare_ip_query(&self, query: &Array1<f64>) -> PreparedIpQuery {
         assert_eq!(query.len(), self.d);
 
@@ -217,14 +236,20 @@ impl ProdQuantizer {
     /// which returns a centred value in [−1, 1].  Used as a proxy for inner-product
     /// proximity during HNSW construction when raw vectors are unavailable.
     pub fn hamming_proximity(&self, from_qjl: &[u8], to_qjl: &[u8]) -> f64 {
-        let n_bytes = from_qjl.len().min(to_qjl.len());
-        if n_bytes == 0 {
+        let n_bits = self.n.min(from_qjl.len().min(to_qjl.len()) * 8);
+        if n_bits == 0 {
             return 0.5;
         }
-        let matching_bits: u32 = (0..n_bytes)
+        let full_bytes = n_bits / 8;
+        let mut matching_bits: u32 = (0..full_bytes)
             .map(|i| (!(from_qjl[i] ^ to_qjl[i])).count_ones())
             .sum();
-        matching_bits as f64 / (n_bytes as f64 * 8.0)
+        let rem_bits = n_bits % 8;
+        if rem_bits > 0 {
+            let mask = (1u8 << rem_bits) - 1;
+            matching_bits += (!(from_qjl[full_bytes] ^ to_qjl[full_bytes]) & mask).count_ones();
+        }
+        matching_bits as f64 / n_bits as f64
     }
 
     /// Build a `PreparedIpQueryLite` directly from stored MSE codes without any SRHT.
@@ -257,6 +282,7 @@ impl ProdQuantizer {
             "score_ip_encoded_lite: idx.len() must equal quantizer.n ({})",
             self.n
         );
+        self.assert_qjl_len_if_used(qjl, gamma, "score_ip_encoded_lite");
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -428,6 +454,7 @@ impl ProdQuantizer {
             "score_ip_encoded: idx.len() must equal quantizer.n ({})",
             self.n
         );
+        self.assert_qjl_len_if_used(qjl, gamma, "score_ip_encoded");
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -585,16 +612,17 @@ impl ProdQuantizer {
         qjl: &[u8],
         gamma: f64,
     ) -> f64 {
-        let b = self.mse_quantizer.b;
-        debug_assert_eq!(
+        assert_eq!(
             packed_mse.len(),
-            (self.n * b).div_ceil(8),
+            self.packed_mse_len(),
             "score_ip_encoded_packed: packed_mse.len() must equal ceil(n*b/8) ({})",
-            (self.n * b).div_ceil(8)
+            self.packed_mse_len()
         );
+        self.assert_qjl_len_if_used(qjl, gamma, "score_ip_encoded_packed");
 
         #[cfg(target_arch = "x86_64")]
         {
+            let b = self.mse_quantizer.b;
             if (1..=8).contains(&b)
                 && is_x86_feature_detected!("avx2")
                 && is_x86_feature_detected!("fma")
@@ -839,6 +867,13 @@ impl ProdQuantizer {
     }
 
     pub fn quantize_batch(&self, xs: &[&[f32]]) -> Vec<(Vec<CodeIndex>, Vec<u8>, f64)> {
+        for x in xs {
+            assert_eq!(
+                x.len(),
+                self.d,
+                "quantize_batch: vector length must equal d"
+            );
+        }
         // Dense mode: batch all rotations via a single GEMM (Y = R × X) instead of
         // B separate matrix-vector multiplies. Break-even at B ≥ 64.
         const DENSE_BATCH_MIN: usize = 64;
@@ -976,6 +1011,12 @@ impl ProdQuantizer {
     }
 
     pub fn pack_mse_indices(&self, indices: &[CodeIndex]) -> Vec<u8> {
+        assert_eq!(
+            indices.len(),
+            self.n,
+            "pack_mse_indices: indices.len() must equal quantizer.n ({})",
+            self.n
+        );
         let bits_per_idx = self.mse_quantizer.b;
         if bits_per_idx == 8 {
             return indices.iter().map(|v| *v as u8).collect();
@@ -998,6 +1039,17 @@ impl ProdQuantizer {
     }
 
     pub fn unpack_mse_indices(&self, packed: &[u8], out: &mut [CodeIndex]) {
+        assert_eq!(
+            packed.len(),
+            self.packed_mse_len(),
+            "unpack_mse_indices: packed.len() must equal ceil(n*b/8) ({})",
+            self.packed_mse_len()
+        );
+        assert!(
+            out.len() >= self.n,
+            "unpack_mse_indices: out.len() must be at least quantizer.n ({})",
+            self.n
+        );
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx2") {
             return unsafe { self.unpack_mse_indices_avx2(packed, out) };
@@ -1151,7 +1203,7 @@ pub fn hamming_disagree_b4_signs(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
 /// Lower return = closer in IP.
 #[inline]
 pub fn hamming_disagree_signs<const B: usize>(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
-    debug_assert_eq!(
+    assert_eq!(
         query_signs.len() * B,
         mse_bytes.len(),
         "hamming_disagree_signs<B={B}>: query_signs.len()*B must equal mse_bytes.len()"
@@ -2306,6 +2358,77 @@ mod tests {
         let qjl_len = (pq.n + 7) / 8;
         let qjl = vec![0u8; qjl_len];
         let _ = pq.score_ip_encoded_lite(&prep, &short_idx, &qjl, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "packed_mse.len() must equal ceil(n*b/8)")]
+    fn score_ip_encoded_packed_panics_on_short_packed_mse() {
+        let pq = make_pq(64);
+        let q: Array1<f64> = Array1::from_elem(64, 0.1);
+        let prep = pq.prepare_ip_query(&q);
+        let x = vec![0.2f32; 64];
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        let mut packed = pq.pack_mse_indices(&idx);
+        packed.pop();
+        let _ = pq.score_ip_encoded_packed(&prep, &packed, &qjl, gamma);
+    }
+
+    #[test]
+    #[should_panic(expected = "qjl.len() must equal ceil(n/8)")]
+    fn score_ip_encoded_panics_on_short_qjl_when_gamma_nonzero() {
+        let pq = make_pq(64);
+        let q: Array1<f64> = Array1::from_elem(64, 0.1);
+        let prep = pq.prepare_ip_query(&q);
+        let x = vec![0.2f32; 64];
+        let (idx, mut qjl, _gamma) = pq.quantize(&x);
+        qjl.pop();
+        let _ = pq.score_ip_encoded(&prep, &idx, &qjl, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "indices.len() must equal quantizer.n")]
+    fn pack_mse_indices_panics_on_short_indices() {
+        let pq = make_pq(64);
+        let short_idx = vec![0 as CodeIndex; pq.n - 1];
+        let _ = pq.pack_mse_indices(&short_idx);
+    }
+
+    #[test]
+    #[should_panic(expected = "packed.len() must equal ceil(n*b/8)")]
+    fn unpack_mse_indices_panics_on_short_packed() {
+        let pq = make_pq(64);
+        let mut out = vec![0 as CodeIndex; pq.n];
+        let packed = vec![0u8; pq.packed_mse_len() - 1];
+        pq.unpack_mse_indices(&packed, &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "query_signs.len()*B must equal mse_bytes.len()")]
+    fn hamming_disagree_signs_panics_on_mismatched_lengths() {
+        let query_signs = vec![0u8; 1];
+        let mse_bytes = vec![0u8; 3];
+        let _ = super::hamming_disagree_signs::<2>(&query_signs, &mse_bytes);
+    }
+
+    #[test]
+    fn hamming_proximity_ignores_padding_bits() {
+        let pq = ProdQuantizer::new_dense(10, 4, 42);
+        let from = [0b0000_0000u8, 0b0000_0000u8];
+        let to = [0b0000_0000u8, 0b1111_1100u8];
+        let score = pq.hamming_proximity(&from, &to);
+        assert_eq!(
+            score, 1.0,
+            "padding bits beyond n must not affect proximity"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "quantize_batch: vector length must equal d")]
+    fn dense_quantize_batch_panics_on_short_vector() {
+        let pq = ProdQuantizer::new_dense(4, 4, 42);
+        let vectors: Vec<Vec<f32>> = (0..64).map(|_| vec![0.1f32; 3]).collect();
+        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let _ = pq.quantize_batch(&refs);
     }
 
     /// C4: zero vector quantize/dequantize is a no-panic edge case. The result
