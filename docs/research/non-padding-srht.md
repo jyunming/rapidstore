@@ -1,6 +1,6 @@
 # Non-padding alternatives to SRHT — research note
 
-**Status:** investigation, not committed. Authored 2026-05-04 during the v0.9 quantizer
+**Status:** investigation, not committed. Authored 2026-05-04 during the quantizer
 sweep. Purpose: capture the design space for closing SRHT's pow2-padding disk tax at
 non-pow2 dimensions (1536, 3072 — the OpenAI/Cohere production embedding shapes).
 
@@ -177,6 +177,6 @@ penalty is real and not easily bounded.
 
 ## Decision deferred
 
-This is a v0.10+ candidate. v0.9 ships SRHT default at d ≥ 1024 and bf16 rotation
-storage; non-padding SRHT is a follow-up if the padding tax actually bothers users
-in practice.
+This is a future candidate. The current quantizer work ships SRHT default at
+d >= 1024 and bf16 rotation storage; non-padding SRHT is a follow-up if the
+padding tax actually bothers users in practice.

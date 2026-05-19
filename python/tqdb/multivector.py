@@ -10,7 +10,7 @@ This module is a **Python-layer wrapper** over the existing single-vector
 TQDB; a JSON sidecar tracks the ``doc_id → [token_id, ...]`` mapping, and a
 ``_VecStore`` keeps raw float32 token vectors for exact MaxSim scoring.
 
-Future v0.9 release will move multi-vector into the engine for tighter
+Future engine work will move multi-vector into the core for tighter
 storage and native filter pushdown — this module's public API is designed
 to stay stable across that move.
 

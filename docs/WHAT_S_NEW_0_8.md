@@ -29,7 +29,7 @@ hits = store.search(query_token_vectors_5x96, top_k=10)
 
 Each document holds N token vectors; queries are tokenized to K vectors and scored
 via MaxSim. Built as a Python-layer wrapper over `tqdb.Database` so it ships now;
-the v0.9 sprint will move it into the engine for tighter storage and native filter
+future engine work will move it into the core for tighter storage and native filter
 pushdown — **the public Python API stays the same**.
 
 Full guide: [`docs/MULTI_VECTOR.md`](MULTI_VECTOR.md).

@@ -79,7 +79,7 @@ images   = Database.open("./mydb", dimension=512,  collection="images")
 TurboQuantDB exposes the same two-stage MSE + residual-QJL layout through two quantizer families:
 
 - **`None` (default)** — auto-pick based on dimension. `"dense"` for `d < 1024`, `"srht"` for `d >= 1024`. The crossover reflects empirical wins for SRHT once the rotation dominates ingest/latency cost.
-- **`"dense"`** — Haar-uniform QR rotation + dense i.i.d. Gaussian QJL with `n = d`. O(d²) ingest cost; rotation matrix stored as bf16 on disk (since v0.9, ~50% rotation-tax savings vs f32). `"exact"` is a legacy alias.
+- **`"dense"`** — Haar-uniform QR rotation + dense i.i.d. Gaussian QJL with `n = d`. O(d²) ingest cost; rotation matrix stored as bf16 on disk (~50% rotation-tax savings vs f32). `"exact"` is a legacy alias.
 - **`"srht"`** — structured Walsh-Hadamard + random-sign transforms, `n = next_power_of_two(d)`, O(d log d) ingest. At `d >= 1024` this is now the default — typically 2–3× faster ingest, 1.5–3× lower p50 latency, with recall equal to or slightly better than dense in our public-bench numbers.
 
 See [`docs/QUANTIZER_MODES.md`](QUANTIZER_MODES.md) for the full per-dim trade-off table including disk and RAM.

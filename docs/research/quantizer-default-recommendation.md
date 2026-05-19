@@ -1,11 +1,11 @@
-# v0.9 quantizer-default recommendation memo
+# Quantizer-default recommendation memo
 
 **Audience:** maintainer  •  **Status:** for review  •  Written 2026-05-04
 
 This memo synthesises the quantizer head-to-head benchmarks run between
 2026-05-03 and 2026-05-04 to answer one question:
 
-> **Which quantizer should `tqdb.Database.open(...)` default to in v0.9, and
+> **Which quantizer should `tqdb.Database.open(...)` default to, and
 > when should users be steered off the default?**
 
 It covers tqdb's two internal modes (dense Haar QR, SRHT) plus four external
@@ -18,7 +18,7 @@ turborag, turbodb).
 
 1. **Ship SRHT as the default at d ≥ 1024**, dense Haar QR below. The threshold
    is chosen so SRHT's pow2-padding tax never exceeds the dense rotation-matrix
-   tax. This is implemented on `feat/v0.9-srht-default-and-bf16-rotation`.
+   tax. This is implemented on the current quantizer branch.
 
 2. **Ship bf16 storage for the dense Haar QR rotation matrix.** Halves
    `quantizer.bin` for dense (-18 MB at d=3072), recall verified unchanged at
@@ -31,7 +31,7 @@ turborag, turbodb).
    docs needed updating (done).
 
 4. **Defer non-padding SRHT** (DCT-RS variant) to v0.10+. Investigated; viable
-   but requires `rustfft` dependency and a new `quantizer_type` value. Tracked
+   but requires a `rustfft` dependency and a new `quantizer_type` value. Tracked
    in `docs/research/non-padding-srht.md`.
 
 ---
@@ -86,7 +86,7 @@ in exchange for 3× ingest, 2× p50, 21% less RAM, and +1.7 pp recall.
 At every d ≥ 1024, the dense Haar QR's per-vector matrix multiply dominates
 ingest. Going to SRHT's O(d log d) butterfly is a 2–3× ingest speedup with no
 recall cost (and at d=3072 actually a recall *win*). This compounds with the
-v0.9 bf16 storage of the dense rotation matrix — together they give users two
+bf16 storage of the dense rotation matrix — together they give users two
 disjoint paths:
 - Want best ingest + p50? Use SRHT (auto-default at d ≥ 1024).
 - Want absolute minimum disk? Use dense (which is now ~50% smaller on the
@@ -188,7 +188,7 @@ The bench used `max_degree=32, search_list_size=128`. snapvec IVFPQ uses
 structure. tqdb's HNSW recall at d=1536 is 0.912 with the same params — far
 better, suggesting the params are tuned for higher dim.
 
-**Concrete v0.9.1 follow-up:** dim-aware HNSW defaults. At d=200 the corpus
+**Concrete follow-up:** dim-aware HNSW defaults. At d=200 the corpus
 is small enough that brute is competitive (1.1 ms p50); HNSW only helps if
 recall is preserved. At d=1536+ HNSW gives 2× p50 win at -5 pp recall, which
 is a useful trade-off.
@@ -199,7 +199,7 @@ Tuning the defaults is enough.
 
 ---
 
-## What ships in v0.9 (this branch)
+## What ships in this branch
 
 | Change | Files | Status |
 |---|---|---|
@@ -210,18 +210,18 @@ Tuning the defaults is enough.
 | Updated PYTHON_API + README rerank framing | `docs/PYTHON_API.md`, `README.md` | ✓ committed |
 | Research note: non-padding SRHT (deferred) | `docs/research/non-padding-srht.md` | ✓ committed |
 
-Branch: `feat/v0.9-srht-default-and-bf16-rotation`. All 463 cargo unit tests
+All 463 cargo unit tests
 pass. Recall verified on GloVe-200 with 10k queries (ΔR@1 = +0.0002 for dense
 bf16 vs the prior f32 baseline).
 
 ## Open questions / follow-ups
 
-1. **Migration story for v0.8 → v0.9 dense DBs.** bf16 rotation breaks bincode
+1. **Migration story for dense DBs created before bf16 storage.** bf16 rotation breaks bincode
    compatibility for dense-mode DBs. SRHT-mode DBs are unaffected. Options:
    (a) ship a one-shot rebuild tool, (b) detect v0.8 manifest version and
    re-quantize on first open, (c) document the break and require manual rebuild.
-   Recommendation: (c) for v0.9 (clean break, pre-1.0 license), (b) as polish
-   for v0.10.
+   Recommendation: (c) for the current patch (clean break, pre-1.0 license),
+   (b) as later polish.
 
 2. **HNSW default param tuning.** At d=200 HNSW recall collapses to 0.46 with
    the bench params (`max_degree=32, search_list_size=128`). At d=1536 it's

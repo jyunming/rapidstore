@@ -46,7 +46,7 @@ cargo test --test integration_tests
 cargo test --test bench_search
 cargo test --test bench_batch_crud
 cargo test --test test_bm25                # v0.7 BM25 + hybrid integration
-cargo test --test test_multi_vector        # if/when v0.9 lands native multi-vector
+cargo test --test test_multi_vector        # if/when native multi-vector lands
 
 # Full Python test suite (requires optional integration deps)
 maturin develop --release

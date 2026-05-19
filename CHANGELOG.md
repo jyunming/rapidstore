@@ -16,7 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Migration
 
-- **v0.8 → v0.9 dense-mode databases need to be rebuilt.** The bf16 rotation storage is bincode-incompatible with v0.8.x format. SRHT-mode databases reopen cleanly; only `quantizer_type="dense"` (or the legacy `"exact"` alias) is affected. There is no automatic migration in v0.9 — re-quantize from source vectors. A polish migration tool may follow in v0.10+.
+- **Dense-mode databases created before bf16 rotation storage need to be rebuilt.** The bf16 rotation storage is bincode-incompatible with the earlier dense rotation format. SRHT-mode databases reopen cleanly; only `quantizer_type="dense"` (or the legacy `"exact"` alias) is affected. There is no automatic migration yet — re-quantize from source vectors. A polish migration tool may follow in a later patch.
 
 ---
 

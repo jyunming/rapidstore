@@ -39,7 +39,7 @@ Samples a random Gaussian d×d matrix and takes its QR factorization to get a
 Haar-distributed orthogonal matrix. No zero-padding: `n = d`.
 
 - Rotation cost: O(d²) per vector (dense d×d matrix-vector multiply)
-- Rotation state on disk: full d×d matrix stored as **bfloat16** (since v0.9) — `d² × 2` bytes
+- Rotation state on disk: full d×d matrix stored as **bfloat16** — `d² × 2` bytes
 - Subspace count (b=4): `d / 8`
 
 > The rotation matrix is bf16 on disk but rehydrated to f32 in memory at load time, so
@@ -78,7 +78,7 @@ Two competing taxes:
 
 | Source | Dense | SRHT |
 |---|---|---|
-| Rotation state (`quantizer.bin`) | `d² × 2` bytes (bf16, **was f32 pre-v0.9**) | length-`n` sign vector — `~0` |
+| Rotation state (`quantizer.bin`) | `d² × 2` bytes (bf16, **was f32 in the earlier dense format**) | length-`n` sign vector — `~0` |
 | Code padding (`live_codes.bin`) | None — exact `d` slots | Pads `d → next_power_of_two(d)` codes |
 
 The padding tax matters at non-pow2 dims. At d=3072, b=4, n=100k:
@@ -86,7 +86,7 @@ The padding tax matters at non-pow2 dims. At d=3072, b=4, n=100k:
 |  | code data | rotation matrix | total |
 |---|---:|---:|---:|
 | dense (bf16 rotation) | 153.6 MB | 18.0 MB | **171.6 MB** |
-| dense (f32 rotation, pre-v0.9) | 153.6 MB | 36.0 MB | 189.6 MB |
+| dense (f32 rotation, earlier format) | 153.6 MB | 36.0 MB | 189.6 MB |
 | srht (pads d to 4096) | 204.8 MB | ~0 | 204.8 MB |
 
 Dense wins disk at non-pow2 d once bf16 rotation is in. At pow2 dims (1024, 2048,
@@ -130,7 +130,7 @@ At b=2 the picture is similar: SRHT b=2 rerank=F R@1 ≈ 0.55 / 0.86 / 0.90 vs d
 | Reproducing paper figures exactly | `"dense"` (matches the QR + Gaussian formulation in the TurboQuant paper) |
 | Heavy frequent-ingestion workload at any d | `"srht"` |
 | Maximum recall at b=2 with `rerank=True` | Either — at b=2 with rerank the gap is well within 0.5 pp |
-| Recovering from format break in v0.9 | Old DBs with f32-stored rotation must be rebuilt; bf16 is bincode-incompatible with v0.8 |
+| Recovering from the dense-format break | Old DBs with f32-stored rotation must be rebuilt; bf16 is bincode-incompatible with the earlier dense format |
 
 ## ANN + rerank interaction
 
@@ -144,6 +144,6 @@ the recall gap between modes is sub-0.5 pp at every measured cell.
 - `quantizer_type="exact"` remains an alias for `"dense"`.
 - Setting `quantizer_type="dense"` or `"srht"` explicitly always wins over the
   auto-default — existing code paths are unaffected if you pass an explicit string.
-- **Format break in v0.9**: bf16 rotation storage is bincode-incompatible with v0.8.x
+- **Dense-format break**: bf16 rotation storage is bincode-incompatible with earlier
   databases. Old databases must be rebuilt or migrated. SRHT-mode databases reopen
   cleanly — only `dense` mode is affected.
